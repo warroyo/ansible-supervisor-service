@@ -1,0 +1,87 @@
+# FAQ
+
+- [Which AWX/Tower/AAP versions are supported?](#which-awxtoweraap-versions-are-supported)
+- [Why does my template need Prompt on Launch for Limit?](#why-does-my-template-need-prompt-on-launch-for-limit)
+- [Can several supervisors share one AWX instance?](#can-several-supervisors-share-one-awx-instance)
+- [How do I find AWX hosts a supervisor left behind?](#how-do-i-find-awx-hosts-a-supervisor-left-behind)
+- [What's different about Workflow Templates?](#whats-different-about-workflow-templates)
+- [What happens to in-flight runs when a VM powers off?](#what-happens-to-in-flight-runs-when-a-vm-powers-off)
+
+## Which AWX/Tower/AAP versions are supported?
+
+All of them: AWX, Ansible Tower, AAP 2.4 and older, and AAP 2.5+.
+
+AWX, Ansible Tower and AAP up to 2.4 all serve the controller API at `/api/v2`. **AAP 2.5 introduced the platform gateway and moved it to `/api/controller/v2`** - the old path 404s rather than redirecting. Aria Automation's own Ansible integration breaks on exactly this: Broadcom [KB 394498](https://knowledge.broadcom.com/external/article/394498/ansible-automation-platformansible-tower.html) reports `"Failed to validate credentials."` plus a 404 after upgrading to AAP 2.5+, and the documented resolution is to stay on AAP 2.4 or older.
+
+This controller detects which flavor it's talking to instead. On first validation of an `AWXConnection` it probes each candidate's unauthenticated `ping/` endpoint and caches the winner in `status.apiBasePath`:
+
+```bash
+kubectl get awxconnection -n my-namespace
+# NAME         READY   STATE   API                  AGE
+# sample-awx   true    Ready   /api/v2              4m
+# aap-25       true    Ready   /api/controller/v2   2m
+```
+
+Probing `ping/` (which needs no credentials) keeps "wrong API path" distinguishable from "bad token", which is the confusion behind that KB's error message. If your instance serves the API somewhere else entirely, set it explicitly and detection is skipped:
+
+```yaml
+spec:
+  apiBasePath: "/api/controller/v2"
+```
+
+## Why does my template need Prompt on Launch for Limit?
+
+Because otherwise AWX runs your playbook against every host in the inventory.
+
+If a template doesn't accept a limit at launch time (`ask_limit_on_launch: false`), AWX silently discards the limit the controller sends and runs against that template's entire inventory rather than just your VM. Nothing in AWX flags that it happened.
+
+The controller checks this up front and refuses to launch rather than widen the blast radius, so an `AnsibleBinding` pointed at such a template goes `Failed` with an explanatory message and starts nothing. Either enable Prompt on Launch for Limit in AWX, or set `useDefaultLimit: true` on the binding to say you deliberately want the template's own scope.
+
+Enable Prompt on Launch for Variables too if you use `extraVars`, for the same reason.
+
+## Can several supervisors share one AWX instance?
+
+Yes. Ownership is tracked so they don't fight over inventory hosts.
+
+AWX host names are unique per inventory, and AWX Hosts have no labels or tags - so when several supervisors (or several tenant namespaces) point at one AWX instance and the same job template, two VMs called `web-1` want the same inventory host entry.
+
+The controller records ownership in the AWX host's **description** field: `ansible-supervisor:<supervisor_id>:<namespace>/<name>`. Description is the only free-text field on an AWX Host, and unlike host variables it never leaks into playbooks. Because that marker lives in AWX rather than only in CR status, it survives a binding being deleted and recreated. On a name collision the controller then:
+
+| Existing host | Behavior |
+|---|---|
+| Marked as **this** binding's | Updated and owned - including a host left behind by an earlier incarnation of the same binding (so `cleanupPolicy: Retain` → delete → recreate reclaims it rather than orphaning it forever) |
+| Marked by **another** supervisor or binding | **Refused.** Nothing is written, no job is launched, and the `AnsibleBinding` goes `Failed` naming the other owner |
+| **Unmarked** (created by hand in AWX) | Adopted: variables merged, description left alone, never deleted |
+
+Set `supervisor_id` at install time to something readable (e.g. `sup-lab-01`); left empty it's derived from the `kube-system` namespace UID, which works but makes the inventory hard to read.
+
+To resolve a refused collision, give the binding its own namespace in the inventory with `hostNamePrefix` on the `AWXConnection`:
+
+```yaml
+spec:
+  url: "https://awx.example.com"
+  secretRef: "awx-token"
+  hostNamePrefix: "sup-lab-01-"    # -> inventory host "sup-lab-01-web-1"
+```
+
+Host names are only inventory labels - the real address rides in `ansible_host` - so a prefix costs nothing but what `inventory_hostname` looks like inside playbooks. Changing the prefix later retires the old host entry rather than orphaning it.
+
+## How do I find AWX hosts a supervisor left behind?
+
+Hosts can outlive their binding if you used `cleanupPolicy: Retain`, or if finalizers were stripped by hand during an uninstall. The ownership marker makes them findable:
+
+```
+GET /api/v2/hosts/?inventory=<id>&description__startswith=ansible-supervisor:<supervisor_id>
+```
+
+## What's different about Workflow Templates?
+
+`type: JobTemplate` targets `/api/v2/job_templates/`, `type: WorkflowTemplate` targets `/api/v2/workflow_job_templates/` - AWX's two distinct launchable objects.
+
+Workflow templates commonly have no inventory of their own, since each node can carry one. When that's the case there's no inventory for the controller to create a host in and nothing to scope a `--limit` against, so the binding effectively behaves like `useDefaultLimit: true` for that template regardless of what the spec says.
+
+## What happens to in-flight runs when a VM powers off?
+
+The run is tracked independently of the VM, so nothing is lost. A job already running is still polled to completion, and the VM keeps its last run's phase rather than reverting to `Pending`.
+
+Re-run requests made during downtime aren't swallowed either. Whether a run is needed is decided per VM (`status.vms[].appliedGeneration` / `appliedTrigger`), so a spec change or annotation bump made while one VM's job is still running - or while a VM is powered off - is honored as soon as that VM can act on it.

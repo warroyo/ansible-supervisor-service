@@ -1,0 +1,18 @@
+apiVersion: field.vmware.com/v1
+kind: AnsibleBinding
+metadata:
+  name: sample-webserver-binding
+  namespace: my-namespace
+spec:
+  vmSelector:                   # matchLabels-style selector against VirtualMachines in this namespace
+    app: webserver
+  awxConnectionRef: sample-awx  # an AWXConnection in this namespace
+  template:
+    name: "Configure Webserver"  # name of the job or workflow template in AWX
+    type: JobTemplate            # JobTemplate | WorkflowTemplate
+  hostName: ""                   # optional; only honored when vmSelector matches exactly one VM
+  hostVariables: {}              # optional extra host vars, e.g. custom ansible_host
+  useDefaultLimit: false         # false (default) scopes the run to the provisioned VM host
+  extraVars:
+    environment: production
+  cleanupPolicy: Delete          # Delete (default) | Retain - see README for tradeoffs

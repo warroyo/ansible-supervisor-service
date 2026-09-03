@@ -1,0 +1,472 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"time"
+)
+
+// Transports are shared process-wide rather than built per client: a
+// fresh http.Transport per reconcile would leak its own idle connection
+// pool (and the goroutines servicing it) on every pass.
+var (
+	verifyingTransport = newTransport(false)
+	insecureTransport  = newTransport(true)
+)
+
+func newTransport(insecureSkipVerify bool) *http.Transport {
+	t := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		MaxIdleConns:        50,
+		MaxIdleConnsPerHost: 5,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	if insecureSkipVerify {
+		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // opt-in via AWXConnection.spec.insecureSkipVerify
+	}
+	return t
+}
+
+// AWXClient is a minimal, hand-rolled REST client for the handful of
+// AWX/Tower API endpoints this controller needs: resolving job/workflow
+// templates, upserting inventory hosts, launching runs, and polling their
+// status. A full SDK isn't worth the dependency for this surface area.
+type AWXClient struct {
+	baseURL string
+	// basePath is the API root: "/api/v2" on AWX, Tower and AAP up to
+	// 2.4, but "/api/controller/v2" on AAP 2.5+, where the platform
+	// gateway moved the controller endpoints. See DetectAPIBasePath.
+	basePath   string
+	token      string
+	httpClient *http.Client
+}
+
+// API base paths this controller knows how to talk to, in probe order.
+const (
+	APIBasePathGateway = "/api/controller/v2" // AAP 2.5+ behind the platform gateway
+	APIBasePathLegacy  = "/api/v2"            // AWX, Ansible Tower, AAP <= 2.4
+)
+
+var apiBasePathCandidates = []string{APIBasePathGateway, APIBasePathLegacy}
+
+// normalizeAPIBasePath makes a user-supplied path safe to concatenate.
+func normalizeAPIBasePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return strings.TrimRight(path, "/")
+}
+
+func httpClientFor(insecureSkipVerify bool) *http.Client {
+	transport := verifyingTransport
+	if insecureSkipVerify {
+		transport = insecureTransport
+	}
+	return &http.Client{Timeout: 30 * time.Second, Transport: transport}
+}
+
+func NewAWXClient(baseURL, basePath, token string, insecureSkipVerify bool) *AWXClient {
+	if basePath == "" {
+		basePath = APIBasePathLegacy
+	}
+	return &AWXClient{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		basePath:   normalizeAPIBasePath(basePath),
+		token:      token,
+		httpClient: httpClientFor(insecureSkipVerify),
+	}
+}
+
+// DetectAPIBasePath finds which API root an instance serves by probing
+// each candidate's unauthenticated ping endpoint. Probing status codes
+// rather than parsing /api/ keeps this independent of how any given
+// version shapes its discovery document, and because ping needs no
+// credentials, "wrong API path" stays clearly distinguishable from "bad
+// token" - the confusion behind AAP 2.5's "Failed to validate
+// credentials" reports.
+func DetectAPIBasePath(ctx context.Context, baseURL string, insecureSkipVerify bool) (string, error) {
+	client := httpClientFor(insecureSkipVerify)
+	trimmed := strings.TrimRight(baseURL, "/")
+
+	var attempts []string
+	for _, candidate := range apiBasePathCandidates {
+		pingURL := trimmed + candidate + "/ping/"
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, pingURL, nil)
+		if err != nil {
+			return "", fmt.Errorf("building request: %w", err)
+		}
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			// A transport-level failure means the host is unreachable,
+			// not that this candidate is wrong - report it as-is.
+			return "", fmt.Errorf("probing %s: %w", pingURL, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return candidate, nil
+		}
+		attempts = append(attempts, fmt.Sprintf("%s -> %d", candidate, resp.StatusCode))
+	}
+
+	return "", fmt.Errorf("could not determine the AWX/AAP API base path at %s (tried %s); "+
+		"set spec.apiBasePath on the AWXConnection if this instance serves the API somewhere else",
+		trimmed, strings.Join(attempts, ", "))
+}
+
+func (c *AWXClient) do(ctx context.Context, method, path string, body, out interface{}) error {
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("encoding request body: %w", err)
+		}
+		reader = bytes.NewReader(b)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
+	if err != nil {
+		return fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("awx request %s %s: %w", method, path, err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("awx request %s %s: status %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	if out != nil && len(respBody) > 0 {
+		if err := json.Unmarshal(respBody, out); err != nil {
+			return fmt.Errorf("awx request %s %s: decoding response: %w", method, path, err)
+		}
+	}
+	return nil
+}
+
+// Ping validates the connection/credentials without depending on any
+// particular object existing yet.
+func (c *AWXClient) Ping(ctx context.Context) error {
+	return c.do(ctx, http.MethodGet, c.basePath+"/me/", nil, nil)
+}
+
+// AWXTemplate is a resolved job or workflow template. The ask*OnLaunch
+// flags matter a great deal: if AWX isn't configured to accept a limit
+// or extra vars at launch time, it silently drops them from the launch
+// request and runs the template against its whole inventory instead of
+// the VM we meant to target.
+type AWXTemplate struct {
+	ID                   int
+	Inventory            *int
+	AskLimitOnLaunch     bool
+	AskVariablesOnLaunch bool
+}
+
+type templateResult struct {
+	ID                   int  `json:"id"`
+	Inventory            *int `json:"inventory"`
+	AskLimitOnLaunch     bool `json:"ask_limit_on_launch"`
+	AskVariablesOnLaunch bool `json:"ask_variables_on_launch"`
+}
+
+type listTemplatesResponse struct {
+	Count   int              `json:"count"`
+	Results []templateResult `json:"results"`
+}
+
+func (c *AWXClient) findTemplate(ctx context.Context, listPath, kind, name string) (*AWXTemplate, error) {
+	var lr listTemplatesResponse
+	if err := c.do(ctx, http.MethodGet, listPath+"?name="+url.QueryEscape(name), nil, &lr); err != nil {
+		return nil, err
+	}
+	if lr.Count == 0 || len(lr.Results) == 0 {
+		return nil, fmt.Errorf("%s %q not found", kind, name)
+	}
+	r := lr.Results[0]
+	return &AWXTemplate{
+		ID:                   r.ID,
+		Inventory:            r.Inventory,
+		AskLimitOnLaunch:     r.AskLimitOnLaunch,
+		AskVariablesOnLaunch: r.AskVariablesOnLaunch,
+	}, nil
+}
+
+// FindJobTemplate resolves a Job Template by name. A nil Inventory means
+// the template has no inventory configured (possible with
+// prompt-on-launch), in which case there's nowhere to create a host.
+func (c *AWXClient) FindJobTemplate(ctx context.Context, name string) (*AWXTemplate, error) {
+	return c.findTemplate(ctx, c.basePath+"/job_templates/", "job template", name)
+}
+
+// FindWorkflowJobTemplate resolves a Workflow Template by name. Workflow
+// templates commonly have no inventory of their own (each node can carry
+// its own); callers should treat a nil Inventory as "can't target a
+// single host".
+func (c *AWXClient) FindWorkflowJobTemplate(ctx context.Context, name string) (*AWXTemplate, error) {
+	return c.findTemplate(ctx, c.basePath+"/workflow_job_templates/", "workflow job template", name)
+}
+
+type hostResult struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	Variables   string `json:"variables"`
+	Description string `json:"description"`
+}
+
+// findHostByName picks the exact name match out of a host list response.
+//
+// The lookup asks AWX to filter with ?name=, which its field-lookup
+// filtering supports - but that parameter is not part of the published
+// API schema, so an instance that ignored it would hand back every host
+// in the inventory instead. Trusting results[0] there would mean
+// adopting, repointing and eventually deleting an unrelated host, so the
+// name is re-checked here rather than assumed.
+func findHostByName(results []hostResult, hostname string) *hostResult {
+	for i := range results {
+		if results[i].Name == hostname {
+			return &results[i]
+		}
+	}
+	return nil
+}
+
+type listHostsResponse struct {
+	Count   int          `json:"count"`
+	Results []hostResult `json:"results"`
+}
+
+// mergeHostVariables merges ours into an existing AWX host variables
+// document. AWX stores host variables as a YAML/JSON *string*. If an
+// existing document isn't empty and isn't a JSON object we can safely
+// merge into, this refuses rather than destroying whatever an operator
+// put there by hand.
+func mergeHostVariables(existing string, ours map[string]string) (string, error) {
+	trimmed := strings.TrimSpace(existing)
+	if trimmed == "" || trimmed == "---" || trimmed == "{}" {
+		b, err := json.Marshal(ours)
+		return string(b), err
+	}
+
+	var current map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &current); err != nil {
+		return "", fmt.Errorf("existing host variables are not a JSON object this controller can merge into; "+
+			"remove the conflicting host in AWX or point spec.hostName elsewhere: %w", err)
+	}
+	for k, v := range ours {
+		current[k] = v
+	}
+	b, err := json.Marshal(current)
+	return string(b), err
+}
+
+// UpsertHost creates or updates a host named hostname in the given
+// inventory, stamping ownerMarker into its description so ownership
+// outlives the CR that requested it.
+//
+// AWX host names are unique per inventory, so one AWX shared by several
+// supervisors (or several tenant namespaces) can collide on a name. The
+// marker makes that collision explicit rather than letting one owner
+// silently repoint another's host at a different machine:
+//
+//   - marked as ours       -> updated, owned (deletable during cleanup)
+//   - marked by another    -> refused, nothing is touched
+//   - unmarked (pre-existing, someone made it by hand) -> adopted:
+//     variables merged, description left alone, never deleted
+func (c *AWXClient) UpsertHost(ctx context.Context, inventoryID int, hostname, ownerMarker string, vars map[string]string) (id int, owned bool, err error) {
+	var lr listHostsResponse
+	listPath := fmt.Sprintf("%s/inventories/%d/hosts/?name=%s", c.basePath, inventoryID, url.QueryEscape(hostname))
+	if err := c.do(ctx, http.MethodGet, listPath, nil, &lr); err != nil {
+		return 0, false, fmt.Errorf("looking up host %q: %w", hostname, err)
+	}
+
+	if existing := findHostByName(lr.Results, hostname); existing != nil {
+		existingMarker := strings.TrimSpace(existing.Description)
+
+		if existingMarker != ownerMarker && strings.HasPrefix(existingMarker, hostMarkerPrefix) {
+			return 0, false, fmt.Errorf("inventory host %q is already owned by another ansible-supervisor binding (%s); "+
+				"refusing to take it over - set spec.hostNamePrefix on the AWXConnection (or spec.hostName) so this "+
+				"binding uses a distinct inventory host name", hostname, existingMarker)
+		}
+
+		merged, mErr := mergeHostVariables(existing.Variables, vars)
+		if mErr != nil {
+			return 0, false, fmt.Errorf("updating host %q: %w", hostname, mErr)
+		}
+		if merged != strings.TrimSpace(existing.Variables) {
+			body := map[string]interface{}{"variables": merged}
+			if err := c.do(ctx, http.MethodPatch, fmt.Sprintf("%s/hosts/%d/", c.basePath, existing.ID), body, nil); err != nil {
+				return 0, false, fmt.Errorf("updating host %q: %w", hostname, err)
+			}
+		}
+		// Ours if the marker says so - including a host left behind by an
+		// earlier incarnation of this same binding. An unmarked host stays
+		// unclaimed: it was made by hand, so it isn't ours to delete.
+		return existing.ID, existingMarker == ownerMarker, nil
+	}
+
+	// No match, so create it. If the host does exist but the lookup
+	// somehow failed to surface it (an unfiltered list longer than one
+	// page), AWX rejects this with "already exists" on the unique
+	// (name, inventory) constraint - a loud error, which is the right
+	// outcome rather than silently operating on the wrong host.
+	varsJSON, err := json.Marshal(vars)
+	if err != nil {
+		return 0, false, fmt.Errorf("encoding host variables: %w", err)
+	}
+	var createdHost hostResult
+	body := map[string]interface{}{
+		"name":        hostname,
+		"description": ownerMarker,
+		"variables":   string(varsJSON),
+	}
+	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("%s/inventories/%d/hosts/", c.basePath, inventoryID), body, &createdHost); err != nil {
+		return 0, false, fmt.Errorf("creating host %q: %w", hostname, err)
+	}
+	return createdHost.ID, true, nil
+}
+
+// DeleteHost removes a host by ID. A 404 is treated as success: the host
+// is already gone, which is the desired end state.
+func (c *AWXClient) DeleteHost(ctx context.Context, id int) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, fmt.Sprintf("%s%s/hosts/%d/", c.baseURL, c.basePath, id), nil)
+	if err != nil {
+		return fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("awx request DELETE %s/hosts/%d/: %w", c.basePath, id, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || (resp.StatusCode >= 200 && resp.StatusCode < 300) {
+		return nil
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("awx request DELETE %s/hosts/%d/: status %d: %s", c.basePath, id, resp.StatusCode, strings.TrimSpace(string(respBody)))
+}
+
+func launchBody(limit string, extraVars map[string]string) (map[string]interface{}, error) {
+	body := map[string]interface{}{}
+	if limit != "" {
+		body["limit"] = limit
+	}
+	if len(extraVars) > 0 {
+		b, err := json.Marshal(extraVars)
+		if err != nil {
+			return nil, fmt.Errorf("encoding extra vars: %w", err)
+		}
+		body["extra_vars"] = string(b)
+	}
+	return body, nil
+}
+
+type launchResponse struct {
+	Job           int                        `json:"job"`
+	WorkflowJob   int                        `json:"workflow_job"`
+	IgnoredFields map[string]json.RawMessage `json:"ignored_fields"`
+}
+
+// ignoredFieldsError reports fields AWX accepted the launch *without*.
+// This is the failure mode that silently widens a run's blast radius: a
+// dropped "limit" means the template ran against its entire inventory
+// rather than the VM we targeted. Callers pre-flight the template's
+// ask*OnLaunch flags, so this is a backstop.
+func ignoredFieldsError(jobID int, ignored map[string]json.RawMessage) error {
+	if len(ignored) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(ignored))
+	for k := range ignored {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return fmt.Errorf("AWX ignored launch field(s) %s for job %d: the template does not accept them at launch time "+
+		"(enable Prompt on Launch for them in AWX); the run was NOT scoped as requested", strings.Join(keys, ", "), jobID)
+}
+
+// LaunchJobTemplate launches a Job Template run. A non-zero job ID is
+// returned even alongside an error, so callers can still record and
+// trace a run that launched with fields ignored.
+func (c *AWXClient) LaunchJobTemplate(ctx context.Context, id int, limit string, extraVars map[string]string) (int, error) {
+	body, err := launchBody(limit, extraVars)
+	if err != nil {
+		return 0, err
+	}
+	var out launchResponse
+	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("%s/job_templates/%d/launch/", c.basePath, id), body, &out); err != nil {
+		return 0, fmt.Errorf("launching job template %d: %w", id, err)
+	}
+	return out.Job, ignoredFieldsError(out.Job, out.IgnoredFields)
+}
+
+// LaunchWorkflowJobTemplate launches a Workflow Template run, with the
+// same semantics as LaunchJobTemplate.
+func (c *AWXClient) LaunchWorkflowJobTemplate(ctx context.Context, id int, limit string, extraVars map[string]string) (int, error) {
+	body, err := launchBody(limit, extraVars)
+	if err != nil {
+		return 0, err
+	}
+	var out launchResponse
+	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("%s/workflow_job_templates/%d/launch/", c.basePath, id), body, &out); err != nil {
+		return 0, fmt.Errorf("launching workflow job template %d: %w", id, err)
+	}
+	return out.WorkflowJob, ignoredFieldsError(out.WorkflowJob, out.IgnoredFields)
+}
+
+type jobStatusResponse struct {
+	Status string `json:"status"`
+}
+
+// GetJobStatus returns a job's current AWX status string (e.g. "pending",
+// "running", "successful", "failed").
+func (c *AWXClient) GetJobStatus(ctx context.Context, id int) (string, error) {
+	var out jobStatusResponse
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("%s/jobs/%d/", c.basePath, id), nil, &out); err != nil {
+		return "", fmt.Errorf("getting job %d status: %w", id, err)
+	}
+	return out.Status, nil
+}
+
+// GetWorkflowJobStatus is GetJobStatus for workflow job runs.
+func (c *AWXClient) GetWorkflowJobStatus(ctx context.Context, id int) (string, error) {
+	var out jobStatusResponse
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("%s/workflow_jobs/%d/", c.basePath, id), nil, &out); err != nil {
+		return "", fmt.Errorf("getting workflow job %d status: %w", id, err)
+	}
+	return out.Status, nil
+}
+
+// JobURL builds a link to the run's output in the AWX UI. The exact path
+// can vary across AWX/Tower versions; this targets the common modern
+// AWX UI layout.
+func (c *AWXClient) JobURL(id int, isWorkflow bool) string {
+	kind := "playbook"
+	if isWorkflow {
+		kind = "workflow"
+	}
+	return fmt.Sprintf("%s/#/jobs/%s/%d/output", c.baseURL, kind, id)
+}

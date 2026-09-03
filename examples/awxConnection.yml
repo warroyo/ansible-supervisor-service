@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: awx-token
+  namespace: my-namespace
+type: Opaque
+stringData:
+  token: "<AWX/Tower API token>"
+---
+apiVersion: field.vmware.com/v1
+kind: AWXConnection
+metadata:
+  name: sample-awx
+  namespace: my-namespace
+spec:
+  url: "https://awx.example.com"          # base URL of the AWX/Tower instance
+  secretRef: "awx-token"                  # Secret in this namespace holding the token
+  insecureSkipVerify: false               # set true only for self-signed/test instances
+  apiBasePath: ""                         # empty = detect. "/api/v2" on AWX/Tower/AAP<=2.4,
+                                          # "/api/controller/v2" on AAP 2.5+ (platform gateway)
+  hostNamePrefix: ""                      # prepended to inventory host names; set this when several
+                                          # supervisors or namespaces share one AWX instance, so their
+                                          # host entries don't collide (e.g. "sup-lab-01-")

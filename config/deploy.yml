@@ -1,0 +1,99 @@
+#@ load("@ytt:data", "data")
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ansible-supervisor-controller
+  namespace: #@ data.values.namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ansible-supervisor
+  template:
+    metadata:
+      labels:
+        app: ansible-supervisor
+    spec:
+      serviceAccountName: ansible-supervisor
+      containers:
+      - name: controller
+        image: controller
+        args:
+        - #@ "--resync-period=" + data.values.resync_period
+        - #@ "--supervisor-id=" + data.values.supervisor_id
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ansible-supervisor
+  namespace: #@ data.values.namespace
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ansible-supervisor
+rules:
+  #! get only, deliberately: the controller only ever reads the specific Secret
+  #! an AWXConnection names. list/watch here would let it enumerate every
+  #! Secret of every tenant on the supervisor.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  #! read-only, and only to derive a stable supervisor identity from the
+  #! kube-system namespace UID when supervisor_id is not set explicitly.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
+  - apiGroups: ["vmoperator.vmware.com"]
+    resources: ["virtualmachines"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["field.vmware.com"]
+    resources:
+      - awxconnections
+      - ansiblebindings
+      - awxconnections/status
+      - ansiblebindings/status
+    verbs: ["get", "list", "watch", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ansible-supervisor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ansible-supervisor
+subjects:
+  - kind: ServiceAccount
+    name: ansible-supervisor
+    namespace: #@ data.values.namespace
+---
+#! Both CRDs are namespace-scoped and tenant-owned - a tenant with edit/admin
+#! on their namespace can manage their own AWXConnections and
+#! AnsibleBindings without any extra grant. Unlike a cross-namespace
+#! credential-sharing CRD, there's no separate "authority" concept needed here:
+#! an AWXConnection's Secret never leaves the namespace it's created in.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aggregate-ansible-supervisor-edit
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+rules:
+- apiGroups: ["field.vmware.com"]
+  resources: ["awxconnections", "ansiblebindings"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aggregate-ansible-supervisor-view
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+- apiGroups: ["field.vmware.com"]
+  resources: ["awxconnections", "ansiblebindings"]
+  verbs: ["get", "list", "watch"]

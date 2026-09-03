@@ -1,0 +1,9 @@
+#@data/values-schema
+---
+
+resync_period: "60"
+namespace: ""
+#! identity stamped on AWX inventory hosts this supervisor owns, so one AWX
+#! instance can be shared by several supervisors without them fighting over
+#! host entries. leave empty to derive it from the kube-system namespace UID.
+supervisor_id: ""

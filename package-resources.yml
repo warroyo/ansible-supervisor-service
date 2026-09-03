@@ -1,0 +1,52 @@
+apiVersion: data.packaging.carvel.dev/v1alpha1
+kind: Package
+metadata:
+  creationTimestamp: null
+  name: ansible-supervisor.fling.vsphere.vmware.com.0.0.0
+spec:
+  refName: ansible-supervisor.fling.vsphere.vmware.com
+  releasedAt: null
+  template:
+    spec:
+      deploy:
+      - kapp: {}
+      fetch:
+      - git: {}
+      template:
+      - ytt:
+          paths:
+          - config
+      - kbld: {}
+  valuesSchema:
+    openAPIv3: null
+  version: 0.0.0
+
+---
+apiVersion: data.packaging.carvel.dev/v1alpha1
+kind: PackageMetadata
+metadata:
+  creationTimestamp: null
+  name: ansible-supervisor.fling.vsphere.vmware.com
+spec:
+  displayName: Ansible Supervisor Service
+  longDescription: Binds VM Service VirtualMachines to AWX/Tower job and workflow templates, mirroring Aria Automation's Ansible Automation Platform day-2 integration for Supervisor-native VMs.
+  shortDescription: Ansible Automation for VM Service
+
+---
+apiVersion: packaging.carvel.dev/v1alpha1
+kind: PackageInstall
+metadata:
+  annotations:
+    kctrl.carvel.dev/local-fetch-0: .
+  creationTimestamp: null
+  name: ansible-supervisor
+spec:
+  packageRef:
+    refName: ansible-supervisor.fling.vsphere.vmware.com
+    versionSelection:
+      constraints: 0.0.0
+  serviceAccountName: ansible-supervisor-sa
+status:
+  conditions: null
+  friendlyDescription: ""
+  observedGeneration: 0

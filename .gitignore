@@ -1,0 +1,5 @@
+.vscode
+carvel-artifacts/
+ansible-supervisor.yml
+config/crd.yml
+/controller/ansible-supervisor-service

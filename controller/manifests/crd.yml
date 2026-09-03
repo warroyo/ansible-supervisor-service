@@ -1,0 +1,242 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: awxconnections.field.vmware.com
+spec:
+  group: field.vmware.com
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                url:
+                  type: string
+                  description: base URL of the AWX/Tower instance, e.g. https://awx.example.com
+                secretRef:
+                  type: string
+                  description: name of a Secret in this namespace holding the AWX API token in its "token" key
+                insecureSkipVerify:
+                  type: boolean
+                  description: skip TLS certificate verification when calling the AWX API
+                  default: false
+                apiBasePath:
+                  type: string
+                  description: overrides where this instance serves the controller API. leave empty to detect it - "/api/v2" on AWX, Ansible Tower and AAP up to 2.4, "/api/controller/v2" on AAP 2.5+ where the platform gateway moved the controller endpoints
+                hostNamePrefix:
+                  type: string
+                  description: prepended to every AWX inventory host name created through this connection. AWX host names are unique per inventory, so a prefix keeps host entries apart when several supervisors or namespaces share one AWX instance
+              required:
+                - url
+                - secretRef
+            status:
+              type: object
+              description: current status of the AWXConnection
+              properties:
+                state:
+                  type: string
+                message:
+                  type: string
+                ready:
+                  type: boolean
+                lastUpdated:
+                  type: string
+                  format: date-time
+                apiBasePath:
+                  type: string
+                  description: the API root actually in use, detected on first validation or copied from spec.apiBasePath
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Ready
+          type: boolean
+          jsonPath: .status.ready
+        - name: State
+          type: string
+          jsonPath: .status.state
+        - name: API
+          type: string
+          jsonPath: .status.apiBasePath
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+  scope: Namespaced
+  names:
+    plural: awxconnections
+    singular: awxconnection
+    kind: AWXConnection
+    shortNames:
+      - awxconn
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ansiblebindings.field.vmware.com
+spec:
+  group: field.vmware.com
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                vmSelector:
+                  type: object
+                  description: label selector (matchLabels-style) matching VirtualMachine resources in this namespace to target. must not be empty, an empty selector would target every VM in the namespace
+                  minProperties: 1
+                  additionalProperties:
+                    type: string
+                awxConnectionRef:
+                  type: string
+                  description: name of an AWXConnection in this namespace to launch templates through
+                template:
+                  type: object
+                  description: the AWX job or workflow template to launch against each matched VM
+                  properties:
+                    name:
+                      type: string
+                      description: name of the job template or workflow job template in AWX
+                    type:
+                      type: string
+                      description: which kind of AWX template "name" refers to
+                      enum:
+                        - JobTemplate
+                        - WorkflowTemplate
+                  required:
+                    - name
+                    - type
+                hostName:
+                  type: string
+                  description: override the Ansible inventory host name (defaults to the VM's resource name)
+                hostVariables:
+                  type: object
+                  description: extra host variables merged into the upserted inventory host, e.g. a custom ansible_host
+                  additionalProperties:
+                    type: string
+                useDefaultLimit:
+                  type: boolean
+                  description: if true, launch without a --limit so the template's own configured limit/inventory applies; if false (default), scope the run to the provisioned host
+                  default: false
+                extraVars:
+                  type: object
+                  description: extra variables passed to the template launch
+                  additionalProperties:
+                    type: string
+                cleanupPolicy:
+                  type: string
+                  description: whether the controller deletes AWX inventory hosts it created when a VM stops matching or the CR is deleted
+                  enum:
+                    - Delete
+                    - Retain
+                  default: Delete
+              required:
+                - vmSelector
+                - awxConnectionRef
+                - template
+            status:
+              type: object
+              description: current status of the AnsibleBinding
+              properties:
+                state:
+                  type: string
+                message:
+                  type: string
+                ready:
+                  type: boolean
+                lastUpdated:
+                  type: string
+                  format: date-time
+                observedGeneration:
+                  type: integer
+                  description: informational - the generation the controller most recently reconciled. relaunch decisions are made per VM, see vms[].appliedGeneration
+                lastAppliedTrigger:
+                  type: string
+                  description: informational - the reconcile-requested-at annotation value the controller most recently saw. see vms[].appliedTrigger for what each VM actually ran
+                vms:
+                  type: array
+                  description: per-VM run status for every VM currently matched by vmSelector
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      observedIP:
+                        type: string
+                      phase:
+                        type: string
+                        description: Pending, Running, Succeeded, or Failed
+                      awxHostID:
+                        type: integer
+                        description: AWX inventory host ID for this VM, used to target launches and to drive cleanup
+                      awxHostName:
+                        type: string
+                        description: inventory host name last used for this VM, tracked so a rename retires the old host instead of orphaning it
+                      awxHostCreated:
+                        type: boolean
+                        description: whether this controller owns the AWX host. ownership is stamped into the host description in AWX so it survives this resource being deleted and recreated. hosts that already existed unmarked are adopted and never deleted
+                      pendingCleanup:
+                        type: boolean
+                        description: set when a VM no longer matches the selector but its AWX host could not be deleted yet. the entry is retained only so the deletion is retried
+                      appliedGeneration:
+                        type: integer
+                        description: spec generation this VM last launched a run for
+                      appliedTrigger:
+                        type: string
+                        description: reconcile-requested-at annotation value this VM last launched a run for
+                      hostVarsHash:
+                        type: string
+                        description: fingerprint of the host name and variables last pushed to AWX, used to skip no-op host updates
+                      lastJobID:
+                        type: integer
+                      lastJobURL:
+                        type: string
+                      lastJobStatus:
+                        type: string
+                      lastUpdated:
+                        type: string
+                        format: date-time
+                      history:
+                        type: array
+                        description: bounded log of recent runs for this VM, most recent first
+                        items:
+                          type: object
+                          properties:
+                            jobID:
+                              type: integer
+                            status:
+                              type: string
+                            startedAt:
+                              type: string
+                              format: date-time
+                            finishedAt:
+                              type: string
+                              format: date-time
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Ready
+          type: boolean
+          jsonPath: .status.ready
+        - name: State
+          type: string
+          jsonPath: .status.state
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+  scope: Namespaced
+  names:
+    plural: ansiblebindings
+    singular: ansiblebinding
+    kind: AnsibleBinding
+    shortNames:
+      - ansbind

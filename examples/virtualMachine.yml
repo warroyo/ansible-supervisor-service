@@ -1,0 +1,53 @@
+# A VM Service VirtualMachine that this service can target.
+#
+# Nothing here is specific to ansible-supervisor except the label in
+# metadata.labels, which is what an AnsibleBinding's vmSelector matches
+# on. The rest is an ordinary VM Service VM.
+#
+# The one thing worth getting right is the bootstrap: AWX reaches the VM over
+# SSH as an ordinary Ansible control node would, so the VM has to come up with
+# a user AWX's machine credential can log in as. cloud-init is how that key
+# gets in.
+#
+# Fill in className, imageName and storageClass from your own namespace:
+#   kubectl get virtualmachineclass
+#   kubectl get virtualmachineimage
+#   kubectl get storageclass
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sample-webserver-bootstrap
+  namespace: my-namespace
+type: Opaque
+stringData:
+  # Must match the username and public key of the Machine credential attached
+  # to the AWX job template. AWX supplies the matching private key at run time.
+  user-data: |
+    #cloud-config
+    hostname: sample-webserver
+    users:
+      - name: ansible
+        sudo: ALL=(ALL) NOPASSWD:ALL
+        shell: /bin/bash
+        ssh_authorized_keys:
+          - <your SSH public key>
+    ssh_pwauth: false
+---
+apiVersion: vmoperator.vmware.com/v1alpha2
+kind: VirtualMachine
+metadata:
+  name: sample-webserver
+  namespace: my-namespace
+  labels:
+    app: webserver                  # what AnsibleBinding's vmSelector matches
+spec:
+  className: best-effort-small
+  imageName: vmi-0123456789abcdef0  # an Ubuntu/Photon image with cloud-init and python3
+  storageClass: vsan-default-storage-policy
+  powerState: PoweredOn
+  bootstrap:
+    cloudInit:
+      rawCloudConfig:
+        name: sample-webserver-bootstrap
+        key: user-data
