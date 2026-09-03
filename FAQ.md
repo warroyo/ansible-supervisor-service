@@ -25,7 +25,7 @@ This service puts the same capability on the Supervisor, as CRDs. Nothing here r
 | What can be targeted | Exactly the one machine being provisioned | Every VM the selector matches, now and later |
 | When it runs | Once, at provisioning time | At provisioning time and on demand afterwards - bump the `reconcile-requested-at` annotation or edit the spec |
 | Drift in AWX | Not tracked | The inventory host is reconciled against AWX every pass; one deleted or hand-edited in the UI is repaired |
-| Teardown | Deprovisioning removes the host | The binding's finalizer removes the AWX hosts it created (`cleanupPolicy: Retain` opts out) |
+| Teardown | `templates.de-provision[]` runs playbooks as part of the resource's own teardown, then the host is removed | The binding's finalizer removes the AWX hosts it created (`cleanupPolicy: Retain` opts out). **No deprovision playbooks** - see [why there is no pre-delete hook](#why-is-there-no-pre-delete-hook) |
 | AAP 2.5+ | [Broken](#which-awxtoweraap-versions-are-supported) - KB 394498 says stay on 2.4 | Detected and supported |
 
 Two differences are worth internalizing rather than skimming:
@@ -127,7 +127,17 @@ A plain finalizer on the `VirtualMachine` is not a workaround. vm-operator's own
 
 Watching for VM deletions and reacting after the fact was considered and rejected on accuracy. "Left the selector" conflates a VM being deleted, a VM being relabelled, and the binding's own selector being edited; even narrowing to "the object is gone" cannot separate a decommission from a delete-and-recreate. Intent lives in whatever asked for the deletion, and it is not recoverable from watching state change.
 
-**What to do instead** is what vRA itself does: let the orchestrator sequence it. Run the playbook, *then* destroy. In a VCF Automation blueprint that is a day-2 action creating an `AnsibleRun` with a `vmRef` while the VM is still up, waiting on `.status.state`, and deleting the VM after - see [VCFA blueprints](VCFA-BLUEPRINTS.md#decommissioning-in-the-right-order). For cleanup that doesn't need the guest at all (DNS, CMDB, monitoring), an `AnsibleRun` with `varsFrom` works after the VM is gone too, as long as whatever creates it still knows the name and address.
+**And the blueprint cannot cover for it.** In a VM Apps organization, `Cloud.Ansible.Tower` takes `templates.de-provision[]` alongside `templates.provision[]`, so teardown playbooks are declared on the resource and run as part of its own destruction. That works because it is a *typed* resource whose provider implements a deprovision phase. All Apps has no typed Ansible resource, and `CCI.Supervisor.Resource` - the generic manifest wrapper a blueprint uses instead - has exactly six properties (`context`, `count`, `existing`, `manifest`, `object`, `wait`) and no lifecycle phase of any kind. Confirm it against your own instance:
+
+```bash
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  https://<vcfa>/deployment/api/resource-types \
+  | jq '.content[] | select(.id=="CCI.Supervisor.Resource") | .schema.properties'
+```
+
+So this is a real regression from VM Apps rather than a thing we chose not to build, and it is not one a blueprint can paper over.
+
+**What to do instead** is to sequence it from outside: run the playbook, *then* destroy. An `AnsibleRun` with a `vmRef` while the VM is still up, waited on via `.status.state`, then the deletion - see [VCFA blueprints](VCFA-BLUEPRINTS.md#decommissioning-in-the-right-order) for the shapes that work. For cleanup that doesn't need the guest at all (DNS, CMDB, monitoring), an `AnsibleRun` with `varsFrom` works after the VM is gone too, as long as whatever creates it still knows the name and address.
 
 ## Why does varsFrom refuse to read a Secret?
 

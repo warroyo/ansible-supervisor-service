@@ -358,11 +358,11 @@ Use the same shape for anything else that happens once at provisioning: opening 
 
 There is no pre-delete hook this service can use - the mechanism exists in VM Service but is restricted to privileged accounts, and [the FAQ explains why](FAQ.md#why-is-there-no-pre-delete-hook). So a decommission playbook that needs to log into the guest has to run **while the VM is still up**, and the sequencing belongs to the deployment rather than to this service.
 
-That is also how classic vRA did it: the orchestrator ran the playbook, then destroyed the machine. Nothing here is a step backwards.
+**This is a genuine regression from VM Apps, and worth being straight about.** There, `Cloud.Ansible.Tower` takes both `templates.provision[]` and `templates.de-provision[]`, and the deprovision playbooks run as part of that resource's own teardown - declared in one place, ordered correctly by construction, with nothing for the blueprint author to sequence. All Apps has no typed Ansible resource, and the generic `CCI.Supervisor.Resource` has no lifecycle phase to attach one to, so the ordering becomes the caller's problem.
 
 **The trap is putting the decommission run in the blueprint's `resources:` block.** Everything in there is created when the *deployment* is created, not when it is deleted. A decommission `AnsibleRun` declared alongside the VM runs the teardown playbook at provisioning time - against a VM that probably has no IP yet - and then, being terminal, never runs again. There is no delete-time counterpart to `resources:`, so this has to come from somewhere else.
 
-Three ways to get it, in the order worth trying them.
+Two ways to get it, plus one that looks obvious and does not work.
 
 ### A separate decommission blueprint
 
@@ -414,27 +414,30 @@ resources:
 
 Request it, let it reach `Ready`, then delete the original deployment. The decommission deployment itself can be deleted afterwards; its run created no inventory host worth keeping.
 
-### A conditional resource in the same blueprint
+### Not: a conditional resource in the same blueprint
 
-Keeps it in one place, at the cost of a stranger request form. `count` is supported on `CCI.Supervisor.Resource`, so an input can decide whether the run exists at all:
+Worth ruling out explicitly, because it is the first thing most people try. The idea is an input that decides whether the decommission run exists, flipped on a day-2 update just before deleting. It does not work, and the resource type says so.
 
-```yaml
-inputs:
-  decommission:
-    type: boolean
-    title: Run the decommission playbook
-    description: Set this, update the deployment, wait for it to finish, then delete
-    default: false
+`CCI.Supervisor.Resource` has exactly six properties. Read them off your own instance:
 
-resources:
-  Webserver_Decommission:
-    type: CCI.Supervisor.Resource
-    count: ${input.decommission ? 1 : 0}
-    properties:
-      # ...as above...
+```bash
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  https://<vcfa>/deployment/api/resource-types \
+  | jq '.content[] | select(.id=="CCI.Supervisor.Resource") | .schema.properties'
 ```
 
-The flow is: update the deployment with `decommission: true`, let the update finish (the `wait` block blocks it until the playbook is done), then delete the deployment. **Check `count: 0` behaves as "not created" in your version before relying on this** - it is the part of this pattern most likely to differ.
+| Property | Notes |
+|---|---|
+| `context` | the namespace resource id; `recreateOnUpdate` |
+| `count` | **`ignoreOnUpdate`** |
+| `existing` | use an existing namespace |
+| `manifest` | the Kubernetes object |
+| `object` | computed - the live object, which is what `${resource.X.object...}` reads |
+| `wait` | the wait block |
+
+`count` is `ignoreOnUpdate`, so changing it on a deployment update is ignored - a run gated behind `count` cannot be made to appear later. And there is no `condition` property at all. Note also that the blueprint validation endpoint accepts unknown resource properties without complaint, so a made-up `condition:` or a `count` expression will happily validate and then do nothing; the resource-type schema is the only reliable answer.
+
+The same list is the reason there is no in-blueprint deprovision hook to reach for. `Cloud.Ansible.Tower` in a VM Apps organization carries `templates.provision[]` **and `templates.de-provision[]`**, because it is a typed resource whose provider implements a deprovision phase. `CCI.Supervisor.Resource` is a generic manifest wrapper with no lifecycle phases - it applies an object on create and deletes it on destroy, and there is nowhere to hang "run this on the way out".
 
 ### Out of band
 
