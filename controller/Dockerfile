@@ -15,6 +15,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o /app/main .
 
 FROM scratch
 
+# Links the GHCR package back to this repo on the package page.
+LABEL org.opencontainers.image.source=https://github.com/warroyo/ansible-supervisor-service
+
 WORKDIR /app
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
