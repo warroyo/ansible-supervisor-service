@@ -31,7 +31,7 @@ The product-level version of this mapping - what replaces the AAP integration re
 | Re-running | Day-2 action on the deployment | Change an input that lands in an annotation, then update the deployment |
 | Deployment waits for the playbook | Built into the resource | `wait` block on the `AnsibleBinding` resource |
 
-The practical difference is the fourth row. `Cloud.Ansible.Tower` was attached to one machine and could not target anything else. `AnsibleBinding` is a selector, which is more powerful and less safe - a careless selector reaches every matching VM in the namespace, including VMs belonging to other deployments. [Scope the selector per deployment](#the-patterns-that-matter).
+The practical difference is the fourth row. `Cloud.Ansible.Tower` was attached to one machine and could not target anything else. `AnsibleBinding` is a selector, which is more powerful and less safe - a careless selector reaches every matching VM in the namespace, including VMs belonging to other deployments. [Scope the selector per deployment](#scope-the-selector-to-the-deployment).
 
 ## One-time setup
 
@@ -216,17 +216,29 @@ Substitute the namespace name, storage class, image and template name. The `imag
 
 ## The patterns that matter
 
-**Scope the selector to the deployment.** `${env.shortDeploymentId}` is stamped onto the VM as a label and matched by `vmSelector`, so deployment A's binding only ever touches deployment A's VM. Without that second label, every deployment from this blueprint shares one selector: each binding matches every other deployment's VMs, runs the playbook against all of them, and they fight over the same AWX inventory hosts. This is the one thing that has no analogue in `Cloud.Ansible.Tower` and the one thing that will bite you.
+### Scope the selector to the deployment
 
-**Name resources per deployment too.** `${env.shortDeploymentId}` in the VM name keeps AWX inventory host names unique - the inventory host name defaults to the VM's resource name. Two deployments producing a VM called `webserver` would produce one contested AWX host, and the controller refuses the second rather than hijacking it.
+`${env.shortDeploymentId}` is stamped onto the VM as a label and matched by `vmSelector`, so deployment A's binding only ever touches deployment A's VM. Without that second label, every deployment from this blueprint shares one selector: each binding matches every other deployment's VMs, runs the playbook against all of them, and they fight over the same AWX inventory hosts. This is the one thing that has no analogue in `Cloud.Ansible.Tower` and the one thing that will bite you.
 
-**`dependsOn` orders creation; `wait` is what makes it mean something.** Without `wait` on the VM, the binding is created the moment the VM object exists, before it has an IP. That is not an error - the binding sits in `Pending` and starts the run when the IP appears - but the deployment reports complete before anything is configured. Waiting for `{.status.network.primaryIP4}` and then for the binding's `{.status.state}` is what makes deployment success actually mean "configured".
+### Name resources per deployment too
 
-**Wait on `jsonPath`, not `conditions`.** These CRDs report `.status.state` and `.status.ready`, not a `.status.conditions` array, so a `conditions:` wait block will never match. Use the `jsonPath` form shown above.
+`${env.shortDeploymentId}` in the VM name keeps AWX inventory host names unique - the inventory host name defaults to the VM's resource name. Two deployments producing a VM called `webserver` would produce one contested AWX host, and the controller refuses the second rather than hijacking it.
 
-**A failed playbook surfaces as a wait timeout.** A `jsonPath` wait has no way to express "and fail immediately if the state becomes `Failed`", so a playbook that fails leaves the deployment waiting out the full `timeoutSeconds` before reporting failure. Keep the timeout tight enough that this is tolerable - a few minutes past the playbook's expected runtime - and read `.status.message` or the `ansibleJobUrl` output to find out what actually happened. If you would rather the deployment succeed and report the configuration state instead of blocking on it, drop the `wait` block from the binding and rely on the `ansibleState` output.
+### `dependsOn` orders creation, `wait` is what makes it mean something
 
-**Use the VM API version your Supervisor actually serves.** The example above uses `vmoperator.vmware.com/v1alpha5`, current on VCF 9.x Supervisors, but this moves between releases and blog examples go stale fast. Check yours before copying anything:
+Without `wait` on the VM, the binding is created the moment the VM object exists, before it has an IP. That is not an error - the binding sits in `Pending` and starts the run when the IP appears - but the deployment reports complete before anything is configured. Waiting for `{.status.network.primaryIP4}` and then for the binding's `{.status.state}` is what makes deployment success actually mean "configured".
+
+### Wait on `jsonPath`, not `conditions`
+
+These CRDs report `.status.state` and `.status.ready`, not a `.status.conditions` array, so a `conditions:` wait block will never match. Use the `jsonPath` form shown above.
+
+### A failed playbook surfaces as a wait timeout
+
+A `jsonPath` wait has no way to express "and fail immediately if the state becomes `Failed`", so a playbook that fails leaves the deployment waiting out the full `timeoutSeconds` before reporting failure. Keep the timeout tight enough that this is tolerable - a few minutes past the playbook's expected runtime - and read `.status.message` or the `ansibleJobUrl` output to find out what actually happened. If you would rather the deployment succeed and report the configuration state instead of blocking on it, drop the `wait` block from the binding and rely on the `ansibleState` output.
+
+### Use the VM API version your Supervisor actually serves
+
+The example above uses `vmoperator.vmware.com/v1alpha5`, current on VCF 9.x Supervisors, but this moves between releases and blog examples go stale fast. Check yours before copying anything:
 
 ```bash
 kubectl get crd virtualmachines.vmoperator.vmware.com \
@@ -291,12 +303,12 @@ Everything here is visible with `kubectl` against the project's Supervisor names
 |---|---|
 | Binding resource fails to create | Schema validation. Usually a non-string value in `extraVars` or `hostVariables`, or an empty `vmSelector` - which is rejected deliberately, since it would match every VM in the namespace |
 | Deployment times out waiting on the binding, state `Pending` | The selector matches nothing. Check the labels on the VM actually match both `vmSelector` keys - a `${env.shortDeploymentId}` in one place and not the other is the common one |
-| VM resource creation rejected, `no matches for kind "VirtualMachine"` | The blueprint's `apiVersion` is not a version this Supervisor serves. [Check the served list](#the-patterns-that-matter) |
+| VM resource creation rejected, `no matches for kind "VirtualMachine"` | The blueprint's `apiVersion` is not a version this Supervisor serves. [Check the served list](#use-the-vm-api-version-your-supervisor-actually-serves) |
 | Deployment times out, state `Failed`, no job URL | The controller refused to launch. Prompt on Launch for Limit is off on the AWX template, or the inventory host name collides with one another supervisor owns. `.status.message` says which |
 | Deployment times out, state `Failed`, job URL present | AWX ran the playbook and it failed. Open the job |
 | Job fails `unreachable` | The cloud-init public key does not match the AWX Machine credential's private key, or AWX has no route to the VM's IP |
 | Second deployment fails where the first succeeded | Resource names are not per-deployment. Add `${env.shortDeploymentId}` to the VM name |
-| Playbook ran against VMs from another deployment | The selector is not scoped per deployment. See [the patterns that matter](#the-patterns-that-matter) |
+| Playbook ran against VMs from another deployment | The selector is not scoped per deployment. See [Scope the selector to the deployment](#scope-the-selector-to-the-deployment) |
 
 ```bash
 kubectl get ansiblebinding -n <project-supervisor-namespace>

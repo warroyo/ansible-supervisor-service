@@ -12,6 +12,7 @@ Everything here is explained in more depth in the [README](README.md); this page
 - [5. Bind the VM to the template](#5-bind-the-vm-to-the-template)
 - [Re-running](#re-running)
 - [When it doesn't work](#when-it-doesnt-work)
+- [Cleaning up](#cleaning-up)
 
 ## Before you start
 
@@ -43,14 +44,19 @@ In AWX, on the Job Template you want to run:
 - Enable Prompt on Launch for Variables too, if you plan to pass `extraVars`.
 - Attach the **Machine credential** holding the private key. This is what logs into the VM.
 - Note which **inventory** the template uses. That's where the controller creates host entries.
+- **Workflow templates usually have no inventory of their own**, since each node carries one. With no inventory there is no host for the controller to create and nothing for `--limit` to scope, so the workflow runs against whatever its nodes target - the same as `useDefaultLimit: true`. Use a Job Template if you need the run confined to the selected VM. [More](FAQ.md#whats-different-about-workflow-templates)
 
 Then create an API token (AWX → your user → **Tokens** → Add, scope `write`) and keep it handy.
 
 ## 3. Connect the namespace to AWX
 
+Write the token to a file first. A token passed as `--from-literal` lands in your shell history and is visible to anyone who can run `ps` while the command runs.
+
 ```bash
+umask 077 && cat > awx-token   # paste the token, then Ctrl-D
+
 kubectl create secret generic awx-token -n my-namespace \
-  --from-literal=token='<paste the AWX API token>'
+  --from-file=token=./awx-token
 
 kubectl apply -n my-namespace -f - <<'EOF'
 apiVersion: field.vmware.com/v1
@@ -64,12 +70,13 @@ spec:
 EOF
 ```
 
-If AWX is served by a private CA, trust it rather than skipping verification - put the PEM bundle in a Secret (the token Secret works) and point the connection at it:
+If AWX is served by a private CA, trust it rather than skipping verification. The bundle goes in a Secret, and the token Secret you just created will do - add the PEM to it under `ca.crt`:
 
 ```bash
 kubectl create secret generic awx-token -n my-namespace \
-  --from-literal=token='<paste the AWX API token>' \
-  --from-file=ca.crt=/path/to/ca.crt
+  --from-file=token=./awx-token \
+  --from-file=ca.crt=/path/to/ca.crt \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 ```yaml
@@ -79,6 +86,8 @@ spec:
   caBundleSecretRef:
     name: "awx-token"         # key defaults to ca.crt
 ```
+
+Delete the local `awx-token` file once the Secret exists.
 
 `insecureSkipVerify: true` and `caBundleSecretRef` together are rejected.
 

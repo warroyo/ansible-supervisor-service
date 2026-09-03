@@ -41,7 +41,7 @@ A few guardrails worth knowing about:
 
 - VCF supervisor cluster with VM Service enabled. Any served `vmoperator.vmware.com` version works - the controller resolves one by API discovery at startup, preferring the newest, and logs its choice as `virtualmachine api: vmoperator.vmware.com/<version>`
 - An AWX or Ansible Automation Platform (Tower) instance that can reach your VMs over SSH at the IP they report in `status.network.primaryIP4` - that address is what the controller writes into the inventory host's `ansible_host`. If AWX has to reach them at some other address, override it per binding with `hostVariables`. AWX, Ansible Tower, AAP 2.4 and AAP 2.5+ are all supported - see [the FAQ](FAQ.md#which-awxtoweraap-versions-are-supported)
-- A Job Template or Workflow Template in AWX, with **Prompt on Launch enabled for Limit** (and for Variables, if you use `extraVars`) - [why](FAQ.md#why-does-my-template-need-prompt-on-launch-for-limit). Its inventory is where the controller creates host entries, and the Machine credential attached to it is what logs into the VMs.
+- A Job Template or Workflow Template in AWX, with **Prompt on Launch enabled for Limit** (and for Variables, if you use `extraVars`) - [why](FAQ.md#why-does-my-template-need-prompt-on-launch-for-limit). Its inventory is where the controller creates host entries, and the Machine credential attached to it is what logs into the VMs. A Workflow Template with no inventory of its own is the exception: nothing gets a host created for it and there is no inventory for `--limit` to scope against, so the run is not confined to the selected VMs - see [What's different about Workflow Templates?](FAQ.md#whats-different-about-workflow-templates)
 
 ## Install
 
@@ -52,7 +52,7 @@ A few guardrails worth knowing about:
 3. Configure values as needed (see [Values](#values) below)
 4. Click **Install**
 
-### AirGap
+### Air-gapped
 
 1. Relocate the image bundle to your registry:
 
