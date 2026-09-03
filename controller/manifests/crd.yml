@@ -253,3 +253,221 @@ spec:
     kind: AnsibleBinding
     shortNames:
       - ansbind
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ansibleruns.field.vmware.com
+spec:
+  group: field.vmware.com
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              description: a single execution - one AWX job, launched once, terminal forever. re-running means creating another AnsibleRun
+              x-kubernetes-validations:
+                - rule: "self == oldSelf"
+                  message: spec is immutable - an AnsibleRun executes once; create a new one to run again
+                - rule: "!(has(self.hosts) && has(self.vmRef))"
+                  message: spec.hosts and spec.vmRef are mutually exclusive - a run points at explicit hosts or at one VM, not both
+              properties:
+                awxConnectionRef:
+                  type: string
+                  description: name of an AWXConnection in this namespace to launch the template through
+                template:
+                  type: object
+                  description: the AWX job or workflow template to launch, once
+                  properties:
+                    name:
+                      type: string
+                      description: name of the job template or workflow job template in AWX
+                    type:
+                      type: string
+                      description: which kind of AWX template "name" refers to
+                      enum:
+                        - JobTemplate
+                        - WorkflowTemplate
+                  required:
+                    - name
+                    - type
+                vmRef:
+                  type: object
+                  description: target one VirtualMachine in this namespace - an inventory host is built from its reported IP and the run is scoped to it. mutually exclusive with hosts. reading a VM's fields into playbook variables is varsFrom's job, not this one
+                  properties:
+                    name:
+                      type: string
+                      description: name of a VirtualMachine in this namespace
+                  required:
+                    - name
+                hostName:
+                  type: string
+                  description: override the inventory host name derived from vmRef (defaults to the VM's resource name)
+                hostVariables:
+                  type: object
+                  description: extra host variables merged into the host derived from vmRef, e.g. a custom ansible_host
+                  additionalProperties:
+                    type: string
+                hosts:
+                  type: array
+                  description: explicit inventory targets, for hosts this Supervisor does not own. names are literals and the AWXConnection's hostNamePrefix is deliberately not applied to them, since they commonly name hosts that already exist in the inventory. mutually exclusive with vmRef
+                  minItems: 1
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                        description: the AWX inventory host name, used verbatim
+                      address:
+                        type: string
+                        description: sets ansible_host. omit to leave ansible_host unmanaged, which is what a host already in the inventory with working connection details needs
+                      variables:
+                        type: object
+                        description: host variables merged into this host
+                        additionalProperties:
+                          type: string
+                    required:
+                      - name
+                extraVars:
+                  type: object
+                  description: extra variables passed to the template launch
+                  additionalProperties:
+                    type: string
+                varsFrom:
+                  type: array
+                  description: extra variables read off live objects in this namespace, for a playbook that acts on a resource's behalf rather than logging into it - a hosts:localhost DNS or CMDB playbook needing a VM's name and IP as variables
+                  minItems: 1
+                  items:
+                    type: object
+                    properties:
+                      resource:
+                        type: object
+                        description: the object to read. always in this AnsibleRun's own namespace - there is deliberately no namespace field, since a cross-namespace read would let a tenant pull data out of a neighbour. Secrets are refused, because extra variables are visible in AWX job output
+                        properties:
+                          apiVersion:
+                            type: string
+                          kind:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                          - apiVersion
+                          - kind
+                          - name
+                      vars:
+                        type: object
+                        description: >-
+                          maps an extra variable name to a JSONPath evaluated against the object,
+                          e.g. record_ip -> "{.status.network.primaryIP4}". must resolve to a scalar
+                        minProperties: 1
+                        additionalProperties:
+                          type: string
+                    required:
+                      - resource
+                      - vars
+                cleanupPolicy:
+                  type: string
+                  description: whether AWX inventory hosts this run created are deleted along with it. hosts that already existed are adopted and never deleted regardless
+                  enum:
+                    - Delete
+                    - Retain
+                  default: Delete
+                activeDeadlineSeconds:
+                  type: integer
+                  minimum: 0
+                  description: bound the whole run, measured from creation. on expiry it goes terminally Failed, which is what stops a retryable condition - a referenced object that never appears, an AWX job wedged non-terminal - from waiting forever. 0 or unset means no deadline
+                ttlSecondsAfterFinished:
+                  type: integer
+                  minimum: 0
+                  description: delete this resource that long after it reaches a terminal state, taking the AWX hosts it created with it. unset keeps it indefinitely. granularity is the controller's resync period
+              required:
+                - awxConnectionRef
+                - template
+            status:
+              type: object
+              description: current status of the AnsibleRun
+              properties:
+                state:
+                  type: string
+                  description: Pending, Running, Ready, or Failed
+                message:
+                  type: string
+                ready:
+                  type: boolean
+                lastUpdated:
+                  type: string
+                  format: date-time
+                jobID:
+                  type: integer
+                  description: the one AWX job this run launched
+                jobURL:
+                  type: string
+                  description: link to the run's output in the AWX UI
+                jobStatus:
+                  type: string
+                  description: AWX's own status vocabulary for the job, e.g. pending, running, successful, failed
+                startedAt:
+                  type: string
+                  format: date-time
+                finishedAt:
+                  type: string
+                  format: date-time
+                  description: set only on a terminal outcome, and what ttlSecondsAfterFinished counts from. a retryable failure leaves it empty on purpose
+                launchAttemptedAt:
+                  type: string
+                  format: date-time
+                  description: written before the launch request goes out. set with no jobID means the controller died between the request and recording its result, so the run is failed rather than launched a second time
+                failureReason:
+                  type: string
+                  description: why a terminal failure happened, kept here because status.message is rewritten from scratch on every pass
+                resolvedVars:
+                  type: array
+                  description: the extra variable names varsFrom produced. names only - values are never echoed into status
+                  items:
+                    type: string
+                hosts:
+                  type: array
+                  description: the AWX inventory hosts this run touched
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      address:
+                        type: string
+                      awxHostID:
+                        type: integer
+                      awxInventoryID:
+                        type: integer
+                      awxHostCreated:
+                        type: boolean
+                        description: whether this run created the host. hosts that already existed are adopted and never deleted
+                      pendingCleanup:
+                        type: boolean
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Ready
+          type: boolean
+          jsonPath: .status.ready
+        - name: State
+          type: string
+          jsonPath: .status.state
+        - name: Job
+          type: integer
+          jsonPath: .status.jobID
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+  scope: Namespaced
+  names:
+    plural: ansibleruns
+    singular: ansiblerun
+    kind: AnsibleRun
+    shortNames:
+      - ansrun

@@ -13,6 +13,7 @@ Everything here is explained in more depth in the [README](README.md); this page
 - [Re-running](#re-running)
 - [When it doesn't work](#when-it-doesnt-work)
 - [Cleaning up](#cleaning-up)
+- [What next](#what-next)
 
 ## Before you start
 
@@ -33,6 +34,7 @@ Confirm the CRDs landed:
 ```bash
 kubectl get crd | grep field.vmware.com
 # ansiblebindings.field.vmware.com
+# ansibleruns.field.vmware.com
 # awxconnections.field.vmware.com
 ```
 
@@ -200,3 +202,9 @@ kubectl delete ansiblebinding webserver-config -n my-namespace
 ```
 
 Remove the service last, after the bindings are gone.
+
+## What next
+
+This walkthrough builds an `AnsibleBinding`: standing state that says "these VMs should be configured like this", re-runnable forever.
+
+The other shape is `AnsibleRun` - one AWX job, launched once, terminal. That is what you want for something that has already happened rather than something that should stay true: registering a VM in DNS, patching two servers tonight, running a decommission playbook before a VM is destroyed, or calling an external API with no host involved at all. See [AnsibleBinding or AnsibleRun?](README.md#ansiblebinding-or-ansiblerun) and `examples/ansibleRun.yml`.

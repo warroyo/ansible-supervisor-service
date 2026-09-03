@@ -7,13 +7,16 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"k8s.io/client-go/discovery"
+	memory "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
@@ -28,6 +31,8 @@ func main() {
 
 	resync := flag.Int("resync-period", 60, "reconcile resync interval, in seconds")
 	supervisorIDFlag := flag.String("supervisor-id", "", "identity stamped on AWX inventory hosts this supervisor owns, so one AWX instance can be shared by several supervisors (default: the kube-system namespace UID)")
+	varsFromGroupsFlag := flag.String("vars-from-api-groups", coreGroupAlias+","+vmGroup,
+		"comma-separated API groups an AnsibleRun's spec.varsFrom may read, with \""+coreGroupAlias+"\" for the core group. Must match the RBAC this controller is granted")
 	flag.Parse()
 	resyncPeriod := time.Duration(*resync) * time.Second
 
@@ -86,6 +91,14 @@ func main() {
 	}
 	fmt.Printf("virtualmachine api: %s\n", vmGVR.GroupVersion())
 
+	// An AnsibleRun's spec.varsFrom names kinds rather than resources, so
+	// they have to be mapped at reconcile time. Deferred and cache-backed
+	// so a CRD installed after this process started resolves on a reset
+	// rather than never.
+	varsFromRESTMapper = restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
+	allowedVarsFromGroups = parseVarsFromGroups(*varsFromGroupsFlag)
+	fmt.Printf("varsFrom api groups: %s\n", strings.Join(groupLabelList(), ", "))
+
 	// One rate limiter per queue: its backoff state is keyed by
 	// "namespace/name", so a shared limiter would let a failing
 	// AnsibleBinding throttle an identically named AWXConnection.
@@ -114,17 +127,29 @@ func main() {
 		Queue:            workqueue.NewRateLimitingQueue(newRateLimiter()),
 	}
 
-	// Both CRDs are namespace-scoped and tenant-owned, but the controller
-	// itself watches cluster-wide (no namespace allowlist to maintain) -
-	// same for the VirtualMachine lookups applyAnsibleBinding does
-	// per-namespace on demand.
+	ansRunController := &Controller{
+		client:           dynClient,
+		gvr:              ansRunGVR,
+		finalizerName:    "field.vmware.com/ansible-run-cleanup",
+		provisionFunc:    applyAnsibleRun,
+		cleanupFunc:      cleanupAnsibleRun,
+		updateStatusFunc: updateAnsibleRunStatus,
+		Queue:            workqueue.NewRateLimitingQueue(newRateLimiter()),
+	}
+
+	// Every CRD here is namespace-scoped and tenant-owned, but the
+	// controller itself watches cluster-wide (no namespace allowlist to
+	// maintain) - same for the VirtualMachine lookups applyAnsibleBinding
+	// does per-namespace on demand.
 	awxConnInformer := setupInformer(ctx, dynClient, awxConnController.gvr, awxConnController, resyncPeriod)
 	ansBindInformer := setupInformer(ctx, dynClient, ansBindController.gvr, ansBindController, resyncPeriod)
+	ansRunInformer := setupInformer(ctx, dynClient, ansRunController.gvr, ansRunController, resyncPeriod)
 
 	go awxConnInformer.Run(ctx.Done())
 	go ansBindInformer.Run(ctx.Done())
+	go ansRunInformer.Run(ctx.Done())
 
-	if !cache.WaitForCacheSync(ctx.Done(), awxConnInformer.HasSynced, ansBindInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), awxConnInformer.HasSynced, ansBindInformer.HasSynced, ansRunInformer.HasSynced) {
 		fmt.Fprintln(os.Stderr, "error waiting for cache sync")
 		os.Exit(1)
 	}
@@ -133,7 +158,7 @@ func main() {
 	// Each Run returns once its queue has drained, so the process stays
 	// alive until both controllers have finished the work in hand.
 	var wg sync.WaitGroup
-	for _, c := range []*Controller{awxConnController, ansBindController} {
+	for _, c := range []*Controller{awxConnController, ansBindController, ansRunController} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

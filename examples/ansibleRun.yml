@@ -1,0 +1,130 @@
+# An AnsibleRun is a single execution: one AWX job, launched once, terminal
+# forever. Where an AnsibleBinding is standing desired state that re-runs on
+# demand, this is what an orchestrator creates when something has already
+# happened. Its spec is immutable - to run again, create another one.
+#
+# Two independent choices describe a run:
+#
+#   where it points   nothing / spec.hosts / spec.vmRef
+#                     -> what lands in the AWX inventory and in --limit
+#   where vars come   spec.extraVars (literals) / spec.varsFrom (live objects)
+#   from              -> entirely separate from the above
+#
+# The four shapes below are all of the useful combinations. Apply whichever
+# one fits; they are separate documents, so `kubectl apply -f` takes the lot.
+
+---
+# 1. Standalone. No target at all: nothing is written to the inventory and no
+#    --limit is sent, so the template's own inventory and scope apply. This is
+#    the shape for a `hosts: localhost` playbook that talks to an external API
+#    - a ticketing system, a CMDB, a paging tool.
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: sample-open-change-ticket
+  namespace: my-namespace
+spec:
+  awxConnectionRef: sample-awx
+  template:
+    name: "Open Change Ticket"
+    type: JobTemplate
+  extraVars:
+    summary: "quarterly patch window"
+    requested_by: platform-team
+  ttlSecondsAfterFinished: 3600   # collect the CR an hour after it finishes
+
+---
+# 2. Standalone, with facts read off a live object. Still no inventory host and
+#    no --limit - the playbook runs on localhost and registers the VM in DNS
+#    with variables read straight off the VirtualMachine.
+#
+#    The Infoblox/nsupdate credential is an AWX Credential attached to the
+#    template, exactly like a Machine credential. Nothing sensitive passes
+#    through this resource, and varsFrom refuses to read a Secret at all:
+#    extra variables are visible in AWX job output.
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: sample-register-dns
+  namespace: my-namespace
+spec:
+  awxConnectionRef: sample-awx
+  template:
+    name: "Register DNS Record"
+    type: JobTemplate
+  extraVars:
+    zone: corp.example.com
+    record_state: present
+  varsFrom:
+    - resource:
+        # Use a version your Supervisor serves; check with
+        #   kubectl get crd virtualmachines.vmoperator.vmware.com \
+        #     -o jsonpath='{range .spec.versions[?(@.served)]}{.name}{"\n"}{end}'
+        apiVersion: vmoperator.vmware.com/v1alpha5
+        kind: VirtualMachine
+        name: sample-vm
+      vars:                       # each value is a JSONPath, and must resolve to a scalar
+        record_name: "{.metadata.name}"
+        record_ip: "{.status.network.primaryIP4}"
+  activeDeadlineSeconds: 600      # give up if the VM never reports an IP
+  ttlSecondsAfterFinished: 3600
+
+---
+# 3. Explicit hosts. For machines this Supervisor does not own - bare metal,
+#    network gear, a pre-existing VM. Names are literals: the AWXConnection's
+#    hostNamePrefix is deliberately NOT applied, because these commonly name
+#    hosts that already exist in the AWX inventory.
+#
+#    A host that already exists is adopted, not hijacked: its variables are
+#    merged into rather than overwritten, and it is never deleted at cleanup.
+#    Only hosts this run created are.
+#
+#    The template needs Prompt on Launch for Limit, since the run is scoped.
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: sample-emergency-patch
+  namespace: my-namespace
+spec:
+  awxConnectionRef: sample-awx
+  template:
+    name: "Emergency Patch"
+    type: JobTemplate
+  hosts:
+    - name: db-prod-01            # already in the inventory: omit address and
+                                  # its ansible_host is left exactly as it is
+    - name: db-prod-02            # new: address is what creates it
+      address: 10.20.5.12
+      variables:
+        ansible_user: dbadmin
+  extraVars:
+    package_name: openssl
+    service_name: postgresql
+  cleanupPolicy: Delete           # deletes db-prod-02, never the adopted db-prod-01
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 86400  # keep a day, as a change record
+
+---
+# 4. One Supervisor VM. An inventory host is built from the VM's reported IP
+#    and the run is scoped to it - the AnsibleBinding experience, once.
+#
+#    Typically created by a day-2 action that then deletes the VM: run the
+#    decommission playbook while the guest is still up, then destroy. There is
+#    no pre-delete hook this service can use (see the FAQ), so that ordering
+#    belongs to whatever is driving the deployment.
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: sample-decommission
+  namespace: my-namespace
+spec:
+  awxConnectionRef: sample-awx
+  template:
+    name: "Decommission Host"
+    type: JobTemplate
+  vmRef:
+    name: sample-vm               # a VirtualMachine in this namespace
+  hostName: ""                    # optional override for the derived host name
+  hostVariables: {}               # optional, e.g. reach it at a FQDN instead
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 3600

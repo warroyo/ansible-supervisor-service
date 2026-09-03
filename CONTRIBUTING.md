@@ -4,10 +4,10 @@
 
 | Path | What's in it |
 |---|---|
-| `controller/` | the Go controller - one file per concern (`awxconnection.go`, `ansiblebinding.go`, `awx_client.go`, `engine.go`) |
-| `controller/manifests/crd.yml` | both CRDs; copied into `config/` at release time |
+| `controller/` | the Go controller - one file per concern (`awxconnection.go`, `ansiblebinding.go`, `ansiblerun.go`, `varsfrom.go`, `awx_client.go`, `engine.go`) |
+| `controller/manifests/crd.yml` | all three CRDs; copied into `config/` at release time |
 | `config/` | ytt templates for the deployed service: `Deployment`, `ServiceAccount`, RBAC, values schema |
-| `examples/` | the three manifests a user applies |
+| `examples/` | the manifests a user applies |
 | `test/` | the e2e suite and its fake AWX server |
 
 ## Testing

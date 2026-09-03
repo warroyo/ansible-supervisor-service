@@ -7,3 +7,16 @@ namespace: ""
 #! instance can be shared by several supervisors without them fighting over
 #! host entries. leave empty to derive it from the kube-system namespace UID.
 supervisor_id: ""
+#! API groups an AnsibleRun's spec.varsFrom may read fields from, with "core"
+#! meaning the core group. this both grants the controller RBAC and gates what
+#! it will read, so the two can never drift apart.
+#!
+#! the controller reads with its own identity, not the requesting user's, so
+#! this is the blast radius: anything of an allowed kind in the AnsibleRun's
+#! own namespace becomes readable by anyone who can create an AnsibleRun
+#! there. Secrets are refused whatever this says. widen it deliberately.
+#! the single item below only declares the element type; the real default is
+#! the annotation, because in a ytt schema an array's default is always empty.
+#@schema/default ["core", "vmoperator.vmware.com"]
+vars_from_api_groups:
+  - ""

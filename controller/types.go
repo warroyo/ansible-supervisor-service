@@ -175,6 +175,163 @@ type VMStatus struct {
 	History           []VMRunHistoryEntry `json:"history,omitempty"`
 }
 
+// AnsibleRun is a single execution: one CR, one AWX job, terminal
+// forever. Where an AnsibleBinding is standing desired state that
+// re-runs on demand, an AnsibleRun is what an orchestrator creates when
+// an event has already happened - configure this host once, register
+// this record, open this ticket. Its spec is immutable and it never
+// launches a second job; re-running means creating another one.
+//
+// Two independent axes describe a run. Where it points (nothing, an
+// explicit list of hosts, or one VirtualMachine) decides what lands in
+// the AWX inventory and in --limit. Where its variables come from
+// (literal extraVars, plus varsFrom reading fields off live Kubernetes
+// objects) is entirely separate - a run with no target at all can still
+// read a VM's IP, which is exactly what a "register this in DNS"
+// playbook running on localhost needs.
+type AnsibleRun struct {
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              *AnsibleRunSpec   `json:"spec,omitempty"`
+	Status            *AnsibleRunStatus `json:"status,omitempty"`
+}
+
+// VMRef names a VirtualMachine in the same namespace to build an
+// inventory host from. It means only that: reading a VM's fields into
+// playbook variables is varsFrom's job, with kind VirtualMachine like
+// any other object.
+type VMRef struct {
+	Name string `json:"name"`
+}
+
+// RunHost is one explicit inventory target.
+//
+// Unlike the host name an AnsibleBinding derives from a VM, this is a
+// literal the user typed, and it commonly names a host that already
+// exists in the AWX inventory. So the AWXConnection's hostNamePrefix is
+// deliberately NOT applied to it - prefixing "db-prod-01" would match
+// nothing, create a duplicate, and run against the wrong machine.
+type RunHost struct {
+	Name string `json:"name"`
+	// Address sets ansible_host. Optional: left empty, the host's
+	// ansible_host is not managed at all, which is what a host already in
+	// the inventory with working connection details needs. A host that
+	// does not exist yet is still created without one - AWX resolves the
+	// name, which is an ordinary inventory pattern.
+	Address string `json:"address,omitempty"`
+	// Variables are merged into the host's variables, alongside
+	// ansible_host when Address is set.
+	Variables map[string]string `json:"variables,omitempty"`
+}
+
+// ResourceRef points at one object in the AnsibleRun's own namespace.
+// There is deliberately no namespace field: a cross-namespace read would
+// let a tenant pull data out of a neighbour.
+type ResourceRef struct {
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Name       string `json:"name"`
+}
+
+// VarsFromSource reads fields off one live object into extra_vars. Vars
+// maps an extra_vars key to a JSONPath expression evaluated against the
+// fetched object, grouped this way so several fields off one object cost
+// a single read.
+type VarsFromSource struct {
+	Resource ResourceRef `json:"resource"`
+	// Vars maps an extra_vars key to a JSONPath, e.g.
+	// record_ip: "{.status.network.primaryIP4}".
+	Vars map[string]string `json:"vars"`
+}
+
+type AnsibleRunSpec struct {
+	// AWXConnectionRef names an AWXConnection in this namespace.
+	AWXConnectionRef string `json:"awxConnectionRef"`
+	// Template is the job or workflow template to launch, once.
+	Template TemplateRef `json:"template"`
+
+	// VMRef targets one VirtualMachine in this namespace: an inventory
+	// host is built from its reported IP and the run is scoped to it.
+	// Mutually exclusive with Hosts.
+	VMRef *VMRef `json:"vmRef,omitempty"`
+	// HostName overrides the inventory host name derived from VMRef.
+	HostName string `json:"hostName,omitempty"`
+	// HostVariables are merged into the host derived from VMRef.
+	HostVariables map[string]string `json:"hostVariables,omitempty"`
+
+	// Hosts targets explicit inventory entries. Mutually exclusive with
+	// VMRef.
+	Hosts []RunHost `json:"hosts,omitempty"`
+
+	// ExtraVars are passed to the template at launch.
+	ExtraVars map[string]string `json:"extraVars,omitempty"`
+	// VarsFrom adds extra vars read off live objects in this namespace.
+	VarsFrom []VarsFromSource `json:"varsFrom,omitempty"`
+
+	// CleanupPolicy controls whether AWX inventory hosts this run created
+	// are deleted when it is. Defaults to Delete. Hosts that already
+	// existed are adopted and never deleted regardless.
+	CleanupPolicy string `json:"cleanupPolicy,omitempty"`
+	// ActiveDeadlineSeconds bounds the whole run, measured from creation.
+	// On expiry the run goes terminally Failed, which is what stops a
+	// retryable condition - a referenced object that never appears, an
+	// AWX job wedged non-terminal - from waiting forever. Zero means no
+	// deadline.
+	ActiveDeadlineSeconds int64 `json:"activeDeadlineSeconds,omitempty"`
+	// TTLSecondsAfterFinished deletes this CR that long after it reaches
+	// a terminal state, taking the AWX hosts it created with it. Nil
+	// keeps it indefinitely; zero collects it on the next pass.
+	TTLSecondsAfterFinished *int64 `json:"ttlSecondsAfterFinished,omitempty"`
+}
+
+// RunHostStatus is one inventory host this run touched.
+type RunHostStatus struct {
+	Name    string `json:"name"`
+	Address string `json:"address,omitempty"`
+	// AWXHostID and AWXInventoryID locate the host for cleanup.
+	AWXHostID      int64 `json:"awxHostID,omitempty"`
+	AWXInventoryID int64 `json:"awxInventoryID,omitempty"`
+	// AWXHostCreated records whether this run created the host. A host
+	// that already existed is adopted and never deleted.
+	AWXHostCreated bool `json:"awxHostCreated,omitempty"`
+	// PendingCleanup marks a host whose deletion has not succeeded yet.
+	PendingCleanup bool `json:"pendingCleanup,omitempty"`
+}
+
+type AnsibleRunStatus struct {
+	State       string `json:"state,omitempty"`
+	Message     string `json:"message,omitempty"`
+	Ready       bool   `json:"ready,omitempty"`
+	LastUpdated string `json:"lastUpdated,omitempty"`
+
+	JobID     int64  `json:"jobID,omitempty"`
+	JobURL    string `json:"jobURL,omitempty"`
+	JobStatus string `json:"jobStatus,omitempty"`
+
+	StartedAt string `json:"startedAt,omitempty"`
+	// FinishedAt is set only on a terminal outcome, and is what the TTL
+	// counts from. A retryable failure leaves it empty on purpose.
+	FinishedAt string `json:"finishedAt,omitempty"`
+	// LaunchAttemptedAt is written before the launch request goes out.
+	// Finding it set with no JobID means the process died between the
+	// POST and recording its result: the run is failed rather than
+	// launched a second time, since a job that already ran cannot be
+	// un-run.
+	LaunchAttemptedAt string `json:"launchAttemptedAt,omitempty"`
+
+	// FailureReason explains a terminal failure. It is kept in the detail
+	// half of status rather than only in status.message because message
+	// is rewritten from scratch on every pass by the engine's own field
+	// manager, which would lose the explanation as soon as the next
+	// reconcile found nothing left to do.
+	FailureReason string `json:"failureReason,omitempty"`
+
+	// ResolvedVars lists the extra_vars names varsFrom produced. Names
+	// only - the values are never echoed back into status.
+	ResolvedVars []string `json:"resolvedVars,omitempty"`
+
+	Hosts []RunHostStatus `json:"hosts,omitempty"`
+}
+
 type AnsibleBindingStatus struct {
 	State       string `json:"state,omitempty"`
 	Message     string `json:"message,omitempty"`

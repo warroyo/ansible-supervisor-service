@@ -106,6 +106,37 @@ else:
 " "$2" "$3"
 }
 
+# Counting "launched job" log lines proves a run happened. Only the launch
+# body proves it ran against what the CR asked for - that a targetless run
+# sent no limit at all, or that varsFrom reached extra_vars.
+launch_body() {   # launch_body <addr> <job id> -> prints the launch body as JSON
+  curl -sf "http://$1/_test/launches" \
+    | python3 -c "
+import json, sys
+job = int(sys.argv[1])
+for l in json.load(sys.stdin):
+    if l['job'] == job:
+        print(json.dumps(l['body']))
+        break
+else:
+    print('{}')
+" "$2"
+}
+
+launch_limit() {  # launch_limit <addr> <job id> -> prints the limit, empty if none was sent
+  launch_body "$1" "$2" | python3 -c "import json,sys; print(json.load(sys.stdin).get('limit',''))"
+}
+
+launch_var() {    # launch_var <addr> <job id> <name> -> prints one extra var
+  launch_body "$1" "$2" | python3 -c "
+import json, sys
+body = json.load(sys.stdin)
+print(json.loads(body.get('extra_vars') or '{}').get(sys.argv[1], ''))
+" "$3"
+}
+
+launch_count() { grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true; }
+
 log "creating kind cluster $CLUSTER_NAME"
 kind create cluster --name "$CLUSTER_NAME" --kubeconfig "$WORK_DIR/admin.kubeconfig" >/dev/null
 export KUBECONFIG="$WORK_DIR/admin.kubeconfig"
@@ -116,6 +147,7 @@ kubectl apply -f "$ROOT_DIR/test/fixtures/vm-crd.yml" >/dev/null
 kubectl wait --for=condition=Established --timeout=30s \
   crd/awxconnections.field.vmware.com \
   crd/ansiblebindings.field.vmware.com \
+  crd/ansibleruns.field.vmware.com \
   crd/virtualmachines.vmoperator.vmware.com >/dev/null
 
 kubectl create namespace "$SYSTEM_NS" >/dev/null
@@ -759,5 +791,649 @@ if host_deleted "$NOFILTER_ADDR" "$UNRELATED_ID"; then
   exit 1
 fi
 log "unrelated host survived cleanup"
+
+
+# =====================================================================
+# AnsibleRun: a single execution - one AWX job, launched once, terminal
+# forever. Everything below is about that "once", and about the two
+# independent axes: where a run points, and where its variables come from.
+# =====================================================================
+
+# --- standalone: no target at all means no inventory writes and no limit ---
+# This is the shape a `hosts: localhost` playbook needs. The binding refuses
+# to launch when it cannot scope a run; a run with no target deliberately
+# does the opposite and accepts the template's own scope.
+log "applying a standalone AnsibleRun (no hosts, no vmRef)"
+HOSTS_BEFORE_STANDALONE=$(curl -sf "http://${AWX_ADDR}/_test/hosts" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-standalone
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  extraVars:
+    summary: "standalone run"
+EOF
+
+wait_for "standalone run reaches Ready" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-standalone -n ${TEST_NS} -o jsonpath='{.status.state}') == Ready ]]"
+
+STANDALONE_JOB=$(kubectl get ansiblerun e2e-standalone -n "$TEST_NS" -o jsonpath='{.status.jobID}')
+if [[ -n "$(launch_limit "$AWX_ADDR" "$STANDALONE_JOB")" ]]; then
+  echo "a run with no target sent a limit: $(launch_limit "$AWX_ADDR" "$STANDALONE_JOB")"
+  exit 1
+fi
+if [[ "$(launch_var "$AWX_ADDR" "$STANDALONE_JOB" summary)" != "standalone run" ]]; then
+  echo "extraVars did not reach the launch body"
+  exit 1
+fi
+HOSTS_AFTER_STANDALONE=$(curl -sf "http://${AWX_ADDR}/_test/hosts" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+if [[ "$HOSTS_BEFORE_STANDALONE" != "$HOSTS_AFTER_STANDALONE" ]]; then
+  echo "a run with no target touched the inventory ($HOSTS_BEFORE_STANDALONE -> $HOSTS_AFTER_STANDALONE hosts)"
+  exit 1
+fi
+RUN_HOSTS=$(kubectl get ansiblerun e2e-standalone -n "$TEST_NS" -o jsonpath='{.status.hosts}')
+if [[ -n "$RUN_HOSTS" ]]; then
+  echo "expected no status.hosts on a targetless run, got: $RUN_HOSTS"
+  exit 1
+fi
+log "standalone run: job $STANDALONE_JOB launched with no limit and no inventory host"
+
+# --- a finished run is finished: nothing re-triggers it ---
+# The re-run annotation is what an AnsibleBinding exists for. A run must
+# ignore it, or "single execution" means nothing.
+log "bumping the re-run annotation on a finished run, expecting no second job"
+JOBS_BEFORE_RERUN=$(launch_count)
+kubectl annotate ansiblerun e2e-standalone -n "$TEST_NS" \
+  ansible.field.vmware.com/reconcile-requested-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite >/dev/null
+sleep 6   # several resyncs at --resync-period=2
+JOBS_AFTER_RERUN=$(launch_count)
+if [[ "$JOBS_BEFORE_RERUN" != "$JOBS_AFTER_RERUN" ]]; then
+  echo "a terminal run launched again ($JOBS_BEFORE_RERUN -> $JOBS_AFTER_RERUN)"
+  exit 1
+fi
+log "terminal run stayed terminal, no second job"
+
+# --- spec is immutable ---
+log "editing a run's spec, expecting the API server to reject it"
+if kubectl patch ansiblerun e2e-standalone -n "$TEST_NS" --type=merge \
+     -p '{"spec":{"extraVars":{"summary":"changed"}}}' >/dev/null 2>&1; then
+  echo "spec was editable; an AnsibleRun must be immutable"
+  exit 1
+fi
+log "spec edit rejected"
+kubectl delete ansiblerun e2e-standalone -n "$TEST_NS" --timeout=30s >/dev/null
+
+# --- varsFrom off a ConfigMap: the pure external-API case ---
+# A DNS/CMDB playbook runs on localhost and needs the record as variables,
+# not as an inventory host. Reading them off a live object is the point.
+log "applying a run that reads variables off a ConfigMap"
+kubectl -n "$TEST_NS" create configmap dns-config --from-literal=zone=corp.example.com >/dev/null
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-varsfrom-cm
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  varsFrom:
+    - resource:
+        apiVersion: v1
+        kind: ConfigMap
+        name: dns-config
+      vars:
+        zone: "{.data.zone}"
+EOF
+
+wait_for "ConfigMap varsFrom run reaches Ready" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-varsfrom-cm -n ${TEST_NS} -o jsonpath='{.status.state}') == Ready ]]"
+CM_JOB=$(kubectl get ansiblerun e2e-varsfrom-cm -n "$TEST_NS" -o jsonpath='{.status.jobID}')
+if [[ "$(launch_var "$AWX_ADDR" "$CM_JOB" zone)" != "corp.example.com" ]]; then
+  echo "varsFrom value did not reach extra_vars: $(launch_body "$AWX_ADDR" "$CM_JOB")"
+  exit 1
+fi
+if [[ -n "$(launch_limit "$AWX_ADDR" "$CM_JOB")" ]]; then
+  echo "varsFrom must not imply a target, but a limit was sent"
+  exit 1
+fi
+RESOLVED=$(kubectl get ansiblerun e2e-varsfrom-cm -n "$TEST_NS" -o jsonpath='{.status.resolvedVars[0]}')
+if [[ "$RESOLVED" != "zone" ]]; then
+  echo "expected status.resolvedVars to name 'zone', got '$RESOLVED'"
+  exit 1
+fi
+log "varsFrom read the ConfigMap into extra_vars, inventory untouched"
+kubectl delete ansiblerun e2e-varsfrom-cm -n "$TEST_NS" --timeout=30s >/dev/null
+
+# --- varsFrom off a VirtualMachine: the DNS registration case ---
+log "creating a VM for the run scenarios"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: vmoperator.vmware.com/v1alpha2
+kind: VirtualMachine
+metadata:
+  name: run-vm
+  namespace: ${TEST_NS}
+  labels:
+    app: runtarget
+spec: {}
+status:
+  powerState: PoweredOn
+  network:
+    primaryIP4: "10.0.0.77"
+EOF
+
+log "applying a run that reads a VM's name and IP into variables"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-varsfrom-vm
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  extraVars:
+    record_state: present
+  varsFrom:
+    - resource:
+        apiVersion: vmoperator.vmware.com/v1alpha2
+        kind: VirtualMachine
+        name: run-vm
+      vars:
+        record_name: "{.metadata.name}"
+        record_ip: "{.status.network.primaryIP4}"
+EOF
+
+wait_for "VM varsFrom run reaches Ready" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-varsfrom-vm -n ${TEST_NS} -o jsonpath='{.status.state}') == Ready ]]"
+VM_JOB=$(kubectl get ansiblerun e2e-varsfrom-vm -n "$TEST_NS" -o jsonpath='{.status.jobID}')
+if [[ "$(launch_var "$AWX_ADDR" "$VM_JOB" record_name)" != "run-vm" \
+   || "$(launch_var "$AWX_ADDR" "$VM_JOB" record_ip)" != "10.0.0.77" ]]; then
+  echo "VM fields did not reach extra_vars: $(launch_body "$AWX_ADDR" "$VM_JOB")"
+  exit 1
+fi
+if [[ -n "$(launch_limit "$AWX_ADDR" "$VM_JOB")" ]]; then
+  echo "reading a VM's fields must not turn it into a target, but a limit was sent"
+  exit 1
+fi
+log "VM name and IP arrived as variables, with no inventory host created for it"
+kubectl delete ansiblerun e2e-varsfrom-vm -n "$TEST_NS" --timeout=30s >/dev/null
+
+# --- varsFrom refusals: each terminal, each launching nothing ---
+run_must_fail_without_launching() {  # <name> <manifest on stdin> <needle in message>
+  local name="$1" needle="$2"
+  local before after msg
+  before=$(launch_count)
+  kubectl apply -f - >/dev/null
+  wait_for "$name reaches Failed" 60 bash -c \
+    "[[ \$(kubectl get ansiblerun $name -n ${TEST_NS} -o jsonpath='{.status.state}') == Failed ]]"
+  msg=$(kubectl get ansiblerun "$name" -n "$TEST_NS" -o jsonpath='{.status.message}')
+  if [[ "$msg" != *"$needle"* ]]; then
+    echo "$name: expected the message to mention '$needle', got: $msg"
+    exit 1
+  fi
+  # A terminal failure must stamp finishedAt, or the TTL can never collect it.
+  if [[ -z "$(kubectl get ansiblerun "$name" -n "$TEST_NS" -o jsonpath='{.status.finishedAt}')" ]]; then
+    echo "$name: terminal failure did not set finishedAt"
+    exit 1
+  fi
+  after=$(launch_count)
+  if [[ "$before" != "$after" ]]; then
+    echo "$name: refused but still launched a job ($before -> $after)"
+    exit 1
+  fi
+  kubectl delete ansiblerun "$name" -n "$TEST_NS" --timeout=30s >/dev/null
+}
+
+log "checking varsFrom refuses to read a Secret"
+run_must_fail_without_launching e2e-varsfrom-secret "Credential" <<EOF
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-varsfrom-secret
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  varsFrom:
+    - resource:
+        apiVersion: v1
+        kind: Secret
+        name: awx-token
+      vars:
+        leaked: "{.data.token}"
+EOF
+log "Secret refused"
+
+log "checking varsFrom refuses an API group outside vars_from_api_groups"
+run_must_fail_without_launching e2e-varsfrom-group "vars_from_api_groups" <<EOF
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-varsfrom-group
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  varsFrom:
+    - resource:
+        apiVersion: field.vmware.com/v1
+        kind: AWXConnection
+        name: e2e-awx
+      vars:
+        url: "{.spec.url}"
+EOF
+log "disallowed group refused"
+
+log "checking a varsFrom key colliding with extraVars is refused"
+run_must_fail_without_launching e2e-varsfrom-clash "already set in spec.extraVars" <<EOF
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-varsfrom-clash
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  extraVars:
+    zone: literal
+  varsFrom:
+    - resource:
+        apiVersion: v1
+        kind: ConfigMap
+        name: dns-config
+      vars:
+        zone: "{.data.zone}"
+EOF
+log "collision refused"
+
+log "checking a varsFrom path resolving to a non-scalar is refused"
+run_must_fail_without_launching e2e-varsfrom-nonscalar "scalar" <<EOF
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-varsfrom-nonscalar
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  varsFrom:
+    - resource:
+        apiVersion: v1
+        kind: ConfigMap
+        name: dns-config
+      vars:
+        everything: "{.data}"
+EOF
+log "non-scalar refused"
+
+# --- hosts and vmRef are mutually exclusive, rejected by the schema ---
+log "checking hosts and vmRef together are rejected by the CRD"
+if cat <<EOF | kubectl apply -f - >/dev/null 2>&1
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-both-targets
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  vmRef:
+    name: run-vm
+  hosts:
+    - name: somewhere
+EOF
+then
+  echo "hosts and vmRef were accepted together"
+  kubectl delete ansiblerun e2e-both-targets -n "$TEST_NS" --timeout=30s >/dev/null 2>&1 || true
+  exit 1
+fi
+log "both targets rejected"
+
+# --- inline hosts: one adopted, one created ---
+# The interesting half is adoption. A host that already exists keeps its
+# variables and is never deleted; only the one this run created goes.
+log "seeding a pre-existing inventory host, then targeting it and a new one"
+SEEDED_RUN_ID=$(curl -sf -X POST "http://${AWX_ADDR}/_test/hosts" \
+  -d '{"inventory":1,"name":"db-prod-01","variables":"{\"ansible_host\":\"10.20.5.11\",\"backup_window\":\"02:00-04:00\"}"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-hosts
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  hosts:
+    - name: db-prod-01
+    - name: db-prod-02
+      address: 10.20.5.12
+      variables:
+        ansible_user: dbadmin
+  extraVars:
+    package_name: openssl
+EOF
+
+wait_for "inline hosts run reaches Ready" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-hosts -n ${TEST_NS} -o jsonpath='{.status.state}') == Ready ]]"
+
+HOSTS_JOB=$(kubectl get ansiblerun e2e-hosts -n "$TEST_NS" -o jsonpath='{.status.jobID}')
+if [[ "$(launch_limit "$AWX_ADDR" "$HOSTS_JOB")" != "db-prod-01,db-prod-02" ]]; then
+  echo "expected the limit to name both hosts, got '$(launch_limit "$AWX_ADDR" "$HOSTS_JOB")'"
+  exit 1
+fi
+# The pre-existing host is adopted: its hand-set variables survive, and no
+# address in the CR means ansible_host was left exactly as it was.
+ADOPTED_VARS=$(host_field "$AWX_ADDR" db-prod-01 variables)
+if [[ "$ADOPTED_VARS" != *"backup_window"* || "$ADOPTED_VARS" != *"10.20.5.11"* ]]; then
+  echo "adopted host lost its own variables: $ADOPTED_VARS"
+  exit 1
+fi
+CREATED_VARS=$(host_field "$AWX_ADDR" db-prod-02 variables)
+if [[ "$CREATED_VARS" != *"10.20.5.12"* || "$CREATED_VARS" != *"dbadmin"* ]]; then
+  echo "created host has the wrong variables: $CREATED_VARS"
+  exit 1
+fi
+# awxHostCreated is omitempty, so "not ours" is an absent field rather than
+# an explicit false - read it as JSON instead of through jsonpath.
+OWNED=$(kubectl get ansiblerun e2e-hosts -n "$TEST_NS" -o json | python3 -c "
+import json, sys
+hosts = {h['name']: h.get('awxHostCreated', False) for h in json.load(sys.stdin)['status']['hosts']}
+print(json.dumps(hosts, sort_keys=True))
+")
+if [[ "$OWNED" != '{"db-prod-01": false, "db-prod-02": true}' ]]; then
+  echo "ownership recorded wrongly: $OWNED"
+  exit 1
+fi
+CREATED_ID=$(kubectl get ansiblerun e2e-hosts -n "$TEST_NS" \
+  -o jsonpath='{range .status.hosts[?(@.name=="db-prod-02")]}{.awxHostID}{end}')
+log "adopted db-prod-01 (vars intact), created db-prod-02 (id=$CREATED_ID), limit covered both"
+
+kubectl delete ansiblerun e2e-hosts -n "$TEST_NS" --timeout=30s >/dev/null
+if ! host_deleted "$AWX_ADDR" "$CREATED_ID"; then
+  echo "the host this run created was not cleaned up"
+  exit 1
+fi
+if host_deleted "$AWX_ADDR" "$SEEDED_RUN_ID"; then
+  echo "cleanup deleted the adopted host $SEEDED_RUN_ID, which it did not create"
+  exit 1
+fi
+log "cleanup removed only the created host, leaving the adopted one"
+
+# --- inline host names are literals: hostNamePrefix must not touch them ---
+# Prefixing a name the user typed would match nothing in the inventory,
+# create a duplicate, and run the playbook against the wrong machine.
+log "setting hostNamePrefix, expecting inline host names to ignore it"
+kubectl patch awxconnection e2e-awx -n "$TEST_NS" --type=merge \
+  -p '{"spec":{"hostNamePrefix":"sup-c-"}}' >/dev/null
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-hosts-prefix
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  hosts:
+    - name: literal-host-01
+      address: 10.20.9.1
+EOF
+
+wait_for "literal-host run reaches Ready" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-hosts-prefix -n ${TEST_NS} -o jsonpath='{.status.state}') == Ready ]]"
+PREFIX_JOB=$(kubectl get ansiblerun e2e-hosts-prefix -n "$TEST_NS" -o jsonpath='{.status.jobID}')
+if [[ "$(launch_limit "$AWX_ADDR" "$PREFIX_JOB")" != "literal-host-01" ]]; then
+  echo "an inline host name was prefixed: limit was '$(launch_limit "$AWX_ADDR" "$PREFIX_JOB")'"
+  exit 1
+fi
+if curl -sf "http://${AWX_ADDR}/_test/hosts" | grep -q 'sup-c-literal-host-01'; then
+  echo "a prefixed duplicate of an inline host was created"
+  exit 1
+fi
+log "inline host name used verbatim, no prefixed duplicate"
+kubectl delete ansiblerun e2e-hosts-prefix -n "$TEST_NS" --timeout=30s >/dev/null
+
+# --- a name this service DERIVES does carry the prefix ---
+log "running against a VM by reference, expecting the derived name to be prefixed"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-vmref
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  vmRef:
+    name: run-vm
+EOF
+
+wait_for "vmRef run reaches Ready" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-vmref -n ${TEST_NS} -o jsonpath='{.status.state}') == Ready ]]"
+VMREF_JOB=$(kubectl get ansiblerun e2e-vmref -n "$TEST_NS" -o jsonpath='{.status.jobID}')
+if [[ "$(launch_limit "$AWX_ADDR" "$VMREF_JOB")" != "sup-c-run-vm" ]]; then
+  echo "expected the derived host name to carry the prefix, limit was '$(launch_limit "$AWX_ADDR" "$VMREF_JOB")'"
+  exit 1
+fi
+if [[ "$(host_field "$AWX_ADDR" sup-c-run-vm variables)" != *"10.0.0.77"* ]]; then
+  echo "the host built from the VM has the wrong ansible_host"
+  exit 1
+fi
+log "vmRef built host sup-c-run-vm from the VM's reported IP and scoped the run to it"
+kubectl delete ansiblerun e2e-vmref -n "$TEST_NS" --timeout=30s >/dev/null
+kubectl patch awxconnection e2e-awx -n "$TEST_NS" --type=merge -p '{"spec":{"hostNamePrefix":""}}' >/dev/null
+
+# --- a template that would silently drop the limit must be refused ---
+log "targeting hosts with a template that has no Prompt on Launch for Limit"
+run_must_fail_without_launching e2e-run-noprompt "ask_limit_on_launch" <<EOF
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-run-noprompt
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "No Prompt Template"
+    type: JobTemplate
+  hosts:
+    - name: never-touched-01
+      address: 10.20.9.9
+EOF
+if curl -sf "http://${AWX_ADDR}/_test/hosts" | grep -q 'never-touched-01'; then
+  log "note: the host was upserted before the launch was refused, and cleaned up with the run"
+fi
+log "refused rather than running against the whole inventory"
+
+# --- activeDeadlineSeconds ends a run wedged on a retryable condition ---
+# A referenced object that never appears is deliberately retryable, so
+# without a deadline this run would wait forever.
+log "applying a run whose varsFrom object never appears, with a short deadline"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-deadline
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  activeDeadlineSeconds: 5
+  varsFrom:
+    - resource:
+        apiVersion: v1
+        kind: ConfigMap
+        name: never-created
+      vars:
+        nope: "{.data.nope}"
+EOF
+
+wait_for "deadline run reaches Failed" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-deadline -n ${TEST_NS} -o jsonpath='{.status.state}') == Failed ]]"
+DEADLINE_MSG=$(kubectl get ansiblerun e2e-deadline -n "$TEST_NS" -o jsonpath='{.status.message}')
+if [[ "$DEADLINE_MSG" != *"activeDeadlineSeconds"* ]]; then
+  echo "expected the deadline to be named in the message, got: $DEADLINE_MSG"
+  exit 1
+fi
+if [[ -z "$(kubectl get ansiblerun e2e-deadline -n "$TEST_NS" -o jsonpath='{.status.finishedAt}')" ]]; then
+  echo "a deadline expiry must set finishedAt so the TTL can collect it"
+  exit 1
+fi
+log "deadline expiry ended the run: $DEADLINE_MSG"
+kubectl delete ansiblerun e2e-deadline -n "$TEST_NS" --timeout=30s >/dev/null
+
+# --- ttlSecondsAfterFinished collects the run and its hosts ---
+log "applying a run with a short TTL, expecting it to delete itself"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-ttl
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  hosts:
+    - name: ttl-host-01
+      address: 10.20.9.21
+  ttlSecondsAfterFinished: 5
+EOF
+
+wait_for "TTL run reaches Ready" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-ttl -n ${TEST_NS} -o jsonpath='{.status.state}') == Ready ]]"
+TTL_HOST_ID=$(kubectl get ansiblerun e2e-ttl -n "$TEST_NS" -o jsonpath='{.status.hosts[0].awxHostID}')
+wait_for "TTL run deletes itself" 60 bash -c \
+  "! kubectl get ansiblerun e2e-ttl -n ${TEST_NS} >/dev/null 2>&1"
+if ! host_deleted "$AWX_ADDR" "$TTL_HOST_ID"; then
+  echo "the TTL deleted the run but left AWX host $TTL_HOST_ID behind"
+  exit 1
+fi
+log "TTL collected the run and its AWX host $TTL_HOST_ID"
+
+# --- cleanupPolicy: Retain keeps the host when the run goes ---
+log "applying a Retain run with a short TTL, expecting the host to survive"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-ttl-retain
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  hosts:
+    - name: retained-host-01
+      address: 10.20.9.31
+  cleanupPolicy: Retain
+  ttlSecondsAfterFinished: 5
+EOF
+
+wait_for "Retain run reaches Ready" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-ttl-retain -n ${TEST_NS} -o jsonpath='{.status.state}') == Ready ]]"
+RETAIN_HOST_ID=$(kubectl get ansiblerun e2e-ttl-retain -n "$TEST_NS" -o jsonpath='{.status.hosts[0].awxHostID}')
+wait_for "Retain run deletes itself" 60 bash -c \
+  "! kubectl get ansiblerun e2e-ttl-retain -n ${TEST_NS} >/dev/null 2>&1"
+if host_deleted "$AWX_ADDR" "$RETAIN_HOST_ID"; then
+  echo "cleanupPolicy: Retain still deleted host $RETAIN_HOST_ID"
+  exit 1
+fi
+log "Retain kept host $RETAIN_HOST_ID after the run was collected"
+
+# --- a run and a binding sharing a name must not share host ownership ---
+# The ownership marker lives in the AWX host description. If both kinds
+# produced the same marker, each would believe it could delete the other's
+# host - so the run's marker carries its kind.
+log "creating an AnsibleRun and an AnsibleBinding with the same name, contesting one host"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-contested
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  hosts:
+    - name: contested-host
+      address: 10.20.9.41
+EOF
+wait_for "the run claims the host" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-contested -n ${TEST_NS} -o jsonpath='{.status.state}') == Ready ]]"
+CONTESTED_ID=$(kubectl get ansiblerun e2e-contested -n "$TEST_NS" -o jsonpath='{.status.hosts[0].awxHostID}')
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleBinding
+metadata:
+  name: e2e-contested
+  namespace: ${TEST_NS}
+spec:
+  vmSelector:
+    app: runtarget
+  awxConnectionRef: e2e-awx
+  hostName: contested-host
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+EOF
+
+wait_for "the binding refuses the run's host" 60 bash -c \
+  "kubectl get ansiblebinding e2e-contested -n ${TEST_NS} -o jsonpath='{.status.message}' | grep -q 'already owned'"
+if host_deleted "$AWX_ADDR" "$CONTESTED_ID"; then
+  echo "the binding deleted the run's host $CONTESTED_ID"
+  exit 1
+fi
+log "same-named binding refused the run's host instead of taking it over"
+
+kubectl delete ansiblebinding e2e-contested -n "$TEST_NS" --timeout=30s >/dev/null
+if host_deleted "$AWX_ADDR" "$CONTESTED_ID"; then
+  echo "deleting the binding took the run's host $CONTESTED_ID with it"
+  exit 1
+fi
+kubectl delete ansiblerun e2e-contested -n "$TEST_NS" --timeout=30s >/dev/null
+if ! host_deleted "$AWX_ADDR" "$CONTESTED_ID"; then
+  echo "the run that created host $CONTESTED_ID did not clean it up"
+  exit 1
+fi
+log "ownership stayed with the run throughout"
 
 log "ALL CHECKS PASSED"

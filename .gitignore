@@ -4,3 +4,4 @@ ansible-supervisor.yml
 config/crd.yml
 /controller/ansible-supervisor-service
 config/config-release.yml
+/test/fakeawx/fakeawx

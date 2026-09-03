@@ -101,19 +101,9 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 	// inventory host via --limit.
 	targetsHost := !ac.Spec.UseDefaultLimit && tmpl.Inventory != nil
 
-	// AWX silently drops launch fields the template isn't configured to
-	// accept (ask_*_on_launch). A dropped limit means the template runs
-	// against its ENTIRE inventory rather than the targeted VM, so refuse
-	// to launch at all rather than widen the blast radius.
-	if targetsHost && !tmpl.AskLimitOnLaunch {
-		return fmt.Errorf("template %q does not accept a limit at launch time (ask_limit_on_launch is false), "+
-			"so AWX would ignore the per-VM limit and run against the whole inventory: enable Prompt on Launch for Limit in AWX, "+
-			"or set spec.useDefaultLimit: true to accept the template's own scope", ac.Spec.Template.Name)
-	}
-	if len(ac.Spec.ExtraVars) > 0 && !tmpl.AskVariablesOnLaunch {
-		return fmt.Errorf("template %q does not accept extra variables at launch time (ask_variables_on_launch is false), "+
-			"so AWX would ignore spec.extraVars: enable Prompt on Launch for Variables in AWX, or remove spec.extraVars",
-			ac.Spec.Template.Name)
+	if err := checkTemplateAcceptsLaunchFields(tmpl, ac.Spec.Template.Name, targetsHost, len(ac.Spec.ExtraVars) > 0,
+		"set spec.useDefaultLimit: true to accept the template's own scope"); err != nil {
+		return err
 	}
 
 	priorByName := map[string]VMStatus{}
@@ -219,20 +209,8 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 				vs.AWXInventoryID = 0
 			}
 
-			hostVars := map[string]string{"ansible_host": ip}
-			for k, v := range ac.Spec.HostVariables {
-				hostVars[k] = v
-			}
-
-			// Reconcile the host against AWX itself on every pass, rather
-			// than trusting what status says was pushed last time. A host
-			// deleted or edited in the AWX UI is drift like any other, and
-			// status cannot see it: the run would then fail forever with
-			// "--limit does not match any hosts", or quietly run against
-			// hand-edited variables, and nothing would ever repair it.
-			// UpsertHost PATCHes only when the variables actually differ,
-			// so a steady state costs one GET per VM per resync.
-			hostID, owned, hErr := awxClient.UpsertHost(ctx, *tmpl.Inventory, hostName, hostOwnerMarker(ac.Namespace, ac.Name), hostVars)
+			hostID, owned, hErr := upsertInventoryHost(ctx, awxClient, *tmpl.Inventory, hostName,
+				hostOwnerMarker(ac.Namespace, ac.Name), ip, ac.Spec.HostVariables)
 			if hErr != nil {
 				vs.Phase = PhaseFailed
 				recordErr(fmt.Errorf("upserting AWX host for VM %q: %w", name, hErr))

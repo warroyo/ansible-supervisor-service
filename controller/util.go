@@ -94,6 +94,7 @@ func resolveVMGVR(d versionDiscoverer) (schema.GroupVersionResource, error) {
 
 var awxConnGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "awxconnections"}
 var ansBindGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "ansiblebindings"}
+var ansRunGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "ansibleruns"}
 
 // ReconcileRequestedAtAnnotation is the annotation a user bumps to force
 // a re-run of an AnsibleBinding that's already up to date
@@ -131,6 +132,16 @@ func hostOwnerMarker(namespace, name string) string {
 	return fmt.Sprintf("%s%s:%s/%s", hostMarkerPrefix, supervisorID, namespace, name)
 }
 
+// runHostOwnerMarker is hostOwnerMarker for AnsibleRuns. The kind is in
+// the path because an AnsibleRun and an AnsibleBinding sharing a name in
+// one namespace would otherwise produce the same marker, and each would
+// believe it was entitled to delete the other's host. Only the new kind
+// carries the segment, so markers already written by bindings keep
+// working with nothing to migrate.
+func runHostOwnerMarker(namespace, name string) string {
+	return fmt.Sprintf("%s%s:%s/%s/%s", hostMarkerPrefix, supervisorID, namespace, ansRunGVR.Resource, name)
+}
+
 // resolveSupervisorID returns the configured identity, falling back to
 // the kube-system namespace UID.
 func resolveSupervisorID(ctx context.Context, client *dynamic.DynamicClient, override string) (string, error) {
@@ -156,6 +167,12 @@ func convertAWXConnection(u *unstructured.Unstructured) (AWXConnection, error) {
 
 func convertAnsibleBinding(u *unstructured.Unstructured) (AnsibleBinding, error) {
 	var c AnsibleBinding
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &c)
+	return c, err
+}
+
+func convertAnsibleRun(u *unstructured.Unstructured) (AnsibleRun, error) {
+	var c AnsibleRun
 	err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &c)
 	return c, err
 }
@@ -296,6 +313,50 @@ func isTerminalAWXStatus(status string) bool {
 		return true
 	}
 	return false
+}
+
+// checkTemplateAcceptsLaunchFields refuses a launch AWX would quietly
+// strip fields from. AWX drops launch fields a template isn't configured
+// to accept (ask_*_on_launch) rather than erroring, and a dropped limit
+// means the run reaches the template's entire inventory instead of the
+// hosts we targeted - so this must be checked before launching, not
+// detected afterwards from ignored_fields.
+//
+// limitRemedy names the way out for the calling kind, since "accept the
+// template's own scope" is a different field on each.
+func checkTemplateAcceptsLaunchFields(tmpl *AWXTemplate, templateName string, wantLimit, wantExtraVars bool, limitRemedy string) error {
+	if wantLimit && !tmpl.AskLimitOnLaunch {
+		return fmt.Errorf("template %q does not accept a limit at launch time (ask_limit_on_launch is false), "+
+			"so AWX would ignore the limit and run against the whole inventory: enable Prompt on Launch for Limit in AWX, "+
+			"or %s", templateName, limitRemedy)
+	}
+	if wantExtraVars && !tmpl.AskVariablesOnLaunch {
+		return fmt.Errorf("template %q does not accept extra variables at launch time (ask_variables_on_launch is false), "+
+			"so AWX would ignore spec.extraVars: enable Prompt on Launch for Variables in AWX, or remove spec.extraVars",
+			templateName)
+	}
+	return nil
+}
+
+// upsertInventoryHost reconciles one AWX inventory host against AWX
+// itself, rather than against what status says was pushed last time. A
+// host deleted or hand-edited in the AWX UI is drift like any other and
+// status cannot see it: the run would then fail forever with "--limit
+// does not match any hosts", or quietly run against edited variables,
+// with nothing to repair it. UpsertHost PATCHes only when the variables
+// actually differ, so a steady state costs one GET.
+//
+// An empty address leaves ansible_host unmanaged, for a host whose
+// connection details are already right in the inventory.
+func upsertInventoryHost(ctx context.Context, client *AWXClient, inventoryID int, hostName, ownerMarker, address string, extraVars map[string]string) (id int, owned bool, err error) {
+	vars := map[string]string{}
+	if address != "" {
+		vars["ansible_host"] = address
+	}
+	for k, v := range extraVars {
+		vars[k] = v
+	}
+	return client.UpsertHost(ctx, inventoryID, hostName, ownerMarker, vars)
 }
 
 func pollJobStatus(ctx context.Context, client *AWXClient, templateType string, jobID int64) (string, error) {

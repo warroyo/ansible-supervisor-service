@@ -11,6 +11,8 @@ This page is about **All Apps** organizations only. If you are in a **VM Apps** 
 - [Passing blueprint inputs to the playbook](#passing-blueprint-inputs-to-the-playbook)
 - [Re-running the playbook as a day-2 update](#re-running-the-playbook-as-a-day-2-update)
 - [Multiple VMs](#multiple-vms)
+- [One-off actions with AnsibleRun](#one-off-actions-with-ansiblerun)
+- [Decommissioning in the right order](#decommissioning-in-the-right-order)
 - [Teardown](#teardown)
 - [Troubleshooting](#troubleshooting)
 
@@ -289,11 +291,100 @@ Different roles get different bindings pointed at different templates - `app: we
 
 Ordering between roles is `dependsOn` between the binding resources: a `Webserver_Ansible` that `dependsOn: [Database_Ansible]` does not start until the database binding's wait has been satisfied. That is how you get "configure the database, then the app tier" out of a single deployment.
 
+## One-off actions with AnsibleRun
+
+An `AnsibleBinding` is standing state, which is right for "this tier should be configured like this" and wrong for "register this in DNS". A binding for a one-time action has to be created, waited on, and then remembered about forever, because nothing ever finishes it.
+
+`AnsibleRun` is the one-time version: one AWX job, launched once, terminal, and optionally self-deleting. In a blueprint it is another `CCI.Supervisor.Resource`, waited on exactly the same way:
+
+```yaml
+  Webserver_DNS:
+    type: CCI.Supervisor.Resource
+    dependsOn:
+      - Webserver_VM
+    properties:
+      context: ${resource.CCI_Supervisor_Namespace_1.id}
+      manifest:
+        apiVersion: field.vmware.com/v1
+        kind: AnsibleRun
+        metadata:
+          name: dns-${input.vmName}-${env.shortDeploymentId}
+        spec:
+          awxConnectionRef: awx
+          template:
+            name: "Register DNS Record"
+            type: JobTemplate
+          extraVars:
+            zone: ${input.dnsZone}
+            record_state: present
+          varsFrom:
+            - resource:
+                apiVersion: vmoperator.vmware.com/v1alpha5
+                kind: VirtualMachine
+                name: ${input.vmName}-${env.shortDeploymentId}
+              vars:
+                record_name: "{.metadata.name}"
+                record_ip: "{.status.network.primaryIP4}"
+          activeDeadlineSeconds: 600
+          ttlSecondsAfterFinished: 3600
+      wait:
+        timeoutSeconds: 900
+        jsonPath:
+          - path: '{.status.state}'
+            regex: '^Ready$'
+```
+
+Three things about that are worth understanding rather than copying:
+
+**The playbook does not target the VM.** It runs `hosts: localhost` on the AWX execution node and calls the DNS API, so this run has no `vmRef` and no `hosts` - nothing goes into the AWX inventory and no `--limit` is sent. The VM is *data*, arriving as variables through `varsFrom`. The Infoblox (or nsupdate, or Route53) credential is an AWX Credential on the template, exactly like the Machine credential that logs into VMs; nothing sensitive passes through the blueprint.
+
+**`varsFrom` is what removes the ordering headache.** The alternative is passing `${resource.Webserver_VM.object.status.network.primaryIP4}` as an `extraVars` string, which forces the VM's `wait` block to have already resolved the IP. Reading it off the live object instead means the run simply sits `Pending` and retries until the IP appears - `activeDeadlineSeconds` is what stops that waiting forever. Keeping the `wait` on the VM is still worth it, since it makes the first attempt succeed.
+
+**`ttlSecondsAfterFinished` matters more here than anywhere else.** A blueprint deployed a hundred times leaves a hundred finished runs in the namespace otherwise. With a TTL the CR deletes itself an hour after finishing, taking any AWX inventory hosts it created with it.
+
+Use the same shape for anything else that happens once: opening a change ticket, registering in a CMDB, notifying a channel, adding the VM to a monitoring group.
+
+## Decommissioning in the right order
+
+There is no pre-delete hook this service can use - the mechanism exists in VM Service but is restricted to privileged accounts, and [the FAQ explains why](FAQ.md#why-is-there-no-pre-delete-hook). So a decommission playbook that needs to log into the guest has to run **while the VM is still up**, and the sequencing belongs to the deployment rather than to this service.
+
+That is also how classic vRA did it: the orchestrator ran the playbook, then destroyed the machine. Nothing here is a step backwards.
+
+As a day-2 action, with a `vmRef` because this playbook really does need to reach the guest:
+
+```yaml
+          manifest:
+            apiVersion: field.vmware.com/v1
+            kind: AnsibleRun
+            metadata:
+              name: decom-${input.vmName}-${env.shortDeploymentId}
+            spec:
+              awxConnectionRef: awx
+              template:
+                name: "Decommission Host"
+                type: JobTemplate
+              vmRef:
+                name: ${input.vmName}-${env.shortDeploymentId}
+              activeDeadlineSeconds: 900
+              ttlSecondsAfterFinished: 3600
+          wait:
+            timeoutSeconds: 1200
+            jsonPath:
+              - path: '{.status.state}'
+                regex: '^Ready$'
+```
+
+Run that, confirm it reached `Ready`, and only then delete the deployment.
+
+Cleanup that does **not** need the guest - removing a DNS record, closing a CMDB entry - has no such constraint and can run after the VM is gone, as long as whatever creates the run still knows the name and address to pass in `extraVars`. It cannot use `varsFrom` against the VM at that point, because there is no VM left to read.
+
 ## Teardown
 
 Deleting the deployment deletes the `AnsibleBinding`, whose finalizer blocks until the controller has removed the AWX inventory hosts it created. This is normally invisible - it takes a second or two - but it means **the service must still be running on the Supervisor when deployments are deleted.** If the service is removed first, the bindings hang in `Terminating` and the deployment's delete does not finish. Recovery is to reinstall the service and let it drain them, or strip the finalizers by hand and clean AWX up yourself ([how to find the leftovers](FAQ.md#how-do-i-find-awx-hosts-a-supervisor-left-behind)).
 
-Set `cleanupPolicy: Retain` on the binding if you want the AWX host entries kept after the deployment is gone - for run history or audit. They are then yours to clean up.
+`AnsibleRun` carries the same finalizer and the same caveat. A run with `ttlSecondsAfterFinished` has usually collected itself long before teardown, which is one more reason to set one; a run with no TTL is deleted with the deployment like anything else.
+
+Set `cleanupPolicy: Retain` on a binding or run if you want the AWX host entries kept after the deployment is gone - for run history or audit. They are then yours to clean up.
 
 ## Troubleshooting
 

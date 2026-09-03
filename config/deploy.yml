@@ -1,4 +1,10 @@
 #@ load("@ytt:data", "data")
+
+#! "core" is how the core API group is spelled in values, since "" is not a
+#! legible thing to put in a config list. RBAC wants the empty string back.
+#@ def vars_from_groups():
+#@   return [("" if g == "core" else g) for g in data.values.vars_from_api_groups]
+#@ end
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -36,6 +42,9 @@ spec:
         args:
         - #@ "--resync-period=" + data.values.resync_period
         - #@ "--supervisor-id=" + data.values.supervisor_id
+        #! passed as well as granted, so the controller refuses a varsFrom
+        #! read it has no RBAC for with an explanation instead of a Forbidden.
+        - #@ "--vars-from-api-groups=" + ",".join(data.values.vars_from_api_groups)
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -88,9 +97,26 @@ rules:
     resources:
       - awxconnections
       - ansiblebindings
+      - ansibleruns
       - awxconnections/status
       - ansiblebindings/status
+      - ansibleruns/status
     verbs: ["get", "list", "watch", "update", "patch"]
+  #! delete, on ansibleruns only: a finished run collects itself once
+  #! ttlSecondsAfterFinished elapses. Nothing else here is ever deleted by
+  #! the controller.
+  - apiGroups: ["field.vmware.com"]
+    resources: ["ansibleruns"]
+    verbs: ["delete"]
+  #! get only, and only in the groups vars_from_api_groups names: this is
+  #! what an AnsibleRun's spec.varsFrom reads fields out of. list/watch are
+  #! deliberately absent - varsFrom names one object at a time, so the
+  #! controller never needs to enumerate a namespace. Secrets are refused in
+  #! code regardless of what the core group grants here, since extra
+  #! variables are visible in AWX job output.
+  - apiGroups: #@ vars_from_groups()
+    resources: ["*"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -105,11 +131,12 @@ subjects:
     name: ansible-supervisor
     namespace: #@ data.values.namespace
 ---
-#! Both CRDs are namespace-scoped and tenant-owned - a tenant with edit/admin
-#! on their namespace can manage their own AWXConnections and
-#! AnsibleBindings without any extra grant. Unlike a cross-namespace
-#! credential-sharing CRD, there's no separate "authority" concept needed here:
-#! an AWXConnection's Secret never leaves the namespace it's created in.
+#! Every CRD here is namespace-scoped and tenant-owned - a tenant with
+#! edit/admin on their namespace can manage their own AWXConnections,
+#! AnsibleBindings and AnsibleRuns without any extra grant. Unlike a
+#! cross-namespace credential-sharing CRD, there's no separate "authority"
+#! concept needed here: an AWXConnection's Secret never leaves the namespace
+#! it's created in.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -119,7 +146,7 @@ metadata:
     rbac.authorization.k8s.io/aggregate-to-edit: "true"
 rules:
 - apiGroups: ["field.vmware.com"]
-  resources: ["awxconnections", "ansiblebindings"]
+  resources: ["awxconnections", "ansiblebindings", "ansibleruns"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -130,5 +157,5 @@ metadata:
     rbac.authorization.k8s.io/aggregate-to-view: "true"
 rules:
 - apiGroups: ["field.vmware.com"]
-  resources: ["awxconnections", "ansiblebindings"]
+  resources: ["awxconnections", "ansiblebindings", "ansibleruns"]
   verbs: ["get", "list", "watch"]

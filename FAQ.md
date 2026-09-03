@@ -7,6 +7,9 @@
 - [How do I find AWX hosts a supervisor left behind?](#how-do-i-find-awx-hosts-a-supervisor-left-behind)
 - [What's different about Workflow Templates?](#whats-different-about-workflow-templates)
 - [What happens to in-flight runs when a VM powers off?](#what-happens-to-in-flight-runs-when-a-vm-powers-off)
+- [Why is there no pre-delete hook?](#why-is-there-no-pre-delete-hook)
+- [Why does varsFrom refuse to read a Secret?](#why-does-varsfrom-refuse-to-read-a-secret)
+- [Why do AnsibleBinding and AnsibleRun handle a lost launch differently?](#why-do-ansiblebinding-and-ansiblerun-handle-a-lost-launch-differently)
 
 ## I used the AAP integration in classic Aria Automation. What maps to what?
 
@@ -111,3 +114,48 @@ Workflow templates commonly have no inventory of their own, since each node can 
 The run is tracked independently of the VM, so nothing is lost. A job already running is still polled to completion, and the VM keeps its last run's phase rather than reverting to `Pending`.
 
 Re-run requests made during downtime aren't swallowed either. Whether a run is needed is decided per VM (`status.vms[].appliedGeneration` / `appliedTrigger`), so a spec change or annotation bump made while one VM's job is still running - or while a VM is powered off - is honored as soon as that VM can act on it.
+
+## Why is there no pre-delete hook?
+
+Because the mechanism exists and this service is not allowed to use it.
+
+VM Service has a real one: annotate a VM with `delete.check.vmoperator.vmware.com/<component>: <reason>` and vm-operator will not destroy it until the annotation is removed. It is stronger than a finalizer, too - vm-operator holds off deleting the *vSphere* VM, not just the Kubernetes object, which is exactly what a decommission playbook needs. There is a sibling `poweron.check.vmoperator.vmware.com/<component>` for power-on.
+
+Both are gated on vm-operator's `IsPrivilegedAccount`: the vm-operator service account, `system:masters`, kube-admin, or an entry in its `PRIVILEGED_USERS` list. That list is an environment variable baked into the vm-operator manager Deployment by VCF. It does support supervisor services - a stock VCF 9.x supervisor has an entry like `system:serviceaccount:svc-configuration-HASH:configuration-service-controller-manager`, whose wildcard matches the `svc-<name>-<5 characters>` namespace shape every supervisor service gets. But a Carvel package cannot add itself to it, so this service's account is not privileged and its annotation would be rejected.
+
+A plain finalizer on the `VirtualMachine` is not a workaround. vm-operator's own finalizer destroys the vSphere VM during its finalization, so ours would only keep a dead API object around and the playbook would SSH into nothing.
+
+Watching for VM deletions and reacting after the fact was considered and rejected on accuracy. "Left the selector" conflates a VM being deleted, a VM being relabelled, and the binding's own selector being edited; even narrowing to "the object is gone" cannot separate a decommission from a delete-and-recreate. Intent lives in whatever asked for the deletion, and it is not recoverable from watching state change.
+
+**What to do instead** is what vRA itself does: let the orchestrator sequence it. Run the playbook, *then* destroy. In a VCF Automation blueprint that is a day-2 action creating an `AnsibleRun` with a `vmRef` while the VM is still up, waiting on `.status.state`, and deleting the VM after - see [VCFA blueprints](VCFA-BLUEPRINTS.md#decommissioning-in-the-right-order). For cleanup that doesn't need the guest at all (DNS, CMDB, monitoring), an `AnsibleRun` with `varsFrom` works after the VM is gone too, as long as whatever creates it still knows the name and address.
+
+## Why does varsFrom refuse to read a Secret?
+
+Because `extra_vars` are not a private channel. AWX echoes them in job output and keeps them in the job's stored launch parameters, so anything read this way is visible to everyone who can see that job - long after the run. Sourcing a password through it would be a credential leak with extra steps, so the refusal is unconditional: it applies even when the core API group is in `vars_from_api_groups` and the controller could technically read the Secret.
+
+The mechanism for credentials is an AWX Credential attached to the template, exactly as the Machine credential that logs into VMs already is. A custom credential type injecting environment variables covers the API-token case:
+
+```yaml
+# input configuration
+fields:
+  - id: infoblox_host,     type: string, label: Grid Master
+  - id: infoblox_username, type: string, label: Username
+  - id: infoblox_password, type: string, label: Password, secret: true
+# injector configuration
+env:
+  INFOBLOX_HOST:     "{{ infoblox_host }}"
+  INFOBLOX_USERNAME: "{{ infoblox_username }}"
+  INFOBLOX_PASSWORD: "{{ infoblox_password }}"
+```
+
+The playbook then needs no `provider:` block at all, and nothing sensitive passes through this service.
+
+## Why do AnsibleBinding and AnsibleRun handle a lost launch differently?
+
+There is a window in both: the controller sends a launch to AWX and dies before recording the job ID. On the next pass it cannot tell whether the job started.
+
+An `AnsibleBinding` relaunches. Its playbooks are convergent configuration - running one twice is how the resource works in the first place, and leaving a VM unconfigured is the worse outcome.
+
+An `AnsibleRun` refuses to. It exists for things that are *not* convergent: opening a ticket, decommissioning a host, sending a notification. Doing one of those twice can be worse than not doing it, and unlike a binding there is no later reconcile that would put things right. So the run records `status.launchAttemptedAt` before sending the launch, and finding that set with no `jobID` fails the run with a message pointing at AWX's recent jobs for that template. If it did not run, create another `AnsibleRun`.
+
+This is also why `AnsibleRun` never launches twice for any other reason: its spec is immutable, and the re-run annotation an `AnsibleBinding` responds to is ignored.

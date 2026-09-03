@@ -39,6 +39,12 @@ type jobRec struct {
 	ID       int
 	Workflow bool
 	Polls    int
+	// TemplateID and Body record what was actually launched. Counting
+	// "launched job" log lines proves a run happened; only the body proves
+	// it was scoped the way the CR asked for - that a targetless run sent
+	// no limit at all, or that varsFrom reached extra_vars.
+	TemplateID int
+	Body       map[string]interface{}
 }
 
 type server struct {
@@ -252,7 +258,7 @@ func (s *server) handleLaunch(list []templateRec, workflow bool) func(http.Respo
 
 		id := s.nextJobID
 		s.nextJobID++
-		s.jobs[id] = &jobRec{ID: id, Workflow: workflow}
+		s.jobs[id] = &jobRec{ID: id, Workflow: workflow, TemplateID: templateID, Body: body}
 		log.Printf("fakeawx: launched job %d (template=%d workflow=%v limit=%v ignored=%v)", id, templateID, workflow, body["limit"], ignored)
 
 		resp := map[string]interface{}{}
@@ -320,6 +326,35 @@ func (s *server) handleTestHosts(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// /_test/launches reports what every launch actually asked for, oldest
+// first. The log line proves a job ran; this proves what it ran against.
+func (s *server) handleTestLaunches(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := make([]int, 0, len(s.jobs))
+	for id := range s.jobs {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+
+	launches := make([]map[string]interface{}, 0, len(ids))
+	for _, id := range ids {
+		j := s.jobs[id]
+		body := j.Body
+		if body == nil {
+			body = map[string]interface{}{}
+		}
+		launches = append(launches, map[string]interface{}{
+			"job":      j.ID,
+			"template": j.TemplateID,
+			"workflow": j.Workflow,
+			"body":     body,
+		})
+	}
+	writeJSON(w, 200, launches)
+}
+
 func (s *server) handleTestDeletedHosts(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -352,6 +387,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/_test/deleted-hosts":
 		s.handleTestDeletedHosts(w, r)
+		return
+	case "/_test/launches":
+		s.handleTestLaunches(w, r)
 		return
 	}
 
