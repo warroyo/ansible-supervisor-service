@@ -4,13 +4,20 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 )
 
-func (c *Controller) processNextWorkItem() bool {
+// maxReconcileRetries bounds fast retries for an ordinary reconcile
+// failure. Past it the key is dropped and the periodic resync picks it
+// up again, so a permanently broken resource stops spinning without
+// being forgotten for good.
+const maxReconcileRetries = 10
+
+func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	// Get() blocks until an item is available.
 	obj, shutdown := c.Queue.Get()
 	if shutdown {
@@ -28,14 +35,18 @@ func (c *Controller) processNextWorkItem() bool {
 		return true
 	}
 
-	if err := c.reconcileByKey(key); err != nil {
-		if c.Queue.NumRequeues(key) < 10 {
+	if err := c.reconcileByKey(ctx, key); err != nil {
+		// Finalization is never abandoned. Dropping the key would leave
+		// the resource stuck in Terminating with its AWX hosts leaked,
+		// and a deleting object may produce no further events to
+		// rediscover it from.
+		if isCleanupPending(err) || c.Queue.NumRequeues(key) < maxReconcileRetries {
 			log.Printf("Failed to reconcile %s: %v. Retrying...\n", key, err)
 			c.Queue.AddRateLimited(key)
 			return true
 		}
 		c.Queue.Forget(obj)
-		log.Printf("Max retries exceeded for %s: %v. Forgetting item.\n", key, err)
+		log.Printf("Max retries exceeded for %s: %v. Forgetting item; the next resync will pick it up again.\n", key, err)
 		return true
 	}
 
@@ -46,13 +57,13 @@ func (c *Controller) processNextWorkItem() bool {
 // reconcileByKey re-fetches the object from the API before reconciling it,
 // rather than trusting the (possibly stale) object handed to the informer
 // callback, so reconciliation is level-triggered.
-func (c *Controller) reconcileByKey(key string) error {
+func (c *Controller) reconcileByKey(ctx context.Context, key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return fmt.Errorf("invalid resource key: %s", key)
 	}
 
-	u, err := c.client.Resource(c.gvr).Namespace(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+	u, err := c.client.Resource(c.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// Resource is gone; nothing left to reconcile.
@@ -61,22 +72,29 @@ func (c *Controller) reconcileByKey(key string) error {
 		return fmt.Errorf("failed to fetch resource %s: %w", key, err)
 	}
 
-	return c.Reconcile(u)
+	return c.Reconcile(ctx, u)
 }
 
 func (c *Controller) runWorker(ctx context.Context) {
-	for c.processNextWorkItem() {
+	for c.processNextWorkItem(ctx) {
 	}
 }
 
 // Run starts the controller's worker pool and blocks until ctx is
-// cancelled.
+// cancelled and every worker has drained. Shutting the queue down first
+// makes the blocking Get() in each worker return, so a SIGTERM finishes
+// the reconcile in flight instead of being killed mid-launch.
 func (c *Controller) Run(ctx context.Context, workers int) {
-	defer c.Queue.ShutDown()
-
+	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
-		go c.runWorker(ctx)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.runWorker(ctx)
+		}()
 	}
 
 	<-ctx.Done()
+	c.Queue.ShutDown()
+	wg.Wait()
 }

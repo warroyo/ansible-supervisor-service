@@ -2,14 +2,14 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -21,10 +21,76 @@ import (
 var secretGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
 var nsGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"}
 
-// vmGVR targets VM Service VirtualMachines. v1alpha2 is current as of
-// vSphere Supervisor 8.0u2+; verify against the target Supervisor's
-// installed vmoperator.vmware.com CRD version if VMs aren't found.
-var vmGVR = schema.GroupVersionResource{Group: "vmoperator.vmware.com", Version: "v1alpha2", Resource: "virtualmachines"}
+const vmGroup = "vmoperator.vmware.com"
+const vmResource = "virtualmachines"
+
+// vmGVR targets VM Service VirtualMachines. VM Operator serves several
+// versions of this CRD side by side (v1alpha1 through v1alpha5 on VCF
+// 9.x) and retires the oldest as it adds new ones, so the version is
+// discovered at startup by resolveVMGVR rather than compiled in - a
+// pinned version becomes a silent "no VMs ever match" the day it stops
+// being served. This value is only the fallback if discovery fails.
+var vmGVR = schema.GroupVersionResource{Group: vmGroup, Version: "v1alpha2", Resource: vmResource}
+
+// versionDiscoverer is the slice of discovery.DiscoveryInterface
+// resolveVMGVR needs, kept narrow so it can be faked in tests.
+type versionDiscoverer interface {
+	ServerGroups() (*metav1.APIGroupList, error)
+	ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error)
+}
+
+// resolveVMGVR picks a served version of the VirtualMachine resource,
+// preferring the API server's own preferred version (the newest, which
+// for a CRD is what the storage version sorts to) and falling back
+// through the rest.
+//
+// Reading VMs across versions is safe because the controller only ever
+// reads labels and a couple of status fields, and the API server
+// converts between served versions - it never writes a VM, so no version
+// carries a field it could drop. The one genuine difference is v1alpha1's
+// flat status.vmIp, which vmReady handles.
+func resolveVMGVR(d versionDiscoverer) (schema.GroupVersionResource, error) {
+	groups, err := d.ServerGroups()
+	if err != nil {
+		return schema.GroupVersionResource{}, fmt.Errorf("listing server groups: %w", err)
+	}
+
+	var candidates []string
+	for _, g := range groups.Groups {
+		if g.Name != vmGroup {
+			continue
+		}
+		// PreferredVersion first, then everything else in the order the
+		// API server returned it, which is already priority-sorted.
+		if g.PreferredVersion.Version != "" {
+			candidates = append(candidates, g.PreferredVersion.Version)
+		}
+		for _, v := range g.Versions {
+			if v.Version != g.PreferredVersion.Version {
+				candidates = append(candidates, v.Version)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return schema.GroupVersionResource{}, fmt.Errorf("api group %q not found: is VM Service enabled on this supervisor?", vmGroup)
+	}
+
+	// A version being in the group list doesn't guarantee it serves this
+	// particular resource, so confirm before settling on one.
+	for _, version := range candidates {
+		gv := schema.GroupVersion{Group: vmGroup, Version: version}
+		resources, err := d.ServerResourcesForGroupVersion(gv.String())
+		if err != nil {
+			continue
+		}
+		for _, r := range resources.APIResources {
+			if r.Name == vmResource {
+				return gv.WithResource(vmResource), nil
+			}
+		}
+	}
+	return schema.GroupVersionResource{}, fmt.Errorf("no served version of %s.%s found (tried %v)", vmResource, vmGroup, candidates)
+}
 
 var awxConnGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "awxconnections"}
 var ansBindGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "ansiblebindings"}
@@ -33,6 +99,18 @@ var ansBindGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version:
 // a re-run of an AnsibleBinding that's already up to date
 // (controller-runtime/Flux "reconcile requested at" convention).
 const ReconcileRequestedAtAnnotation = "ansible.field.vmware.com/reconcile-requested-at"
+
+// errPermanentConfig marks an error that retrying cannot fix: the
+// referenced object exists but is malformed. Deletion paths use it to
+// tell "come back later" apart from "this will never succeed", so a
+// transient outage never causes an AWX host to be abandoned.
+var errPermanentConfig = errors.New("permanent configuration error")
+
+// isPermanent reports whether err is one retrying will never resolve:
+// either a referenced object is genuinely gone, or it is malformed.
+func isPermanent(err error) bool {
+	return apierrors.IsNotFound(err) || errors.Is(err, errPermanentConfig)
+}
 
 // hostMarkerPrefix identifies AWX inventory hosts managed by some
 // ansible-supervisor deployment. The full marker also names the
@@ -55,11 +133,11 @@ func hostOwnerMarker(namespace, name string) string {
 
 // resolveSupervisorID returns the configured identity, falling back to
 // the kube-system namespace UID.
-func resolveSupervisorID(client *dynamic.DynamicClient, override string) (string, error) {
+func resolveSupervisorID(ctx context.Context, client *dynamic.DynamicClient, override string) (string, error) {
 	if override != "" {
 		return override, nil
 	}
-	ns, err := client.Resource(nsGVR).Get(context.Background(), "kube-system", metav1.GetOptions{})
+	ns, err := client.Resource(nsGVR).Get(ctx, "kube-system", metav1.GetOptions{})
 	if err != nil {
 		return "", fmt.Errorf("deriving a supervisor id from the kube-system namespace UID (set --supervisor-id to skip this): %w", err)
 	}
@@ -86,8 +164,8 @@ func convertAnsibleBinding(u *unstructured.Unstructured) (AnsibleBinding, error)
 // Read via the dynamic client, Secret data values arrive base64-encoded
 // as-is (unlike the typed corev1.Secret client, which decodes them for
 // you), so this decodes explicitly.
-func getSecretValue(client *dynamic.DynamicClient, namespace, name, key string) (string, error) {
-	secret, err := client.Resource(secretGVR).Namespace(namespace).Get(context.Background(), name, metav1.GetOptions{})
+func getSecretValue(ctx context.Context, client *dynamic.DynamicClient, namespace, name, key string) (string, error) {
+	secret, err := client.Resource(secretGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return "", fmt.Errorf("fetching secret %q: %w", name, err)
 	}
@@ -96,11 +174,11 @@ func getSecretValue(client *dynamic.DynamicClient, namespace, name, key string) 
 		return "", err
 	}
 	if !found || encoded == "" {
-		return "", fmt.Errorf("secret %q has no data key %q", name, key)
+		return "", fmt.Errorf("secret %q has no data key %q: %w", name, key, errPermanentConfig)
 	}
 	decoded, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return "", fmt.Errorf("decoding secret %q key %q: %w", name, key, err)
+		return "", fmt.Errorf("decoding secret %q key %q: %w: %w", name, key, err, errPermanentConfig)
 	}
 	// Trim surrounding whitespace: the value goes straight into an
 	// Authorization header, and a token stored the obvious way (echo
@@ -109,7 +187,7 @@ func getSecretValue(client *dynamic.DynamicClient, namespace, name, key string) 
 	// "Authorization"`, which names the header and not the newline.
 	trimmed := strings.TrimSpace(string(decoded))
 	if trimmed == "" {
-		return "", fmt.Errorf("secret %q key %q is empty", name, key)
+		return "", fmt.Errorf("secret %q key %q is empty: %w", name, key, errPermanentConfig)
 	}
 	return trimmed, nil
 }
@@ -128,12 +206,12 @@ func structToMap(v interface{}) (map[string]interface{}, error) {
 	return m, nil
 }
 
-func listVirtualMachines(client *dynamic.DynamicClient, namespace string, selector map[string]string) ([]unstructured.Unstructured, error) {
+func listVirtualMachines(ctx context.Context, client *dynamic.DynamicClient, namespace string, selector map[string]string) ([]unstructured.Unstructured, error) {
 	listOpts := metav1.ListOptions{}
 	if len(selector) > 0 {
 		listOpts.LabelSelector = labels.SelectorFromSet(selector).String()
 	}
-	list, err := client.Resource(vmGVR).Namespace(namespace).List(context.Background(), listOpts)
+	list, err := client.Resource(vmGVR).Namespace(namespace).List(ctx, listOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -152,6 +230,13 @@ func vmReady(vm *unstructured.Unstructured) (ip string, ready bool) {
 		return v, true
 	}
 	if v, found, _ := unstructured.NestedString(vm.Object, "status", "network", "primaryIP6"); found && v != "" {
+		return v, true
+	}
+	// v1alpha1 reported a single flat status.vmIp; the status.network
+	// block replaced it in v1alpha2 and is unchanged through v1alpha5.
+	// Only reached on a Supervisor old enough that v1alpha1 is all
+	// resolveVMGVR had to choose from.
+	if v, found, _ := unstructured.NestedString(vm.Object, "status", "vmIp"); found && v != "" {
 		return v, true
 	}
 	return "", false
@@ -182,21 +267,6 @@ func upsertHistory(existing []VMRunHistoryEntry, entry VMRunHistoryEntry) []VMRu
 		updated = updated[:historyLimit]
 	}
 	return updated
-}
-
-// hostVarsHash fingerprints what was last pushed to AWX for a host, so
-// an unchanged host isn't re-PATCHed on every resync.
-func hostVarsHash(hostName string, vars map[string]string) string {
-	payload := struct {
-		Host string            `json:"host"`
-		Vars map[string]string `json:"vars"`
-	}{hostName, vars}
-	b, err := json.Marshal(payload) // map keys are marshaled sorted, so this is stable
-	if err != nil {
-		return ""
-	}
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
 }
 
 func nowRFC3339() string {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -37,16 +38,36 @@ type StatusUpdater func(*unstructured.Unstructured, bool, error) map[string]inte
 // status. Every kind this service manages (AWXConnection,
 // AnsibleBinding) is driven by one of these.
 type Controller struct {
-	client           *dynamic.DynamicClient
-	gvr              schema.GroupVersionResource
-	finalizerName    string
-	provisionFunc    func(*dynamic.DynamicClient, interface{}, []string) error
-	cleanupFunc      func(*dynamic.DynamicClient, interface{}) error
+	client *dynamic.DynamicClient
+	gvr    schema.GroupVersionResource
+	// finalizerName is the finalizer this controller manages. Empty means
+	// this kind needs no finalizer - nothing outside Kubernetes is
+	// created for it, so there is nothing to clean up before deletion.
+	finalizerName string
+	// staleFinalizers are finalizers this controller used to set and no
+	// longer does. They are stripped on sight, so resources created by an
+	// older version of the controller stay deletable after an upgrade.
+	staleFinalizers  []string
+	provisionFunc    func(context.Context, *dynamic.DynamicClient, interface{}) error
+	cleanupFunc      func(context.Context, *dynamic.DynamicClient, interface{}) error
 	updateStatusFunc StatusUpdater
-	namespaces       []string
 
-	Queue    workqueue.RateLimitingInterface
-	Informer cache.SharedIndexInformer
+	Queue workqueue.RateLimitingInterface
+}
+
+// errCleanupPending wraps a finalization failure. The workqueue never
+// gives up on one: dropping a key mid-finalization leaves the resource
+// stuck in Terminating with its external state leaked, and unlike a
+// normal reconcile a deleted object may get no further events to
+// rediscover it from.
+type errCleanupPending struct{ err error }
+
+func (e *errCleanupPending) Error() string { return e.err.Error() }
+func (e *errCleanupPending) Unwrap() error { return e.err }
+
+func isCleanupPending(err error) bool {
+	var e *errCleanupPending
+	return errors.As(err, &e)
 }
 
 // updateGenericStatus is the default StatusUpdater: it only ever writes
@@ -77,6 +98,9 @@ func updateGenericStatus(u *unstructured.Unstructured, success bool, reconcileEr
 		"lastUpdated": metav1.Now(),
 	}
 }
+
+// key formats a namespace/name pair the way the workqueue does.
+func key(namespace, name string) string { return namespace + "/" + name }
 
 func toUnstructured(obj interface{}) (*unstructured.Unstructured, error) {
 	if u, ok := obj.(*unstructured.Unstructured); ok {
@@ -130,11 +154,16 @@ func patchStatus(ctx context.Context, client dynamic.Interface, gvr schema.Group
 
 // patchFinalizer adds or removes the finalizer using a JSON Merge Patch.
 // A merge patch on metadata.finalizers must carry the whole list, since
-// the array is replaced wholesale.
+// the array is replaced wholesale - which means a list read even
+// slightly out of date would silently drop another controller's
+// finalizer. Sending resourceVersion alongside it makes the API server
+// reject the patch with a conflict instead, and the reconcile retries
+// against a fresh read.
 func patchFinalizer(ctx context.Context, client dynamic.Interface, gvr schema.GroupVersionResource, obj *unstructured.Unstructured, finalizerName string, finalizers []string) error {
 	patchPayload := map[string]interface{}{
 		"metadata": map[string]interface{}{
-			"finalizers": finalizers,
+			"finalizers":      finalizers,
+			"resourceVersion": obj.GetResourceVersion(),
 		},
 	}
 	patchData, err := json.Marshal(patchPayload)
@@ -168,7 +197,26 @@ func removeString(slice []string, s string) (result []string) {
 	return
 }
 
-func (c *Controller) Reconcile(obj interface{}) (reconcileResult error) {
+// desiredFinalizers is metadata.finalizers as this controller wants it:
+// its own finalizer present, and any finalizer it no longer manages
+// removed. Returns false if the list is already correct.
+func (c *Controller) desiredFinalizers(u *unstructured.Unstructured) ([]string, bool) {
+	desired := u.GetFinalizers()
+	changed := false
+	for _, stale := range c.staleFinalizers {
+		if containsFinalizer(u, stale) {
+			desired = removeString(desired, stale)
+			changed = true
+		}
+	}
+	if c.finalizerName != "" && !containsFinalizer(u, c.finalizerName) {
+		desired = append(desired, c.finalizerName)
+		changed = true
+	}
+	return desired, changed
+}
+
+func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileResult error) {
 	u, err := toUnstructured(obj)
 	if err != nil {
 		return fmt.Errorf("error converting to unstructured: %w", err)
@@ -184,7 +232,7 @@ func (c *Controller) Reconcile(obj interface{}) (reconcileResult error) {
 		if reconcileErr != nil {
 			log.Printf("%s DEFER STATUS UPDATE: patching status after error: %v\n", logPrefix, reconcileErr)
 
-			latestU, getErr := c.client.Resource(c.gvr).Namespace(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+			latestU, getErr := c.client.Resource(c.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 			if getErr != nil {
 				if apierrors.IsNotFound(getErr) {
 					log.Printf("%s Status patch skipped: resource was deleted during defer execution.\n", logPrefix)
@@ -197,7 +245,7 @@ func (c *Controller) Reconcile(obj interface{}) (reconcileResult error) {
 			}
 
 			statusMap := c.updateStatusFunc(latestU, false, reconcileErr)
-			if statusPatchErr := patchStatus(context.TODO(), c.client, c.gvr, latestU, statusMap, StatusFieldManager); statusPatchErr != nil {
+			if statusPatchErr := patchStatus(ctx, c.client, c.gvr, latestU, statusMap, StatusFieldManager); statusPatchErr != nil {
 				if !apierrors.IsNotFound(statusPatchErr) && !apierrors.IsConflict(statusPatchErr) {
 					log.Printf("%s CRITICAL: failed to patch status after error: %v\n", logPrefix, statusPatchErr)
 				}
@@ -210,55 +258,100 @@ func (c *Controller) Reconcile(obj interface{}) (reconcileResult error) {
 	if !u.GetDeletionTimestamp().IsZero() {
 		log.Printf("%s DeletionTimestamp detected. Initiating finalization.\n", logPrefix)
 
-		if containsFinalizer(u, c.finalizerName) {
+		// Everything this controller holds on the object comes off in one
+		// patch: its own finalizer once cleanup has actually succeeded,
+		// plus any finalizer an older version left behind.
+		remaining := u.GetFinalizers()
+		releasing := false
+
+		if c.finalizerName != "" && containsFinalizer(u, c.finalizerName) {
 			log.Printf("%s Finalizer %s is present. Starting cleanup...\n", logPrefix, c.finalizerName)
 
-			if cleanupErr := c.cleanupFunc(c.client, obj); cleanupErr != nil {
-				log.Printf("%s CLEANUP FAILED: %v. Will retry on next sync.\n", logPrefix, cleanupErr)
-				reconcileErr = fmt.Errorf("cleanup failed: %w", cleanupErr)
-				return reconcileErr
+			if c.cleanupFunc != nil {
+				if cleanupErr := c.cleanupFunc(ctx, c.client, obj); cleanupErr != nil {
+					log.Printf("%s CLEANUP FAILED: %v. Will retry.\n", logPrefix, cleanupErr)
+					reconcileErr = &errCleanupPending{fmt.Errorf("cleanup failed: %w", cleanupErr)}
+					return reconcileErr
+				}
 			}
+			remaining = removeString(remaining, c.finalizerName)
+			releasing = true
+		}
+		for _, stale := range c.staleFinalizers {
+			if containsFinalizer(u, stale) {
+				remaining = removeString(remaining, stale)
+				releasing = true
+			}
+		}
 
-			updatedFinalizers := removeString(u.GetFinalizers(), c.finalizerName)
-			if err := patchFinalizer(context.TODO(), c.client, c.gvr, u, c.finalizerName, updatedFinalizers); err != nil {
-				log.Printf("%s ERROR patching to remove finalizer: %v\n", logPrefix, err)
-				reconcileErr = fmt.Errorf("finalizer removal patch failed: %w", err)
-				return reconcileErr
-			}
-			log.Printf("%s Finalizer %s removed successfully. Deletion will now complete.\n", logPrefix, c.finalizerName)
+		if !releasing {
+			log.Printf("%s Finalizer not present. Deletion complete/in progress by Kubernetes.\n", logPrefix)
 			return nil
 		}
 
-		log.Printf("%s Finalizer not present. Deletion complete/in progress by Kubernetes.\n", logPrefix)
+		if err := patchFinalizer(ctx, c.client, c.gvr, u, c.finalizerName, remaining); err != nil {
+			log.Printf("%s ERROR patching to remove finalizer: %v\n", logPrefix, err)
+			reconcileErr = &errCleanupPending{fmt.Errorf("finalizer removal patch failed: %w", err)}
+			return reconcileErr
+		}
+		log.Printf("%s Finalizer(s) removed successfully. Deletion will now complete.\n", logPrefix)
 		return nil
 	}
 
-	if !containsFinalizer(u, c.finalizerName) {
-		log.Printf("%s Finalizer %s missing. Adding it now.\n", logPrefix, c.finalizerName)
+	if desired, changed := c.desiredFinalizers(u); changed {
+		log.Printf("%s Updating finalizers to %v.\n", logPrefix, desired)
 
-		updatedFinalizers := append(u.GetFinalizers(), c.finalizerName)
-		if err := patchFinalizer(context.TODO(), c.client, c.gvr, u, c.finalizerName, updatedFinalizers); err != nil {
-			log.Printf("%s ERROR patching to add finalizer: %v\n", logPrefix, err)
-			reconcileErr = fmt.Errorf("finalizer addition patch failed: %w", err)
+		if err := patchFinalizer(ctx, c.client, c.gvr, u, c.finalizerName, desired); err != nil {
+			log.Printf("%s ERROR patching finalizers: %v\n", logPrefix, err)
+			reconcileErr = fmt.Errorf("finalizer patch failed: %w", err)
 			return reconcileErr
 		}
 
 		statusMap := c.updateStatusFunc(u, false, nil)
-		if statusPatchErr := patchStatus(context.TODO(), c.client, c.gvr, u, statusMap, StatusFieldManager); statusPatchErr != nil {
+		if statusPatchErr := patchStatus(ctx, c.client, c.gvr, u, statusMap, StatusFieldManager); statusPatchErr != nil {
 			log.Printf("%s Warning: failed to patch status after adding finalizer: %v\n", logPrefix, statusPatchErr)
 		}
 
-		log.Printf("%s Finalizer added. Continuing to main reconciliation.\n", logPrefix)
+		// The finalizer has to be in place before anything external is
+		// created, and the copy in hand predates the patch. Re-read
+		// rather than provisioning against it - and rather than waiting
+		// for the resulting event, which is a metadata-only change the
+		// informer's update filter deliberately drops.
+		refreshed, getErr := c.client.Resource(c.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			if apierrors.IsNotFound(getErr) {
+				log.Printf("%s Resource was deleted right after its finalizers were set.\n", logPrefix)
+				return nil
+			}
+			reconcileErr = fmt.Errorf("re-fetching %s after the finalizer patch: %w", key(namespace, name), getErr)
+			return reconcileErr
+		}
+		u = refreshed
+		obj = refreshed
+		log.Printf("%s Finalizers set. Continuing from the updated object.\n", logPrefix)
 	}
 
 	log.Printf("%s Running normal reconciliation.\n", logPrefix)
-	if provisionErr := c.provisionFunc(c.client, obj, c.namespaces); provisionErr != nil {
+	if provisionErr := c.provisionFunc(ctx, c.client, obj); provisionErr != nil {
 		reconcileErr = fmt.Errorf("provisioning failed: %w", provisionErr)
 		return reconcileErr // defer handles the status update and returns the error for retry
 	}
 
-	statusMap := c.updateStatusFunc(u, true, nil)
-	if statusPatchErr := patchStatus(context.TODO(), c.client, c.gvr, u, statusMap, StatusFieldManager); statusPatchErr != nil {
+	// Re-read before computing the aggregate status: provisioning writes
+	// the detail fields a StatusUpdater derives state from (per-VM run
+	// outcomes, say), and the copy this reconcile started from predates
+	// them.
+	latestU, getErr := c.client.Resource(c.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	if getErr != nil {
+		if apierrors.IsNotFound(getErr) {
+			log.Printf("%s Status patch skipped: resource was deleted during reconciliation.\n", logPrefix)
+			return nil
+		}
+		return fmt.Errorf("re-fetching %s for status: %w", key(namespace, name), getErr)
+	}
+
+	statusMap := c.updateStatusFunc(latestU, true, nil)
+	if statusPatchErr := patchStatus(ctx, c.client, c.gvr, latestU, statusMap, StatusFieldManager); statusPatchErr != nil {
 		log.Printf("%s Warning: failed to patch status after successful provisioning: %v. Requeuing...\n", logPrefix, statusPatchErr)
 		return statusPatchErr
 	}
@@ -267,14 +360,14 @@ func (c *Controller) Reconcile(obj interface{}) (reconcileResult error) {
 	return nil
 }
 
-func setupInformer(client dynamic.Interface, gvr schema.GroupVersionResource, controller *Controller, resyncPeriod time.Duration) cache.SharedIndexInformer {
+func setupInformer(ctx context.Context, client dynamic.Interface, gvr schema.GroupVersionResource, controller *Controller, resyncPeriod time.Duration) cache.SharedIndexInformer {
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				return client.Resource(gvr).Namespace("").List(context.TODO(), options)
+				return client.Resource(gvr).Namespace("").List(ctx, options)
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				return client.Resource(gvr).Namespace("").Watch(context.TODO(), options)
+				return client.Resource(gvr).Namespace("").Watch(ctx, options)
 			},
 		},
 		&unstructured.Unstructured{},

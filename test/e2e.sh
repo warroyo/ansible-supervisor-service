@@ -89,13 +89,16 @@ host_deleted() {  # host_deleted <addr> <host id> -> true if AWX deleted it
     | python3 -c "import json,sys; sys.exit(0 if int(sys.argv[1]) in json.load(sys.stdin) else 1)" "$2"
 }
 
+# Deleted hosts keep their name in the fake's store, so a host that was
+# deleted and recreated appears twice - and the store is a map, so which
+# one comes back first is luck. Only the live one is the answer.
 host_field() {    # host_field <addr> <host name> <field> -> prints the value
   curl -sf "http://$1/_test/hosts" \
     | python3 -c "
 import json, sys
 name, field = sys.argv[1], sys.argv[2]
 for h in json.load(sys.stdin):
-    if h.get('name') == name:
+    if h.get('name') == name and not h.get('deleted'):
         print(h.get(field, ''))
         break
 else:
@@ -294,12 +297,39 @@ wait_for "the deferred re-run launches once the VM is back" 30 bash -c \
 log "re-run requested during downtime was honored, not swallowed"
 
 # --- steady state must not re-PATCH an unchanged host every resync ---
+# The controller re-reads the host from AWX on every pass (see the drift
+# check below), so what keeps a steady state quiet is the write being
+# conditional on the variables actually differing - not the read.
 PATCH_COUNT=$(grep -c "fakeawx: patched host" "$WORK_DIR/fakeawx.log" || true)
 if [[ "$PATCH_COUNT" != "0" ]]; then
   echo "expected 0 host PATCHes for an unchanged host across many resyncs, got $PATCH_COUNT"
   exit 1
 fi
 log "unchanged host was never re-PATCHed across resyncs"
+
+# --- a host deleted out of band must be recreated, not trusted ---
+# Deleting the inventory host in AWX is drift like any other. Status
+# alone cannot see it, and every later run would fail with "--limit does
+# not match any hosts", forever, with nothing to repair it.
+log "deleting the AWX host out of band, expecting the next reconcile to recreate it"
+curl -sf -X DELETE "http://${AWX_ADDR}/api/v2/hosts/${HOST_ID}/" >/dev/null
+wait_for "AWX host recreated under a new id" 30 bash -c \
+  "id=\$(kubectl get ansiblebinding e2e-config -n ${TEST_NS} -o jsonpath='{.status.vms[0].awxHostID}'); [[ -n \$id && \$id != ${HOST_ID} ]]"
+HOST_ID=$(kubectl get ansiblebinding e2e-config -n "$TEST_NS" -o jsonpath='{.status.vms[0].awxHostID}')
+if [[ "$(host_field "$AWX_ADDR" web-1 name)" != "web-1" ]]; then
+  echo "expected the recreated host to be back in the inventory"
+  exit 1
+fi
+log "out-of-band host deletion was repaired (new id=$HOST_ID)"
+
+# --- host variables edited in AWX must be put back ---
+log "editing the host's variables in AWX, expecting the controller to repair them"
+curl -sf -X PATCH -H 'Content-Type: application/json' \
+  -d '{"variables":"{\"ansible_host\": \"10.99.99.99\"}"}' \
+  "http://${AWX_ADDR}/api/v2/hosts/${HOST_ID}/" >/dev/null
+wait_for "ansible_host restored to the VM's real IP" 30 bash -c \
+  "[[ \$(host_field ${AWX_ADDR} web-1 variables) != *10.99.99.99* ]]"
+log "hand-edited host variables were reconciled back"
 
 log "dropping the VM out of vmSelector, expecting its AWX host to be cleaned up"
 kubectl label virtualmachine web-1 -n "$TEST_NS" app- >/dev/null
@@ -575,6 +605,17 @@ log "ownership reclaimed via the AWX-side marker: same host $RETAINED_ID, awxHos
 kubectl delete ansiblebinding e2e-retain -n "$TEST_NS" --timeout=30s >/dev/null
 wait_for "reclaimed host is now deletable on cleanup" 30 host_deleted "$AWX_ADDR" "$RETAINED_ID"
 log "reclaimed host was cleaned up, no longer orphaned"
+
+# --- an AWXConnection finalizer left by an older controller must be stripped ---
+# AWXConnection creates nothing outside Kubernetes, so it no longer
+# carries a finalizer. One left behind by an upgrade would otherwise hang
+# the resource in Terminating with nothing to release it.
+log "adding the legacy AWXConnection finalizer by hand, expecting the controller to strip it"
+kubectl patch awxconnection e2e-awx -n "$TEST_NS" --type=merge \
+  -p '{"metadata":{"finalizers":["field.vmware.com/awx-connection-cleanup"]}}' >/dev/null
+wait_for "legacy finalizer stripped" 30 bash -c \
+  "[[ -z \$(kubectl get awxconnection e2e-awx -n ${TEST_NS} -o jsonpath='{.metadata.finalizers}' | tr -d '[]') ]]"
+log "legacy AWXConnection finalizer was removed"
 
 # --- AAP 2.5+ moved the controller API; detection must find it ---
 # AWX/Tower/AAP<=2.4 serve /api/v2, AAP 2.5+ serve /api/controller/v2.

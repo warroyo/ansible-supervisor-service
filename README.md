@@ -4,6 +4,7 @@
 
 Supervisor service that binds VM Service `VirtualMachine`s to AWX/Tower job and workflow templates - the day-2 "run a playbook against this VM" experience Aria Automation's Ansible Automation Platform integration provides for classic vRA deployments, reproduced for Supervisor-native VMs.
 
+- [Quickstart](QUICKSTART.md) - shortest path to a first working run
 - [How it works](#how-it-works)
 - [Prerequisites](#prerequisites)
 - [Install](#install)
@@ -11,9 +12,12 @@ Supervisor service that binds VM Service `VirtualMachine`s to AWX/Tower job and 
 - [Usage](#usage)
 - [CRD status](#crd-status)
 - [Uninstalling](#uninstalling)
+- [VCFA 9.x blueprints](VCFA-BLUEPRINTS.md) - driving this from a VCF Automation All Apps blueprint
 - [FAQ](FAQ.md) · [Contributing](CONTRIBUTING.md)
 
 ## How it works
+
+**Coming from classic Aria Automation:** this is the `Cloud.Ansible.Tower` capability, rebuilt as Supervisor CRDs. That integration only reaches VMs vRA provisions itself, and it isn't available at all in a VCF Automation 9.x All Apps organization. In place of an org-wide AAP endpoint and a resource bound to one provisioned machine: a per-namespace `AWXConnection`, and an `AnsibleBinding` that selects VMs by label and sticks around for day-2 re-runs. Field-by-field mapping in [the FAQ](FAQ.md#i-used-the-aap-integration-in-classic-aria-automation-what-maps-to-what).
 
 The controller runs centralized in the supervisor cluster and only ever talks to Kubernetes and to AWX/Tower's HTTPS API - never to the VMs themselves. AWX does the SSH, exactly as it already does for the existing vRA integration, so the controller never needs network reachability into a workload network.
 
@@ -30,11 +34,12 @@ A few guardrails worth knowing about:
 - **`vmSelector` may not be empty.** An empty selector would match every VM in the namespace, so it's rejected by the CRD schema and by the controller.
 - **Pre-existing AWX hosts are adopted, never hijacked.** If a host with the target name already exists in the inventory, the controller merges its variables in rather than overwriting them, records that it did not create the host (`status.vms[].awxHostCreated: false`), and never deletes it during cleanup. If that host's existing variables aren't a JSON object it can safely merge into, it refuses rather than destroying them.
 - **Hosts owned by another supervisor are refused outright.** See [Can several supervisors share one AWX instance?](FAQ.md#can-several-supervisors-share-one-awx-instance)
+- **The inventory host is reconciled against AWX, not against status.** Every pass reads the host back from AWX, so one deleted or hand-edited in the AWX UI is recreated or repaired. Trusting the controller's own record instead would leave a deleted host undetected, and every later run failing with `--limit does not match any hosts` with nothing to repair it. Variables the controller doesn't manage are left untouched; a steady state writes nothing.
 - **In-flight runs are tracked independently of the VM.** A VM powering off mid-run doesn't lose the job, and re-run requests made during downtime aren't swallowed. See [the FAQ](FAQ.md#what-happens-to-in-flight-runs-when-a-vm-powers-off).
 
 ## Prerequisites
 
-- VCF supervisor cluster with VM Service enabled
+- VCF supervisor cluster with VM Service enabled. Any served `vmoperator.vmware.com` version works - the controller resolves one by API discovery at startup, preferring the newest, and logs its choice as `virtualmachine api: vmoperator.vmware.com/<version>`
 - An AWX or Ansible Automation Platform (Tower) instance that can reach your VMs over SSH at the IP they report in `status.network.primaryIP4` - that address is what the controller writes into the inventory host's `ansible_host`. If AWX has to reach them at some other address, override it per binding with `hostVariables`. AWX, Ansible Tower, AAP 2.4 and AAP 2.5+ are all supported - see [the FAQ](FAQ.md#which-awxtoweraap-versions-are-supported)
 - A Job Template or Workflow Template in AWX, with **Prompt on Launch enabled for Limit** (and for Variables, if you use `extraVars`) - [why](FAQ.md#why-does-my-template-need-prompt-on-launch-for-limit). Its inventory is where the controller creates host entries, and the Machine credential attached to it is what logs into the VMs.
 
@@ -118,6 +123,9 @@ spec:
   url: "https://awx.example.com"
   secretRef: "awx-token"
   insecureSkipVerify: false
+  caBundleSecretRef:          # optional: trust a private CA instead of skipping verification
+    name: "awx-token"         # may be the token Secret itself
+    key: "ca.crt"             # optional, defaults to ca.crt
   apiBasePath: ""             # leave empty to detect /api/v2 vs /api/controller/v2 (AAP 2.5+)
   hostNamePrefix: ""          # prefix for inventory host names, when sharing one AWX
 ```
@@ -126,7 +134,8 @@ spec:
 |---|---|
 | `url` | Base URL of the AWX/Tower instance |
 | `secretRef` | Name of a `Secret` in this namespace with the API token under key `token` |
-| `insecureSkipVerify` | Skip TLS verification. For self-signed test instances only |
+| `insecureSkipVerify` | Skip TLS verification. For self-signed test instances only. Mutually exclusive with `caBundleSecretRef` |
+| `caBundleSecretRef` | `Secret` in this namespace holding a PEM CA bundle (key `ca.crt` by default) to trust for an AWX served by a private CA. Added to the system roots, not a replacement for them |
 | `apiBasePath` | Leave empty to auto-detect. Set explicitly to skip detection - [details](FAQ.md#which-awxtoweraap-versions-are-supported) |
 | `hostNamePrefix` | Prepended to every inventory host name created through this connection - [details](FAQ.md#can-several-supervisors-share-one-awx-instance) |
 
@@ -180,7 +189,7 @@ Editing `spec` (which bumps `.metadata.generation`) triggers a re-run the same w
 
 **cleanupPolicy**: `Delete` (default) removes AWX inventory hosts **this controller created** when a VM stops matching the selector or the whole `AnsibleBinding` is deleted. Hosts that already existed and were adopted are never deleted regardless. `Retain` leaves everything in place - useful if you manage AWX inventory by hand, want hosts kept for audit/history, or have other job templates that reference that host outside this CR's control.
 
-Cleanup is retried rather than leaked: a host that can't be deleted stays tracked in `status.vms` with `pendingCleanup: true` until the deletion succeeds, and deleting an `AnsibleBinding` blocks on its finalizer until AWX confirms the hosts are gone. The one case that gives up is an unrecoverable one - the `AWXConnection` or its Secret is already deleted, so there's no way left to reach AWX; that's logged and the CR is allowed to finish deleting.
+Cleanup is retried rather than leaked: a host that can't be deleted stays tracked in `status.vms` with `pendingCleanup: true` until the deletion succeeds, and deleting an `AnsibleBinding` blocks on its finalizer until AWX confirms the hosts are gone. A temporary failure - AWX unreachable, the API server erroring - is retried indefinitely rather than abandoned, since an abandoned host keeps an IP that AWX may later hand to an unrelated VM. Only a permanently unrecoverable case gives up: the `AWXConnection` or its Secret has been deleted, or is malformed beyond retrying, so there's no way left to reach AWX; that's logged and the CR finishes deleting. To release a binding whose AWX instance is gone for good, set `cleanupPolicy: Retain` on it - that's honored even while it's terminating.
 
 ## CRD status
 
@@ -188,9 +197,12 @@ Both CRDs track reconciliation state in `.status`:
 
 | State     | Description |
 |-----------|-------------|
-| `Pending` | Finalizer added, provisioning not yet run |
-| `Ready`   | Successfully reconciled |
-| `Failed`  | Reconciliation error, see `message` for details - on `AnsibleBinding`, check `status.vms` for which specific VM(s) failed |
+| `Pending` | Not yet able to run: provisioning hasn't run, no VM matches `vmSelector`, or a matched VM is powered off / has no reported IP |
+| `Running` | At least one VM's run is still in flight in AWX |
+| `Ready`   | Every currently-matched VM completed the requested run successfully |
+| `Failed`  | A reconciliation error, or a run that AWX reported as failed. See `message`, and `status.vms` for which specific VM(s) |
+
+An `AnsibleBinding`'s state is aggregated from the per-VM outcomes in `status.vms`, not just from whether the last reconcile threw an error - a job that AWX ran and failed is not a controller error, but it is not `Ready` either.
 
 ```bash
 kubectl get awxconnection <name> -n <namespace> -o jsonpath='{.status}'
@@ -203,16 +215,15 @@ kubectl get ansiblebinding <name> -n <namespace> -o jsonpath='{.status}'
 |---|---|
 | `observedIP` | Guest IP the AWX host was pointed at |
 | `phase` | `Pending` (never ran, waiting on the VM) / `Running` / `Succeeded` / `Failed` |
-| `awxHostID`, `awxHostName`, `awxHostCreated` | The AWX inventory host, the name it was created under, and whether this controller owns it (adopted hosts are never deleted) |
+| `awxHostID`, `awxHostName`, `awxInventoryID`, `awxHostCreated` | The AWX inventory host, the name and inventory it lives under, and whether this controller owns it (adopted hosts are never deleted) |
 | `lastJobID`, `lastJobURL`, `lastJobStatus` | The most recent run and a link to its output in AWX |
 | `appliedGeneration`, `appliedTrigger` | What this VM last launched a run for - how re-run requests are tracked per VM |
-| `hostVarsHash` | Fingerprint of what was last pushed to AWX, so unchanged hosts aren't re-PATCHed every resync |
 | `pendingCleanup` | Set when the VM no longer matches but its AWX host still needs deleting |
 | `history` | Bounded log of recent runs (one entry per run) |
 
 ## Uninstalling
 
-Delete your `AnsibleBinding` resources **while the controller is still running**, then remove the service. Each one carries a cleanup finalizer, so if the controller is gone first, the CRs hang in `Terminating` and deleting the CRD blocks indefinitely. Recovery is to reinstall the controller and let it drain them, or to strip the finalizers by hand:
+Delete your `AnsibleBinding` resources **while the controller is still running**, then remove the service. Each one carries a cleanup finalizer, so if the controller is gone first, the CRs hang in `Terminating` and deleting the CRD blocks indefinitely. (`AWXConnection` has no finalizer - it creates nothing outside Kubernetes - so it deletes whether the controller is running or not.) Recovery is to reinstall the controller and let it drain them, or to strip the finalizers by hand:
 
 ```bash
 kubectl patch ansiblebinding <name> -n <namespace> --type=merge -p '{"metadata":{"finalizers":[]}}'

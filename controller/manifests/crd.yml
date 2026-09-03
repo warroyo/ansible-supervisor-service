@@ -23,8 +23,21 @@ spec:
                   description: name of a Secret in this namespace holding the AWX API token in its "token" key
                 insecureSkipVerify:
                   type: boolean
-                  description: skip TLS certificate verification when calling the AWX API
+                  description: skip TLS certificate verification when calling the AWX API. mutually exclusive with caBundleSecretRef
                   default: false
+                caBundleSecretRef:
+                  type: object
+                  description: Secret in this namespace holding a PEM CA bundle to trust when calling the AWX API, for an instance served by a private CA. the bundle is added to the system roots, not swapped for them
+                  properties:
+                    name:
+                      type: string
+                      description: name of the Secret. may be the same Secret as secretRef
+                    key:
+                      type: string
+                      description: key within the Secret holding the PEM bundle
+                      default: ca.crt
+                  required:
+                    - name
                 apiBasePath:
                   type: string
                   description: overrides where this instance serves the controller API. leave empty to detect it - "/api/v2" on AWX, Ansible Tower and AAP up to 2.4, "/api/controller/v2" on AAP 2.5+ where the platform gateway moved the controller endpoints
@@ -178,6 +191,9 @@ spec:
                       awxHostID:
                         type: integer
                         description: AWX inventory host ID for this VM, used to target launches and to drive cleanup
+                      awxInventoryID:
+                        type: integer
+                        description: AWX inventory the host above lives in, tracked so repointing the template at another inventory moves the host instead of leaving it behind
                       awxHostName:
                         type: string
                         description: inventory host name last used for this VM, tracked so a rename retires the old host instead of orphaning it
@@ -193,9 +209,6 @@ spec:
                       appliedTrigger:
                         type: string
                         description: reconcile-requested-at annotation value this VM last launched a run for
-                      hostVarsHash:
-                        type: string
-                        description: fingerprint of the host name and variables last pushed to AWX, used to skip no-op host updates
                       lastJobID:
                         type: integer
                       lastJobURL:

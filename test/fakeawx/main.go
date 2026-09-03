@@ -120,20 +120,30 @@ func findTemplateByID(list []templateRec, id int) *templateRec {
 func (s *server) handleTemplateList(list []templateRec) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		name := r.URL.Query().Get("name")
-		t := findTemplate(list, name)
-		if t == nil {
-			writeJSON(w, 200, map[string]interface{}{"count": 0, "results": []interface{}{}})
-			return
+
+		// ?name= is a field lookup, not part of the published API schema.
+		// An instance that ignores it hands back every template, exactly
+		// as it does for hosts - so the controller must not trust
+		// results[0].
+		matches := list
+		if !s.ignoreNameFilter {
+			matches = nil
+			if t := findTemplate(list, name); t != nil {
+				matches = []templateRec{*t}
+			}
 		}
-		writeJSON(w, 200, map[string]interface{}{
-			"count": 1,
-			"results": []map[string]interface{}{{
+
+		results := make([]map[string]interface{}, 0, len(matches))
+		for _, t := range matches {
+			results = append(results, map[string]interface{}{
 				"id":                      t.ID,
+				"name":                    t.Name,
 				"inventory":               t.Inventory,
 				"ask_limit_on_launch":     t.AskLimitOnLaunch,
 				"ask_variables_on_launch": t.AskVariablesOnLaunch,
-			}},
-		})
+			})
+		}
+		writeJSON(w, 200, map[string]interface{}{"count": len(results), "results": results})
 	}
 }
 

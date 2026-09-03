@@ -3,26 +3,73 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
+// TLSOptions is how an AWXConnection wants its TLS handled: verify
+// against the system roots (the zero value), verify against the system
+// roots plus a supplied PEM bundle, or skip verification entirely.
+type TLSOptions struct {
+	// InsecureSkipVerify skips certificate verification. Mutually
+	// exclusive with CABundlePEM - see awxTLSOptionsFor.
+	InsecureSkipVerify bool
+	// CABundlePEM is a PEM bundle of CA certificates to trust in
+	// addition to the system roots, for an AWX behind a private CA.
+	CABundlePEM string
+}
+
+// cacheKey identifies the transport these options need. Bundles are
+// keyed by digest so two connections sharing a CA share a transport.
+func (o TLSOptions) cacheKey() string {
+	switch {
+	case o.InsecureSkipVerify:
+		return "insecure"
+	case o.CABundlePEM != "":
+		return "ca:" + fmt.Sprintf("%x", sha256.Sum256([]byte(o.CABundlePEM)))
+	default:
+		return "system"
+	}
+}
+
 // Transports are shared process-wide rather than built per client: a
 // fresh http.Transport per reconcile would leak its own idle connection
-// pool (and the goroutines servicing it) on every pass.
+// pool (and the goroutines servicing it) on every pass. The cache is
+// keyed by TLS configuration, so the number of transports is bounded by
+// the number of distinct CA bundles in use, not by reconcile count.
 var (
-	verifyingTransport = newTransport(false)
-	insecureTransport  = newTransport(true)
+	transportMu    sync.Mutex
+	transportCache = map[string]*http.Transport{}
 )
 
-func newTransport(insecureSkipVerify bool) *http.Transport {
+func transportFor(opts TLSOptions) (*http.Transport, error) {
+	key := opts.cacheKey()
+
+	transportMu.Lock()
+	defer transportMu.Unlock()
+	if t, ok := transportCache[key]; ok {
+		return t, nil
+	}
+	t, err := newTransport(opts)
+	if err != nil {
+		return nil, err
+	}
+	transportCache[key] = t
+	return t, nil
+}
+
+func newTransport(opts TLSOptions) (*http.Transport, error) {
 	t := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		MaxIdleConns:        50,
@@ -30,10 +77,34 @@ func newTransport(insecureSkipVerify bool) *http.Transport {
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
-	if insecureSkipVerify {
+	switch {
+	case opts.InsecureSkipVerify:
 		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // opt-in via AWXConnection.spec.insecureSkipVerify
+	case opts.CABundlePEM != "":
+		pool, err := certPoolWith(opts.CABundlePEM)
+		if err != nil {
+			return nil, err
+		}
+		t.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	}
-	return t
+	return t, nil
+}
+
+// certPoolWith returns the system roots plus the supplied PEM bundle.
+// Appending rather than replacing keeps a publicly-trusted AWX reachable
+// through a connection that also names an internal CA (for a proxy, say).
+func certPoolWith(pemBundle string) (*x509.CertPool, error) {
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		// Distroless/scratch images and non-Linux platforms may carry
+		// no system bundle. Trusting only the supplied CA is still
+		// better than refusing to connect at all.
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM([]byte(pemBundle)) {
+		return nil, fmt.Errorf("the CA bundle contains no PEM certificates: %w", errPermanentConfig)
+	}
+	return pool, nil
 }
 
 // AWXClient is a minimal, hand-rolled REST client for the handful of
@@ -58,6 +129,32 @@ const (
 
 var apiBasePathCandidates = []string{APIBasePathGateway, APIBasePathLegacy}
 
+// maxResponseBytes caps how much of an AWX response is read into memory.
+// The endpoints used here return small JSON documents; anything larger is
+// a misconfigured URL pointing at something that isn't AWX, and reading
+// it unbounded would let a tenant-supplied spec.url balloon the
+// controller's memory.
+const maxResponseBytes = 1 << 20
+
+// maxErrorBodyChars bounds how much of a response body is quoted into an
+// error, and therefore into a CR's status.message.
+const maxErrorBodyChars = 512
+
+// readCappedBody reads at most maxResponseBytes of a response body.
+func readCappedBody(r io.Reader) []byte {
+	b, _ := io.ReadAll(io.LimitReader(r, maxResponseBytes))
+	return b
+}
+
+// truncate shortens s for embedding in an error message.
+func truncate(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "... (truncated)"
+}
+
 // normalizeAPIBasePath makes a user-supplied path safe to concatenate.
 func normalizeAPIBasePath(path string) string {
 	path = strings.TrimSpace(path)
@@ -70,24 +167,28 @@ func normalizeAPIBasePath(path string) string {
 	return strings.TrimRight(path, "/")
 }
 
-func httpClientFor(insecureSkipVerify bool) *http.Client {
-	transport := verifyingTransport
-	if insecureSkipVerify {
-		transport = insecureTransport
+func httpClientFor(opts TLSOptions) (*http.Client, error) {
+	transport, err := transportFor(opts)
+	if err != nil {
+		return nil, err
 	}
-	return &http.Client{Timeout: 30 * time.Second, Transport: transport}
+	return &http.Client{Timeout: 30 * time.Second, Transport: transport}, nil
 }
 
-func NewAWXClient(baseURL, basePath, token string, insecureSkipVerify bool) *AWXClient {
+func NewAWXClient(baseURL, basePath, token string, opts TLSOptions) (*AWXClient, error) {
 	if basePath == "" {
 		basePath = APIBasePathLegacy
+	}
+	httpClient, err := httpClientFor(opts)
+	if err != nil {
+		return nil, err
 	}
 	return &AWXClient{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		basePath:   normalizeAPIBasePath(basePath),
 		token:      token,
-		httpClient: httpClientFor(insecureSkipVerify),
-	}
+		httpClient: httpClient,
+	}, nil
 }
 
 // DetectAPIBasePath finds which API root an instance serves by probing
@@ -97,8 +198,11 @@ func NewAWXClient(baseURL, basePath, token string, insecureSkipVerify bool) *AWX
 // credentials, "wrong API path" stays clearly distinguishable from "bad
 // token" - the confusion behind AAP 2.5's "Failed to validate
 // credentials" reports.
-func DetectAPIBasePath(ctx context.Context, baseURL string, insecureSkipVerify bool) (string, error) {
-	client := httpClientFor(insecureSkipVerify)
+func DetectAPIBasePath(ctx context.Context, baseURL string, opts TLSOptions) (string, error) {
+	client, err := httpClientFor(opts)
+	if err != nil {
+		return "", err
+	}
 	trimmed := strings.TrimRight(baseURL, "/")
 
 	var attempts []string
@@ -154,9 +258,9 @@ func (c *AWXClient) do(ctx context.Context, method, path string, body, out inter
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody := readCappedBody(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("awx request %s %s: status %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return fmt.Errorf("awx request %s %s: status %d: %s", method, path, resp.StatusCode, truncate(string(respBody), maxErrorBodyChars))
 	}
 	if out != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, out); err != nil {
@@ -185,10 +289,11 @@ type AWXTemplate struct {
 }
 
 type templateResult struct {
-	ID                   int  `json:"id"`
-	Inventory            *int `json:"inventory"`
-	AskLimitOnLaunch     bool `json:"ask_limit_on_launch"`
-	AskVariablesOnLaunch bool `json:"ask_variables_on_launch"`
+	ID                   int    `json:"id"`
+	Name                 string `json:"name"`
+	Inventory            *int   `json:"inventory"`
+	AskLimitOnLaunch     bool   `json:"ask_limit_on_launch"`
+	AskVariablesOnLaunch bool   `json:"ask_variables_on_launch"`
 }
 
 type listTemplatesResponse struct {
@@ -201,10 +306,31 @@ func (c *AWXClient) findTemplate(ctx context.Context, listPath, kind, name strin
 	if err := c.do(ctx, http.MethodGet, listPath+"?name="+url.QueryEscape(name), nil, &lr); err != nil {
 		return nil, err
 	}
-	if lr.Count == 0 || len(lr.Results) == 0 {
+	// AWX's ?name= filter is a field lookup, not part of the published
+	// schema: an instance that ignored it would hand back every template
+	// in the deployment, and results[0] would launch an arbitrary one.
+	// Names are also only unique per organization, so a genuine exact
+	// match can legitimately be ambiguous - refuse rather than guess
+	// which one the user meant.
+	var exact []templateResult
+	for i := range lr.Results {
+		if lr.Results[i].Name == name {
+			exact = append(exact, lr.Results[i])
+		}
+	}
+	if len(exact) == 0 {
 		return nil, fmt.Errorf("%s %q not found", kind, name)
 	}
-	r := lr.Results[0]
+	if len(exact) > 1 {
+		ids := make([]string, 0, len(exact))
+		for _, e := range exact {
+			ids = append(ids, strconv.Itoa(e.ID))
+		}
+		return nil, fmt.Errorf("%s %q is ambiguous: %d templates share that name (IDs %s), "+
+			"most likely in different AWX organizations. Rename one, or point this binding at an "+
+			"instance where the name is unique", kind, name, len(exact), strings.Join(ids, ", "))
+	}
+	r := exact[0]
 	return &AWXTemplate{
 		ID:                   r.ID,
 		Inventory:            r.Inventory,
@@ -365,8 +491,8 @@ func (c *AWXClient) DeleteHost(ctx context.Context, id int) error {
 	if resp.StatusCode == http.StatusNotFound || (resp.StatusCode >= 200 && resp.StatusCode < 300) {
 		return nil
 	}
-	respBody, _ := io.ReadAll(resp.Body)
-	return fmt.Errorf("awx request DELETE %s/hosts/%d/: status %d: %s", c.basePath, id, resp.StatusCode, strings.TrimSpace(string(respBody)))
+	respBody := readCappedBody(resp.Body)
+	return fmt.Errorf("awx request DELETE %s/hosts/%d/: status %d: %s", c.basePath, id, resp.StatusCode, truncate(string(respBody), maxErrorBodyChars))
 }
 
 func launchBody(limit string, extraVars map[string]string) (map[string]interface{}, error) {

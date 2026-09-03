@@ -1,5 +1,5 @@
 test-unit:
-	cd controller && go vet ./... && go test ./...
+	cd controller && go vet ./... && go test -race ./...
 test-e2e:
 	test/e2e.sh
 

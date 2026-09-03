@@ -21,8 +21,15 @@ type AWXConnectionSpec struct {
 	// in its "token" key.
 	SecretRef string `json:"secretRef"`
 	// InsecureSkipVerify skips TLS certificate verification when calling
-	// the AWX API.
+	// the AWX API. Mutually exclusive with CABundleSecretRef: trusting a
+	// CA and then not checking it is a contradiction worth rejecting
+	// rather than silently resolving.
 	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
+	// CABundleSecretRef names a Secret in this namespace holding a PEM
+	// CA bundle to trust when calling the AWX API, for an instance
+	// served by a private CA. The bundle is added to the system roots,
+	// not swapped for them.
+	CABundleSecretRef *SecretKeyRef `json:"caBundleSecretRef,omitempty"`
 	// APIBasePath overrides where this instance serves the controller
 	// API. Leave empty to detect it: "/api/v2" on AWX, Ansible Tower and
 	// AAP up to 2.4, "/api/controller/v2" on AAP 2.5+, where the
@@ -33,6 +40,14 @@ type AWXConnectionSpec struct {
 	// within an inventory, so when several supervisors or namespaces
 	// share one AWX instance a prefix keeps their host entries apart.
 	HostNamePrefix string `json:"hostNamePrefix,omitempty"`
+}
+
+// SecretKeyRef points at one key of a Secret in the same namespace.
+type SecretKeyRef struct {
+	Name string `json:"name"`
+	// Key holds the value within the Secret. Defaults to "ca.crt" when
+	// empty - the name Kubernetes already uses for a CA bundle.
+	Key string `json:"key,omitempty"`
 }
 
 type AWXConnectionStatus struct {
@@ -126,14 +141,19 @@ const historyLimit = 10
 // VMStatus is the per-VM run status for one VirtualMachine currently (or
 // formerly) matched by an AnsibleBinding's vmSelector.
 type VMStatus struct {
-	Name          string `json:"name"`
-	ObservedIP    string `json:"observedIP,omitempty"`
-	Phase         string `json:"phase,omitempty"`
-	AWXHostID     int64  `json:"awxHostID,omitempty"`
-	LastJobID     int64  `json:"lastJobID,omitempty"`
-	LastJobURL    string `json:"lastJobURL,omitempty"`
-	LastJobStatus string `json:"lastJobStatus,omitempty"`
-	LastUpdated   string `json:"lastUpdated,omitempty"`
+	Name       string `json:"name"`
+	ObservedIP string `json:"observedIP,omitempty"`
+	Phase      string `json:"phase,omitempty"`
+	AWXHostID  int64  `json:"awxHostID,omitempty"`
+	// AWXInventoryID is the inventory the host above lives in. Tracked
+	// because the inventory comes from the AWX template, which can be
+	// repointed at a different one: without this the host would be left
+	// behind in the old inventory and a second one created in the new.
+	AWXInventoryID int64  `json:"awxInventoryID,omitempty"`
+	LastJobID      int64  `json:"lastJobID,omitempty"`
+	LastJobURL     string `json:"lastJobURL,omitempty"`
+	LastJobStatus  string `json:"lastJobStatus,omitempty"`
+	LastUpdated    string `json:"lastUpdated,omitempty"`
 	// AWXHostName is the inventory host name last used for this VM.
 	// Tracked so a rename (a changed hostNamePrefix or spec.hostName)
 	// can retire the old host instead of orphaning it.
@@ -150,12 +170,9 @@ type VMStatus struct {
 	// AppliedGeneration and AppliedTrigger record what this specific VM
 	// last launched a run for, so a spec change or re-run request made
 	// while a job was in flight isn't swallowed.
-	AppliedGeneration int64  `json:"appliedGeneration,omitempty"`
-	AppliedTrigger    string `json:"appliedTrigger,omitempty"`
-	// HostVarsHash fingerprints the host name + variables last pushed to
-	// AWX, so unchanged hosts aren't re-PATCHed on every resync.
-	HostVarsHash string              `json:"hostVarsHash,omitempty"`
-	History      []VMRunHistoryEntry `json:"history,omitempty"`
+	AppliedGeneration int64               `json:"appliedGeneration,omitempty"`
+	AppliedTrigger    string              `json:"appliedTrigger,omitempty"`
+	History           []VMRunHistoryEntry `json:"history,omitempty"`
 }
 
 type AnsibleBindingStatus struct {

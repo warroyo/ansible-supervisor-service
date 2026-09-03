@@ -7,6 +7,11 @@ metadata:
   namespace: #@ data.values.namespace
 spec:
   replicas: 1
+  #! Recreate, not RollingUpdate: two controllers reconciling the same
+  #! AnsibleBindings would each decide independently to launch a run, so
+  #! an upgrade must never overlap old and new pods.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: ansible-supervisor
@@ -16,12 +21,34 @@ spec:
         app: ansible-supervisor
     spec:
       serviceAccountName: ansible-supervisor
+      #! The controller drains its workqueue on SIGTERM; this is the
+      #! window it gets to finish the reconcile in hand.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: controller
         image: controller
         args:
         - #@ "--resync-period=" + data.values.resync_period
         - #@ "--supervisor-id=" + data.values.supervisor_id
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          #! No CPU limit: throttling a controller just makes reconciles
+          #! late. Memory is capped because a runaway is worth killing.
+          limits:
+            memory: 256Mi
 
 ---
 apiVersion: v1
@@ -49,6 +76,14 @@ rules:
   - apiGroups: ["vmoperator.vmware.com"]
     resources: ["virtualmachines"]
     verbs: ["get", "list", "watch"]
+  #! API discovery, read at startup to find which VirtualMachine version
+  #! this supervisor serves rather than compiling one in. Stock clusters
+  #! already grant this to system:authenticated via system:discovery;
+  #! spelled out so the controller doesn't silently fall back to a pinned
+  #! version on a supervisor that doesn't. Discovery exposes only the
+  #! names of API groups and resources, no object data.
+  - nonResourceURLs: ["/apis", "/apis/*"]
+    verbs: ["get"]
   - apiGroups: ["field.vmware.com"]
     resources:
       - awxconnections

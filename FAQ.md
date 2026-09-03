@@ -1,11 +1,37 @@
 # FAQ
 
+- [I used the AAP integration in classic Aria Automation. What maps to what?](#i-used-the-aap-integration-in-classic-aria-automation-what-maps-to-what)
 - [Which AWX/Tower/AAP versions are supported?](#which-awxtoweraap-versions-are-supported)
 - [Why does my template need Prompt on Launch for Limit?](#why-does-my-template-need-prompt-on-launch-for-limit)
 - [Can several supervisors share one AWX instance?](#can-several-supervisors-share-one-awx-instance)
 - [How do I find AWX hosts a supervisor left behind?](#how-do-i-find-awx-hosts-a-supervisor-left-behind)
 - [What's different about Workflow Templates?](#whats-different-about-workflow-templates)
 - [What happens to in-flight runs when a VM powers off?](#what-happens-to-in-flight-runs-when-a-vm-powers-off)
+
+## I used the AAP integration in classic Aria Automation. What maps to what?
+
+Classic Aria Automation (vRA) had a built-in Ansible Automation Platform integration: you registered an AAP endpoint org-wide, dropped a `Cloud.Ansible.Tower` resource into a cloud template, and the machine being provisioned was handed to it. It only ever applies to VMs vRA provisions that way, so it cannot touch Supervisor-native VMs - and in a **VCF Automation 9.x All Apps** organization the `Cloud.Ansible.Tower` resource type is not available at all.
+
+This service puts the same capability on the Supervisor, as CRDs. Nothing here replaces or interferes with the classic integration: if you are on a VM Apps organization or classic vRA, that integration still exists and still works, and this is for the VMs it cannot reach.
+
+| | Classic Aria Automation / VM Apps | This service |
+|---|---|---|
+| Where the config lives | `Cloud.Ansible.Tower` resource in a cloud template | `AnsibleBinding` CR in the VM's namespace |
+| Where credentials live | AAP integration, registered org-wide in vRA | `AWXConnection` + `Secret`, per namespace, owned by the tenant |
+| How a host is targeted | vRA hands the provisioned machine to the integration | Label selector (`vmSelector`); the controller creates the inventory host and scopes the run with `--limit` |
+| What can be targeted | Exactly the one machine being provisioned | Every VM the selector matches, now and later |
+| When it runs | Once, at provisioning time | At provisioning time and on demand afterwards - bump the `reconcile-requested-at` annotation or edit the spec |
+| Drift in AWX | Not tracked | The inventory host is reconciled against AWX every pass; one deleted or hand-edited in the UI is repaired |
+| Teardown | Deprovisioning removes the host | The binding's finalizer removes the AWX hosts it created (`cleanupPolicy: Retain` opts out) |
+| AAP 2.5+ | [Broken](#which-awxtoweraap-versions-are-supported) - KB 394498 says stay on 2.4 | Detected and supported |
+
+Two differences are worth internalizing rather than skimming:
+
+**A selector is not a machine.** `Cloud.Ansible.Tower` could only ever touch the machine it was attached to. `vmSelector` reaches every matching VM in the namespace, including VMs from other deployments - which is what makes "configure this whole tier" a single CR, and what makes a careless selector dangerous. Label per deployment and match on that label.
+
+**Configuration is a persistent binding, not a provisioning step.** The CR stays around after the run, so re-running a playbook is a day-2 update to an object rather than a redeploy, and each VM keeps its own phase, job URL and bounded run history in `status.vms`.
+
+Driving all of this from a VCF Automation 9.x blueprint - where the binding becomes a `CCI.Supervisor.Resource` and deployment success waits on the playbook - is covered in [VCFA blueprints](VCFA-BLUEPRINTS.md).
 
 ## Which AWX/Tower/AAP versions are supported?
 

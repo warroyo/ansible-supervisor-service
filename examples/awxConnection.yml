@@ -6,6 +6,10 @@ metadata:
 type: Opaque
 stringData:
   token: "<AWX/Tower API token>"
+  # ca.crt: |                             # optional: PEM CA bundle, referenced by caBundleSecretRef
+  #   -----BEGIN CERTIFICATE-----
+  #   ...
+  #   -----END CERTIFICATE-----
 ---
 apiVersion: field.vmware.com/v1
 kind: AWXConnection
@@ -16,6 +20,9 @@ spec:
   url: "https://awx.example.com"          # base URL of the AWX/Tower instance
   secretRef: "awx-token"                  # Secret in this namespace holding the token
   insecureSkipVerify: false               # set true only for self-signed/test instances
+  # caBundleSecretRef:                    # trust a private CA instead of skipping verification
+  #   name: awx-token                     # any Secret in this namespace - the token Secret works
+  #   key: ca.crt                         # optional, defaults to ca.crt
   apiBasePath: ""                         # empty = detect. "/api/v2" on AWX/Tower/AAP<=2.4,
                                           # "/api/controller/v2" on AAP 2.5+ (platform gateway)
   hostNamePrefix: ""                      # prepended to inventory host names; set this when several

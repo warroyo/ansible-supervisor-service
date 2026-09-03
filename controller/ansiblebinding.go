@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -29,9 +30,7 @@ const detailsFieldManager = "ansible-supervisor-details"
 // is still recorded, and the first error encountered is returned so the
 // generic engine marks the AnsibleBinding as a whole Failed with
 // that message (status.vms still shows exactly which VM(s) succeeded).
-func applyAnsibleBinding(client *dynamic.DynamicClient, obj interface{}, _ []string) error {
-	ctx := context.Background()
-
+func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) error {
 	u, err := toUnstructured(obj)
 	if err != nil {
 		return err
@@ -64,13 +63,13 @@ func applyAnsibleBinding(client *dynamic.DynamicClient, obj interface{}, _ []str
 		return fmt.Errorf("AWXConnection %q has no spec", ac.Spec.AWXConnectionRef)
 	}
 
-	token, err := getSecretValue(client, ac.Namespace, awxConn.Spec.SecretRef, "token")
+	token, err := getSecretValue(ctx, client, ac.Namespace, awxConn.Spec.SecretRef, "token")
 	if err != nil {
 		return fmt.Errorf("reading AWX token from secret %q: %w", awxConn.Spec.SecretRef, err)
 	}
-	awxClient, _, err := awxClientFor(awxConn, token)
+	awxClient, _, err := awxClientFor(ctx, client, awxConn, token)
 	if err != nil {
-		return fmt.Errorf("resolving the API base path for AWXConnection %q: %w", ac.Spec.AWXConnectionRef, err)
+		return fmt.Errorf("preparing a client for AWXConnection %q: %w", ac.Spec.AWXConnectionRef, err)
 	}
 
 	var tmpl *AWXTemplate
@@ -86,7 +85,7 @@ func applyAnsibleBinding(client *dynamic.DynamicClient, obj interface{}, _ []str
 		return fmt.Errorf("resolving template %q: %w", ac.Spec.Template.Name, err)
 	}
 
-	vms, err := listVirtualMachines(client, ac.Namespace, ac.Spec.VMSelector)
+	vms, err := listVirtualMachines(ctx, client, ac.Namespace, ac.Spec.VMSelector)
 	if err != nil {
 		return fmt.Errorf("listing target VMs: %w", err)
 	}
@@ -197,43 +196,53 @@ func applyAnsibleBinding(client *dynamic.DynamicClient, obj interface{}, _ []str
 		hostName = awxConn.Spec.HostNamePrefix + hostName
 
 		if tmpl.Inventory != nil {
-			// A renamed host (changed hostNamePrefix or spec.hostName)
-			// would otherwise orphan the entry under the old name.
-			if vs.AWXHostID != 0 && vs.AWXHostName != "" && vs.AWXHostName != hostName {
+			inventoryID := int64(*tmpl.Inventory)
+
+			// A renamed host (changed hostNamePrefix or spec.hostName), or
+			// a template repointed at a different inventory, would
+			// otherwise orphan the old entry - under the old name, or in
+			// the old inventory - while a second one appears alongside it.
+			renamed := vs.AWXHostName != "" && vs.AWXHostName != hostName
+			moved := vs.AWXInventoryID != 0 && vs.AWXInventoryID != inventoryID
+			if vs.AWXHostID != 0 && (renamed || moved) {
 				if vs.AWXHostCreated && cleanupPolicy == CleanupPolicyDelete {
 					if dErr := awxClient.DeleteHost(ctx, int(vs.AWXHostID)); dErr != nil {
 						// Leave the recorded host in place and retry,
 						// rather than losing track of it.
-						recordErr(fmt.Errorf("retiring renamed AWX host %q for VM %q: %w", vs.AWXHostName, name, dErr))
+						recordErr(fmt.Errorf("retiring AWX host %q for VM %q: %w", vs.AWXHostName, name, dErr))
 						newVMStatuses = append(newVMStatuses, vs)
 						continue
 					}
 				}
 				vs.AWXHostID = 0
 				vs.AWXHostCreated = false
-				vs.HostVarsHash = ""
+				vs.AWXInventoryID = 0
 			}
 
 			hostVars := map[string]string{"ansible_host": ip}
 			for k, v := range ac.Spec.HostVariables {
 				hostVars[k] = v
 			}
-			// Only touch AWX when the host or its variables actually
-			// changed, instead of re-PATCHing on every resync.
-			hash := hostVarsHash(hostName, hostVars)
-			if vs.AWXHostID == 0 || vs.HostVarsHash != hash {
-				hostID, owned, hErr := awxClient.UpsertHost(ctx, *tmpl.Inventory, hostName, hostOwnerMarker(ac.Namespace, ac.Name), hostVars)
-				if hErr != nil {
-					vs.Phase = PhaseFailed
-					recordErr(fmt.Errorf("upserting AWX host for VM %q: %w", name, hErr))
-					newVMStatuses = append(newVMStatuses, vs)
-					continue
-				}
-				vs.AWXHostID = int64(hostID)
-				vs.AWXHostName = hostName
-				vs.AWXHostCreated = owned
-				vs.HostVarsHash = hash
+
+			// Reconcile the host against AWX itself on every pass, rather
+			// than trusting what status says was pushed last time. A host
+			// deleted or edited in the AWX UI is drift like any other, and
+			// status cannot see it: the run would then fail forever with
+			// "--limit does not match any hosts", or quietly run against
+			// hand-edited variables, and nothing would ever repair it.
+			// UpsertHost PATCHes only when the variables actually differ,
+			// so a steady state costs one GET per VM per resync.
+			hostID, owned, hErr := awxClient.UpsertHost(ctx, *tmpl.Inventory, hostName, hostOwnerMarker(ac.Namespace, ac.Name), hostVars)
+			if hErr != nil {
+				vs.Phase = PhaseFailed
+				recordErr(fmt.Errorf("upserting AWX host for VM %q: %w", name, hErr))
+				newVMStatuses = append(newVMStatuses, vs)
+				continue
 			}
+			vs.AWXHostID = int64(hostID)
+			vs.AWXHostName = hostName
+			vs.AWXHostCreated = owned
+			vs.AWXInventoryID = inventoryID
 		}
 
 		// The relaunch decision is per VM, so a spec change or re-run
@@ -303,7 +312,7 @@ func applyAnsibleBinding(client *dynamic.DynamicClient, obj interface{}, _ []str
 
 	sort.Slice(newVMStatuses, func(i, j int) bool { return newVMStatuses[i].Name < newVMStatuses[j].Name })
 
-	if detailErr := writeAnsibleBindingDetails(client, u, newVMStatuses, ac.Generation, triggerValue); detailErr != nil {
+	if detailErr := writeAnsibleBindingDetails(ctx, client, u, newVMStatuses, ac.Generation, triggerValue); detailErr != nil {
 		log.Printf("[AnsibleBinding/%s/%s] failed to persist per-VM status: %v", ac.Namespace, ac.Name, detailErr)
 		recordErr(detailErr)
 	}
@@ -311,7 +320,7 @@ func applyAnsibleBinding(client *dynamic.DynamicClient, obj interface{}, _ []str
 	return firstErr
 }
 
-func writeAnsibleBindingDetails(client *dynamic.DynamicClient, obj *unstructured.Unstructured, vms []VMStatus, observedGeneration int64, lastTrigger string) error {
+func writeAnsibleBindingDetails(ctx context.Context, client *dynamic.DynamicClient, obj *unstructured.Unstructured, vms []VMStatus, observedGeneration int64, lastTrigger string) error {
 	vmsData := make([]interface{}, 0, len(vms))
 	for _, v := range vms {
 		m, err := structToMap(v)
@@ -325,19 +334,22 @@ func writeAnsibleBindingDetails(client *dynamic.DynamicClient, obj *unstructured
 		"observedGeneration": observedGeneration,
 		"lastAppliedTrigger": lastTrigger,
 	}
-	return patchStatus(context.Background(), client, ansBindGVR, obj, statusData, detailsFieldManager)
+	return patchStatus(ctx, client, ansBindGVR, obj, statusData, detailsFieldManager)
 }
 
 // cleanupAnsibleBinding deletes every AWX host this CR created
 // (unless cleanupPolicy is Retain) before the finalizer is released.
 //
-// Host deletion failures are returned so the delete is retried rather
-// than leaking the host. An unrecoverable situation - the AWXConnection
-// or its Secret is already gone, so there's no way left to reach AWX -
-// is logged and skipped instead, since blocking the delete forever would
-// not bring the host back either.
-func cleanupAnsibleBinding(client *dynamic.DynamicClient, obj interface{}) error {
-	ctx := context.Background()
+// Failures are returned so the delete is retried rather than leaking the
+// host. Only a genuinely unrecoverable situation - the AWXConnection or
+// its Secret is gone, or is malformed in a way no retry can fix - is
+// logged and skipped, since blocking the delete forever would not bring
+// the host back either. A temporary failure (AWX unreachable, the API
+// server erroring) is never one of those: abandoning a host there would
+// leak an inventory entry whose IP AWX may later hand to an unrelated
+// VM. To release a binding whose AWX instance is permanently gone, set
+// spec.cleanupPolicy: Retain - that is honored on a terminating object.
+func cleanupAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) error {
 	u, err := toUnstructured(obj)
 	if err != nil {
 		return nil
@@ -360,25 +372,39 @@ func cleanupAnsibleBinding(client *dynamic.DynamicClient, obj interface{}) error
 		return nil
 	}
 
+	abandon := func(reason string, err error) {
+		log.Printf("[AnsibleBinding/%s/%s] cleanup: %s, abandoning %d AWX host(s): %v",
+			ac.Namespace, ac.Name, reason, len(toDelete), err)
+	}
+
 	awxConnObj, err := client.Resource(awxConnGVR).Namespace(ac.Namespace).Get(ctx, ac.Spec.AWXConnectionRef, metav1.GetOptions{})
 	if err != nil {
-		log.Printf("[AnsibleBinding/%s/%s] cleanup: AWXConnection %q unavailable, abandoning %d AWX host(s): %v", ac.Namespace, ac.Name, ac.Spec.AWXConnectionRef, len(toDelete), err)
+		if !isPermanent(err) {
+			return fmt.Errorf("fetching AWXConnection %q to clean up %d AWX host(s): %w", ac.Spec.AWXConnectionRef, len(toDelete), err)
+		}
+		abandon(fmt.Sprintf("AWXConnection %q is gone", ac.Spec.AWXConnectionRef), err)
 		return nil
 	}
 	awxConn, err := convertAWXConnection(awxConnObj)
 	if err != nil || awxConn.Spec == nil {
-		log.Printf("[AnsibleBinding/%s/%s] cleanup: AWXConnection %q invalid, abandoning %d AWX host(s)", ac.Namespace, ac.Name, ac.Spec.AWXConnectionRef, len(toDelete))
+		abandon(fmt.Sprintf("AWXConnection %q is malformed", ac.Spec.AWXConnectionRef), err)
 		return nil
 	}
-	token, err := getSecretValue(client, ac.Namespace, awxConn.Spec.SecretRef, "token")
+	token, err := getSecretValue(ctx, client, ac.Namespace, awxConn.Spec.SecretRef, "token")
 	if err != nil {
-		log.Printf("[AnsibleBinding/%s/%s] cleanup: reading AWX token failed, abandoning %d AWX host(s): %v", ac.Namespace, ac.Name, len(toDelete), err)
+		if !isPermanent(err) {
+			return fmt.Errorf("reading the AWX token to clean up %d AWX host(s): %w", len(toDelete), err)
+		}
+		abandon("the AWX token is gone", err)
 		return nil
 	}
-	awxClient, _, err := awxClientFor(awxConn, token)
+	// A base path that will not resolve means AWX is unreachable right
+	// now - exactly the transient case worth retrying rather than
+	// leaking hosts over.
+	awxClient, _, err := awxClientFor(ctx, client, awxConn, token)
 	if err != nil {
-		log.Printf("[AnsibleBinding/%s/%s] cleanup: resolving the AWX API base path failed, abandoning %d AWX host(s): %v", ac.Namespace, ac.Name, len(toDelete), err)
-		return nil
+		return fmt.Errorf("resolving the AWX API base path to clean up %d AWX host(s) "+
+			"(set spec.cleanupPolicy: Retain to release this binding and leave them in place): %w", len(toDelete), err)
 	}
 
 	var firstErr error
@@ -391,4 +417,81 @@ func cleanupAnsibleBinding(client *dynamic.DynamicClient, obj interface{}) error
 		}
 	}
 	return firstErr
+}
+
+// updateAnsibleBindingStatus derives the binding's aggregate state from
+// the per-VM outcomes in status.vms.
+//
+// The generic updater cannot do this: it only sees whether the reconcile
+// returned an error, and an AWX job that ran and failed is not a
+// reconcile error - the controller did its job. Reporting Ready off the
+// back of that would mark a binding healthy while every run under it was
+// failing, or while no VM had run at all.
+func updateAnsibleBindingStatus(u *unstructured.Unstructured, success bool, reconcileErr error) map[string]interface{} {
+	if reconcileErr != nil || !success {
+		return updateGenericStatus(u, success, reconcileErr)
+	}
+
+	status := func(state, message string, ready bool) map[string]interface{} {
+		return map[string]interface{}{
+			"state":       state,
+			"message":     message,
+			"ready":       ready,
+			"lastUpdated": metav1.Now(),
+		}
+	}
+
+	ab, err := convertAnsibleBinding(u)
+	if err != nil {
+		return status("Pending", fmt.Sprintf("Could not read per-VM status: %s", err), false)
+	}
+	if ab.Status == nil || len(ab.Status.VMs) == 0 {
+		return status("Pending", "No VirtualMachines match vmSelector yet.", false)
+	}
+
+	var pending, running, failed, succeeded []string
+	for _, vm := range ab.Status.VMs {
+		// Entries kept only to retry a host deletion are former targets,
+		// not something the binding is waiting on.
+		if vm.PendingCleanup {
+			continue
+		}
+		switch vm.Phase {
+		case PhaseSucceeded:
+			succeeded = append(succeeded, vm.Name)
+		case PhaseFailed:
+			failed = append(failed, vm.Name)
+		case PhaseRunning:
+			running = append(running, vm.Name)
+		default:
+			pending = append(pending, vm.Name)
+		}
+	}
+
+	total := len(pending) + len(running) + len(failed) + len(succeeded)
+	switch {
+	case total == 0:
+		return status("Pending", "No VirtualMachines match vmSelector yet.", false)
+	case len(failed) > 0:
+		return status("Failed", fmt.Sprintf("%d of %d VM(s) failed their last run: %s.",
+			len(failed), total, nameList(failed)), false)
+	case len(running) > 0:
+		return status("Running", fmt.Sprintf("%d of %d VM(s) still running: %s.",
+			len(running), total, nameList(running)), false)
+	case len(pending) > 0:
+		return status("Pending", fmt.Sprintf("%d of %d VM(s) not ready to run (powered off, or no reported IP): %s.",
+			len(pending), total, nameList(pending)), false)
+	default:
+		return status("Ready", fmt.Sprintf("All %d VM(s) completed the requested run successfully.", total), true)
+	}
+}
+
+// nameList renders VM names for a status message, bounded so a selector
+// matching hundreds of VMs does not produce an unreadable status.
+func nameList(names []string) string {
+	const max = 3
+	if len(names) <= max {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(names[:max], ", "), len(names)-max)
 }

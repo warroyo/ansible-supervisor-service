@@ -5,9 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -17,8 +21,10 @@ import (
 )
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Cancelled on SIGTERM/SIGINT so a rolling update drains in-flight
+	// reconciles instead of being killed part-way through one.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	resync := flag.Int("resync-period", 60, "reconcile resync interval, in seconds")
 	supervisorIDFlag := flag.String("supervisor-id", "", "identity stamped on AWX inventory hosts this supervisor owns, so one AWX instance can be shared by several supervisors (default: the kube-system namespace UID)")
@@ -58,11 +64,27 @@ func main() {
 		panic(err.Error())
 	}
 
-	supervisorID, err = resolveSupervisorID(dynClient, *supervisorIDFlag)
+	supervisorID, err = resolveSupervisorID(ctx, dynClient, *supervisorIDFlag)
 	if err != nil {
 		panic(err.Error())
 	}
 	fmt.Printf("supervisor id: %s\n", supervisorID)
+
+	// Which VirtualMachine API version this Supervisor serves is decided
+	// here rather than compiled in. A failure isn't fatal - the fallback
+	// version may well be right - but it is worth shouting about, since
+	// the symptom of getting this wrong is bindings sitting in Pending
+	// forever with nothing to indicate why.
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	if resolved, resolveErr := resolveVMGVR(discoveryClient); resolveErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not discover the VirtualMachine API version (%v); falling back to %s\n", resolveErr, vmGVR.GroupVersion())
+	} else {
+		vmGVR = resolved
+	}
+	fmt.Printf("virtualmachine api: %s\n", vmGVR.GroupVersion())
 
 	// One rate limiter per queue: its backoff state is keyed by
 	// "namespace/name", so a shared limiter would let a failing
@@ -71,12 +93,13 @@ func main() {
 		return workqueue.NewItemExponentialFailureRateLimiter(time.Second, 60*time.Second)
 	}
 
+	// An AWXConnection creates nothing outside Kubernetes, so it needs no
+	// finalizer; the one earlier versions set is stripped on sight.
 	awxConnController := &Controller{
 		client:           dynClient,
 		gvr:              awxConnGVR,
-		finalizerName:    "field.vmware.com/awx-connection-cleanup",
+		staleFinalizers:  []string{awxConnectionStaleFinalizer},
 		provisionFunc:    applyAWXConnection,
-		cleanupFunc:      cleanupAWXConnection,
 		updateStatusFunc: updateGenericStatus,
 		Queue:            workqueue.NewRateLimitingQueue(newRateLimiter()),
 	}
@@ -87,7 +110,7 @@ func main() {
 		finalizerName:    "field.vmware.com/ansible-binding-cleanup",
 		provisionFunc:    applyAnsibleBinding,
 		cleanupFunc:      cleanupAnsibleBinding,
-		updateStatusFunc: updateGenericStatus,
+		updateStatusFunc: updateAnsibleBindingStatus,
 		Queue:            workqueue.NewRateLimitingQueue(newRateLimiter()),
 	}
 
@@ -95,24 +118,31 @@ func main() {
 	// itself watches cluster-wide (no namespace allowlist to maintain) -
 	// same for the VirtualMachine lookups applyAnsibleBinding does
 	// per-namespace on demand.
-	awxConnInformer := setupInformer(dynClient, awxConnController.gvr, awxConnController, resyncPeriod)
-	ansBindInformer := setupInformer(dynClient, ansBindController.gvr, ansBindController, resyncPeriod)
+	awxConnInformer := setupInformer(ctx, dynClient, awxConnController.gvr, awxConnController, resyncPeriod)
+	ansBindInformer := setupInformer(ctx, dynClient, ansBindController.gvr, ansBindController, resyncPeriod)
 
-	stop := make(chan struct{})
-	defer close(stop)
+	go awxConnInformer.Run(ctx.Done())
+	go ansBindInformer.Run(ctx.Done())
 
-	go awxConnInformer.Run(stop)
-	go ansBindInformer.Run(stop)
-
-	if !cache.WaitForCacheSync(stop, awxConnInformer.HasSynced, ansBindInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), awxConnInformer.HasSynced, ansBindInformer.HasSynced) {
 		fmt.Fprintln(os.Stderr, "error waiting for cache sync")
 		os.Exit(1)
 	}
 	fmt.Println("ansible supervisor controller started successfully")
 
-	go awxConnController.Run(ctx, numWorkers)
-	go ansBindController.Run(ctx, numWorkers)
+	// Each Run returns once its queue has drained, so the process stays
+	// alive until both controllers have finished the work in hand.
+	var wg sync.WaitGroup
+	for _, c := range []*Controller{awxConnController, ansBindController} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Run(ctx, numWorkers)
+		}()
+	}
 
 	<-ctx.Done()
-	fmt.Println("shutting down controller")
+	fmt.Println("shutting down controller: draining in-flight reconciles")
+	wg.Wait()
+	fmt.Println("shutdown complete")
 }
