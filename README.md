@@ -281,11 +281,13 @@ spec:
 | `varsFrom[]` | Read fields off live objects in this namespace into `extra_vars` - see below |
 | `cleanupPolicy` | `Delete` (default) or `Retain`, same meaning as on a binding |
 | `activeDeadlineSeconds` | Bound the whole run, measured from creation. On expiry it goes terminally `Failed` |
-| `ttlSecondsAfterFinished` | Delete the CR that long after it finishes, taking the AWX hosts it created with it. Granularity is `resync_period` |
+| `ttlSecondsAfterFinished` | Delete the CR that long after it finishes, taking the AWX hosts it created with it. Granularity is `resync_period`. Leave it unset when something else owns the object's lifecycle - [a VCFA deployment, for instance](VCFA-BLUEPRINTS.md#one-off-actions-with-ansiblerun) |
 
 **No target means no limit**, and that is deliberate. The template's own inventory and scope apply, exactly as `useDefaultLimit: true` does on a binding. For a `hosts: localhost` playbook that is the whole point - AWX requires *an* inventory on a job template regardless, and the usual answer is a throwaway one holding only `localhost`. For a `hosts: all` template with a populated inventory, it means the run reaches all of it. A binding refuses to launch in the analogous situation; a targetless run does not, because there is nothing to scope to.
 
 **Hosts are adopted, never hijacked**, the same as with a binding: a host that already exists has its variables merged into rather than overwritten, reports `awxHostCreated: false`, and is never deleted at cleanup. Only hosts the run created are.
+
+**The spec is immutable, and the API server enforces it.** That makes a run idempotent across anything that re-applies it - re-applying an unchanged manifest does nothing, and there is no second job to worry about. It also means an *edit* is rejected outright, so any templating system that generates a run's spec from values that can change has to generate a new `metadata.name` when they do, rather than patching in place.
 
 #### `varsFrom`, and what it can read
 

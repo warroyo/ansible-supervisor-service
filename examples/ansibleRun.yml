@@ -12,6 +12,10 @@
 #
 # The four shapes below are all of the useful combinations. Apply whichever
 # one fits; they are separate documents, so `kubectl apply -f` takes the lot.
+#
+# These set ttlSecondsAfterFinished because nothing else owns them - they are
+# applied by hand. Leave it unset when something else tracks the object's
+# lifecycle, such as a VCFA deployment: see VCFA-BLUEPRINTS.md.
 
 ---
 # 1. Standalone. No target at all: nothing is written to the inventory and no
