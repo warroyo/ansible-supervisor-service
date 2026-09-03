@@ -40,6 +40,9 @@ jobs:
           install_carvel ytt carvel-dev/ytt v0.55.1 3a2c925ed222f8db4956946d40279688edd6ceb3e919f03f919a8fc8b8532eda
           install_carvel imgpkg carvel-dev/imgpkg v0.48.1 6c7a1a2e6555e7827c3c97580be87c84d06778d0650d308f7dc67613aec7c7c8
           install_carvel kctrl carvel-dev/kapp-controller v0.60.6 0b6451e64055a2203e72bd1175892db8e17b23dc3e23edd7d60ebe42b063c036
+          # `kctrl package release` shells out to vendir to fetch the package
+          # sources, and fails with "executable file not found" without it.
+          install_carvel vendir carvel-dev/vendir v0.45.2 ecd053b031fdebfe0486b263a7071320b033f60b6d9e6c6b74ad681f2d7068b5
           kctrl version
 
       - name: Set Version
