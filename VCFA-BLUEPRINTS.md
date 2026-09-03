@@ -123,6 +123,9 @@ resources:
 
   # Bootstrap the SSH user AWX's Machine credential logs in as. Nothing
   # about this service is installed on the VM - it only has to accept SSH.
+  # The user name and public key below must match that Machine credential:
+  # a VM that boots without them comes up fine and then fails the job with
+  # `unreachable`, because sshd answers and then rejects the login.
   Webserver_Bootstrap:
     type: CCI.Supervisor.Resource
     properties:
@@ -141,7 +144,7 @@ resources:
                 sudo: ALL=(ALL) NOPASSWD:ALL
                 shell: /bin/bash
                 ssh_authorized_keys:
-                  - ssh-ed25519 AAAA... awx-machine-credential
+                  - <your SSH public key>
             ssh_pwauth: false
 
   Webserver_VM:
