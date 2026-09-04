@@ -161,12 +161,12 @@ kubectl get ansiblebinding webserver-config -n my-namespace -w
 `Ready` means the playbook completed successfully against every matched VM. To see the run in AWX:
 
 ```bash
-kubectl get ansiblebinding webserver-config -n my-namespace \
-  -o jsonpath='{range .status.vms[*]}{.name}{"\t"}{.phase}{"\t"}{.lastJobURL}{"\n"}{end}'
+kubectl get ansiblebindingvm -n my-namespace -l field.vmware.com/binding=webserver-config \
+  -o jsonpath='{range .items[*]}{.spec.vmName}{"\t"}{.status.phase}{"\t"}{.status.lastJobURL}{"\n"}{end}'
 # sample-webserver  Succeeded  https://awx.example.com/#/jobs/playbook/412
 ```
 
-One binding fans out: every VM the selector matches gets its own inventory host, its own run, and its own entry in `status.vms`. Label a second VM `app: webserver` and it's picked up on the next resync - no edit to the binding needed.
+One binding fans out: every VM the selector matches gets its own inventory host, its own run, and its own `AnsibleBindingVM`. Label a second VM `app: webserver` and it's picked up on the next resync - no edit to the binding needed.
 
 ## Re-running
 

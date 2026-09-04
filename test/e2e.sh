@@ -106,6 +106,18 @@ else:
 " "$2" "$3"
 }
 
+vm_field() {      # vm_field <binding> <vm> <status field> -> prints the value
+  # The per-VM detail that used to live in the binding's status.vms[] is
+  # now one AnsibleBindingVM per VM, named <binding>-<vm>.
+  kubectl get ansiblebindingvm "$1-$2" -n "$TEST_NS" -o jsonpath="{.status.$3}" 2>/dev/null
+}
+
+# wait_for runs its command with "$@", which for a `bash -c "..."` check is
+# a brand new shell: without exporting these, a helper used inside one is
+# "command not found" and the check passes or fails for the wrong reason.
+export -f host_deleted host_field vm_field
+export TEST_NS
+
 log "creating kind cluster $CLUSTER_NAME"
 kind create cluster --name "$CLUSTER_NAME" --kubeconfig "$WORK_DIR/admin.kubeconfig" >/dev/null
 export KUBECONFIG="$WORK_DIR/admin.kubeconfig"
@@ -243,10 +255,10 @@ wait_for "AnsibleBinding Ready" 30 bash -c \
   "[[ \$(kubectl get ansiblebinding e2e-config -n ${TEST_NS} -o jsonpath='{.status.ready}') == true ]]"
 
 wait_for "VM job reaches Succeeded" 30 bash -c \
-  "[[ \$(kubectl get ansiblebinding e2e-config -n ${TEST_NS} -o jsonpath='{.status.vms[0].phase}') == Succeeded ]]"
+  "[[ \$(vm_field e2e-config web-1 phase) == Succeeded ]]"
 
-HOST_ID=$(kubectl get ansiblebinding e2e-config -n "$TEST_NS" -o jsonpath='{.status.vms[0].awxHostID}')
-JOB_ID=$(kubectl get ansiblebinding e2e-config -n "$TEST_NS" -o jsonpath='{.status.vms[0].lastJobID}')
+HOST_ID=$(vm_field e2e-config web-1 awxHostID)
+JOB_ID=$(vm_field e2e-config web-1 lastJobID)
 if [[ -z "$HOST_ID" || -z "$JOB_ID" ]]; then
   echo "expected awxHostID and lastJobID to be set, got hostID=$HOST_ID jobID=$JOB_ID"
   exit 1
@@ -259,10 +271,10 @@ kubectl annotate ansiblebinding e2e-config -n "$TEST_NS" \
   ansible.field.vmware.com/reconcile-requested-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite >/dev/null
 
 wait_for "a new job is launched" 30 bash -c \
-  "[[ \$(kubectl get ansiblebinding e2e-config -n ${TEST_NS} -o jsonpath='{.status.vms[0].lastJobID}') != ${JOB_ID} ]]"
+  "[[ \$(vm_field e2e-config web-1 lastJobID) != ${JOB_ID} ]]"
 wait_for "the re-run reaches Succeeded" 30 bash -c \
-  "[[ \$(kubectl get ansiblebinding e2e-config -n ${TEST_NS} -o jsonpath='{.status.vms[0].phase}') == Succeeded ]]"
-RERUN_JOB_ID=$(kubectl get ansiblebinding e2e-config -n "$TEST_NS" -o jsonpath='{.status.vms[0].lastJobID}')
+  "[[ \$(vm_field e2e-config web-1 phase) == Succeeded ]]"
+RERUN_JOB_ID=$(vm_field e2e-config web-1 lastJobID)
 log "re-run launched and succeeded: lastJobID=$RERUN_JOB_ID"
 
 # --- powering a VM off must not clobber its run phase, and must not
@@ -272,8 +284,8 @@ kubectl patch virtualmachine web-1 -n "$TEST_NS" --type=merge \
   -p '{"status":{"powerState":"PoweredOff"}}' >/dev/null
 sleep 6   # several resync passes
 
-PHASE_WHILE_OFF=$(kubectl get ansiblebinding e2e-config -n "$TEST_NS" -o jsonpath='{.status.vms[0].phase}')
-JOB_WHILE_OFF=$(kubectl get ansiblebinding e2e-config -n "$TEST_NS" -o jsonpath='{.status.vms[0].lastJobID}')
+PHASE_WHILE_OFF=$(vm_field e2e-config web-1 phase)
+JOB_WHILE_OFF=$(vm_field e2e-config web-1 lastJobID)
 if [[ "$PHASE_WHILE_OFF" != "Succeeded" ]]; then
   echo "expected a powered-off VM to keep its Succeeded phase, got '$PHASE_WHILE_OFF'"
   exit 1
@@ -285,7 +297,7 @@ kubectl annotate ansiblebinding e2e-config -n "$TEST_NS" \
   ansible.field.vmware.com/reconcile-requested-at="offline-$(date -u +%s)" --overwrite >/dev/null
 sleep 6
 
-if [[ "$(kubectl get ansiblebinding e2e-config -n "$TEST_NS" -o jsonpath='{.status.vms[0].lastJobID}')" != "$JOB_WHILE_OFF" ]]; then
+if [[ "$(vm_field e2e-config web-1 lastJobID)" != "$JOB_WHILE_OFF" ]]; then
   echo "a job was launched against a powered-off VM"
   exit 1
 fi
@@ -293,7 +305,7 @@ fi
 kubectl patch virtualmachine web-1 -n "$TEST_NS" --type=merge \
   -p '{"status":{"powerState":"PoweredOn"}}' >/dev/null
 wait_for "the deferred re-run launches once the VM is back" 30 bash -c \
-  "[[ \$(kubectl get ansiblebinding e2e-config -n ${TEST_NS} -o jsonpath='{.status.vms[0].lastJobID}') != ${JOB_WHILE_OFF} ]]"
+  "[[ \$(vm_field e2e-config web-1 lastJobID) != ${JOB_WHILE_OFF} ]]"
 log "re-run requested during downtime was honored, not swallowed"
 
 # --- steady state must not re-PATCH an unchanged host every resync ---
@@ -314,8 +326,8 @@ log "unchanged host was never re-PATCHed across resyncs"
 log "deleting the AWX host out of band, expecting the next reconcile to recreate it"
 curl -sf -X DELETE "http://${AWX_ADDR}/api/v2/hosts/${HOST_ID}/" >/dev/null
 wait_for "AWX host recreated under a new id" 30 bash -c \
-  "id=\$(kubectl get ansiblebinding e2e-config -n ${TEST_NS} -o jsonpath='{.status.vms[0].awxHostID}'); [[ -n \$id && \$id != ${HOST_ID} ]]"
-HOST_ID=$(kubectl get ansiblebinding e2e-config -n "$TEST_NS" -o jsonpath='{.status.vms[0].awxHostID}')
+  "id=\$(vm_field e2e-config web-1 awxHostID); [[ -n \$id && \$id != ${HOST_ID} ]]"
+HOST_ID=$(vm_field e2e-config web-1 awxHostID)
 if [[ "$(host_field "$AWX_ADDR" web-1 name)" != "web-1" ]]; then
   echo "expected the recreated host to be back in the inventory"
   exit 1
@@ -334,8 +346,8 @@ log "hand-edited host variables were reconciled back"
 log "dropping the VM out of vmSelector, expecting its AWX host to be cleaned up"
 kubectl label virtualmachine web-1 -n "$TEST_NS" app- >/dev/null
 
-wait_for "VM removed from status.vms" 30 bash -c \
-  "[[ \$(kubectl get ansiblebinding e2e-config -n ${TEST_NS} -o jsonpath='{.status.vms}') == '[]' ]]"
+wait_for "AnsibleBindingVM removed for the unmatched VM" 30 bash -c \
+  "! kubectl get ansiblebindingvm e2e-config-web-1 -n ${TEST_NS} >/dev/null 2>&1"
 
 wait_for "AWX host deleted" 15 host_deleted "$AWX_ADDR" "$HOST_ID"
 log "unmatched VM's AWX host was cleaned up (id=$HOST_ID)"
@@ -433,10 +445,10 @@ spec:
 EOF
 
 wait_for "adopted VM reaches a run" 30 bash -c \
-  "[[ -n \$(kubectl get ansiblebinding e2e-adopt -n ${TEST_NS} -o jsonpath='{.status.vms[0].lastJobID}') ]]"
+  "[[ -n \$(vm_field e2e-adopt web-2 lastJobID) ]]"
 
-ADOPTED_ID=$(kubectl get ansiblebinding e2e-adopt -n "$TEST_NS" -o jsonpath='{.status.vms[0].awxHostID}')
-CREATED_FLAG=$(kubectl get ansiblebinding e2e-adopt -n "$TEST_NS" -o jsonpath='{.status.vms[0].awxHostCreated}')
+ADOPTED_ID=$(vm_field e2e-adopt web-2 awxHostID)
+CREATED_FLAG=$(vm_field e2e-adopt web-2 awxHostCreated)
 if [[ "$ADOPTED_ID" != "$SEEDED_ID" ]]; then
   echo "expected the pre-existing host $SEEDED_ID to be adopted, got $ADOPTED_ID"
   exit 1
@@ -498,7 +510,7 @@ spec:
 EOF
 
 wait_for "foreign-owned host is refused" 30 bash -c \
-  "kubectl get ansiblebinding e2e-foreign -n ${TEST_NS} -o jsonpath='{.status.vms[0].phase}{.status.message}' | grep -q 'owned by another'"
+  "kubectl get ansiblebindingvm e2e-foreign-web-3 -n ${TEST_NS} -o jsonpath='{.status.phase}{.status.message}' | grep -q 'owned by another'"
 
 if ! curl -sf "http://${AWX_ADDR}/_test/hosts" | grep -q '192.168.99.99'; then
   echo "the other supervisor's host variables were overwritten"
@@ -516,7 +528,7 @@ kubectl patch awxconnection e2e-awx -n "$TEST_NS" --type=merge \
   -p '{"spec":{"hostNamePrefix":"sup-b-"}}' >/dev/null
 
 wait_for "prefixed host is created and the run succeeds" 60 bash -c \
-  "[[ \$(kubectl get ansiblebinding e2e-foreign -n ${TEST_NS} -o jsonpath='{.status.vms[0].awxHostName}') == sup-b-web-3 ]]"
+  "[[ \$(vm_field e2e-foreign web-3 awxHostName) == sup-b-web-3 ]]"
 if ! curl -sf "http://${AWX_ADDR}/_test/hosts" | grep -q 'sup-b-web-3'; then
   echo "expected a host named sup-b-web-3 to be created"
   exit 1
@@ -566,8 +578,8 @@ spec:
 EOF
 
 wait_for "retained binding creates its host" 30 bash -c \
-  "[[ \$(kubectl get ansiblebinding e2e-retain -n ${TEST_NS} -o jsonpath='{.status.vms[0].awxHostCreated}') == true ]]"
-RETAINED_ID=$(kubectl get ansiblebinding e2e-retain -n "$TEST_NS" -o jsonpath='{.status.vms[0].awxHostID}')
+  "[[ \$(vm_field e2e-retain web-4 awxHostCreated) == true ]]"
+RETAINED_ID=$(vm_field e2e-retain web-4 awxHostID)
 
 kubectl delete ansiblebinding e2e-retain -n "$TEST_NS" --timeout=30s >/dev/null
 if host_deleted "$AWX_ADDR" "$RETAINED_ID"; then
@@ -593,9 +605,9 @@ spec:
 EOF
 
 wait_for "recreated binding adopts the same host" 30 bash -c \
-  "[[ \$(kubectl get ansiblebinding e2e-retain -n ${TEST_NS} -o jsonpath='{.status.vms[0].awxHostID}') == ${RETAINED_ID} ]]"
+  "[[ \$(vm_field e2e-retain web-4 awxHostID) == ${RETAINED_ID} ]]"
 
-RECLAIMED=$(kubectl get ansiblebinding e2e-retain -n "$TEST_NS" -o jsonpath='{.status.vms[0].awxHostCreated}')
+RECLAIMED=$(vm_field e2e-retain web-4 awxHostCreated)
 if [[ "$RECLAIMED" != "true" ]]; then
   echo "expected the recreated binding to reclaim ownership (awxHostCreated=true), got '$RECLAIMED'"
   exit 1
@@ -681,7 +693,7 @@ spec:
 EOF
 
 wait_for "the run through the gateway API succeeds" 60 bash -c \
-  "[[ \$(kubectl get ansiblebinding e2e-gateway -n ${TEST_NS} -o jsonpath='{.status.vms[0].phase}') == Succeeded ]]"
+  "[[ \$(vm_field e2e-gateway web-5 phase) == Succeeded ]]"
 if ! grep -q "fakeawx: launched job" "$WORK_DIR/fakeaap.log"; then
   echo "expected the job to be launched against the AAP-flavored instance"
   exit 1
@@ -735,9 +747,9 @@ spec:
 EOF
 
 wait_for "the run completes against the non-filtering instance" 60 bash -c \
-  "[[ \$(kubectl get ansiblebinding e2e-nofilter -n ${TEST_NS} -o jsonpath='{.status.vms[0].phase}') == Succeeded ]]"
+  "[[ \$(vm_field e2e-nofilter web-6 phase) == Succeeded ]]"
 
-NOFILTER_HOSTNAME=$(kubectl get ansiblebinding e2e-nofilter -n "$TEST_NS" -o jsonpath='{.status.vms[0].awxHostName}')
+NOFILTER_HOSTNAME=$(vm_field e2e-nofilter web-6 awxHostName)
 if [[ "$NOFILTER_HOSTNAME" != "web-6" ]]; then
   echo "expected the binding to use host web-6, got '$NOFILTER_HOSTNAME'"
   exit 1
@@ -759,5 +771,108 @@ if host_deleted "$NOFILTER_ADDR" "$UNRELATED_ID"; then
   exit 1
 fi
 log "unrelated host survived cleanup"
+
+# --- upgrading a pre-split binding must not re-run anything ---
+# The migration hazard, tested directly: a child created for a VM that
+# already ran, without its previous appliedGeneration seeded, concludes it
+# has never run. Every VM under every binding would relaunch its playbook
+# the moment the new controller starts.
+log "checking an upgrade from a pre-split binding launches nothing"
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: vmoperator.vmware.com/v1alpha2
+kind: VirtualMachine
+metadata:
+  name: web-7
+  namespace: ${TEST_NS}
+  labels:
+    app: migrate
+spec: {}
+status:
+  powerState: PoweredOn
+  network:
+    primaryIP4: "10.0.0.77"
+EOF
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleBinding
+metadata:
+  name: e2e-migrate
+  namespace: ${TEST_NS}
+spec:
+  vmSelector:
+    app: migrate
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+EOF
+
+wait_for "migrate binding ran once" 60 bash -c \
+  "[[ \$(vm_field e2e-migrate web-7 phase) == Succeeded ]]"
+
+MIG_HOST=$(vm_field e2e-migrate web-7 awxHostID)
+MIG_JOB=$(vm_field e2e-migrate web-7 lastJobID)
+MIG_GEN=$(vm_field e2e-migrate web-7 appliedGeneration)
+MIG_HOSTNAME=$(vm_field e2e-migrate web-7 awxHostName)
+log "provisioned: host=$MIG_HOST job=$MIG_JOB generation=$MIG_GEN"
+
+# Rewind to what the world looked like before the split: the AWX host
+# exists, the binding's status.vms[] describes it, and no child object
+# exists. The controller is stopped for this so it cannot recreate the
+# child from the selector before the legacy status is in place.
+log "stopping the controller to stage pre-split state"
+kill "$CONTROLLER_PID" 2>/dev/null || true
+wait "$CONTROLLER_PID" 2>/dev/null || true
+
+# Drop the finalizer first: with no controller running, deleting the child
+# outright would wedge it in Terminating, and letting its finalizer run
+# would delete the very AWX host the migration is supposed to adopt.
+kubectl patch ansiblebindingvm e2e-migrate-web-7 -n "$TEST_NS" --type=merge \
+  -p '{"metadata":{"finalizers":null}}' >/dev/null
+kubectl delete ansiblebindingvm e2e-migrate-web-7 -n "$TEST_NS" --timeout=30s >/dev/null
+
+kubectl patch ansiblebinding e2e-migrate -n "$TEST_NS" --subresource=status --type=merge \
+  -p "{\"status\":{\"vms\":[{\"name\":\"web-7\",\"phase\":\"Succeeded\",\"awxHostID\":${MIG_HOST},\"awxHostName\":\"${MIG_HOSTNAME}\",\"awxHostCreated\":true,\"lastJobID\":${MIG_JOB},\"lastJobStatus\":\"successful\",\"appliedGeneration\":${MIG_GEN}}]}}" >/dev/null
+log "staged: status.vms[] restored, child removed, AWX host $MIG_HOST left in place"
+
+JOBS_BEFORE_MIGRATE=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
+
+log "restarting the controller - this is the upgrade"
+KUBECONFIG="$WORK_DIR/sa.kubeconfig" "$WORK_DIR/controller" --resync-period=2 >> "$WORK_DIR/controller.log" 2>&1 &
+CONTROLLER_PID=$!
+wait_for "controller restarted" 30 bash -c \
+  "[[ \$(grep -c 'controller started successfully' '$WORK_DIR/controller.log') -ge 2 ]]"
+
+wait_for "child recreated from the legacy entry" 60 bash -c \
+  "[[ -n \$(vm_field e2e-migrate web-7 lastJobID) ]]"
+
+MIG_JOB_AFTER=$(vm_field e2e-migrate web-7 lastJobID)
+MIG_HOST_AFTER=$(vm_field e2e-migrate web-7 awxHostID)
+if [[ "$MIG_JOB_AFTER" != "$MIG_JOB" ]]; then
+  echo "migration relaunched: job went $MIG_JOB -> $MIG_JOB_AFTER"
+  exit 1
+fi
+if [[ "$MIG_HOST_AFTER" != "$MIG_HOST" ]]; then
+  echo "migration did not adopt the existing AWX host: $MIG_HOST -> $MIG_HOST_AFTER"
+  exit 1
+fi
+
+# Give the resync a couple of passes to relaunch if it were going to.
+sleep 6
+JOBS_AFTER_MIGRATE=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
+if [[ "$JOBS_BEFORE_MIGRATE" != "$JOBS_AFTER_MIGRATE" ]]; then
+  echo "expected NO launches across the upgrade, but count went $JOBS_BEFORE_MIGRATE -> $JOBS_AFTER_MIGRATE"
+  exit 1
+fi
+log "upgrade adopted host $MIG_HOST and job $MIG_JOB with zero new launches"
+
+wait_for "legacy status.vms cleared once every entry has a child" 60 bash -c \
+  "[[ \$(kubectl get ansiblebinding e2e-migrate -n ${TEST_NS} -o jsonpath='{.status.vms}') == '' || \$(kubectl get ansiblebinding e2e-migrate -n ${TEST_NS} -o jsonpath='{.status.vms}') == '[]' ]]"
+log "legacy per-VM status cleared"
+
+kubectl delete ansiblebinding e2e-migrate -n "$TEST_NS" --timeout=60s >/dev/null
+log "migrated binding deleted cleanly"
 
 log "ALL CHECKS PASSED"

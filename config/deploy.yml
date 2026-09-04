@@ -91,7 +91,15 @@ rules:
       - ansiblebindings
       - awxconnections/status
       - ansiblebindings/status
+      - ansiblebindingvms/status
     verbs: ["get", "list", "watch", "update", "patch"]
+  #! An AnsibleBinding creates and deletes one AnsibleBindingVM per matched
+  #! VM, so this kind alone needs create and delete. Kept as its own rule
+  #! rather than widening the verbs above, which would also let the
+  #! controller create and delete the user's bindings and connections.
+  - apiGroups: ["field.vmware.com"]
+    resources: ["ansiblebindingvms"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -122,6 +130,12 @@ rules:
 - apiGroups: ["field.vmware.com"]
   resources: ["awxconnections", "ansiblebindings"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+#! Children are created by the controller, not by users. Readable so a
+#! tenant can see why one VM under a binding is failing, but not writable:
+#! editing one would be undone on the binding's next pass.
+- apiGroups: ["field.vmware.com"]
+  resources: ["ansiblebindingvms"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -131,5 +145,5 @@ metadata:
     rbac.authorization.k8s.io/aggregate-to-view: "true"
 rules:
 - apiGroups: ["field.vmware.com"]
-  resources: ["awxconnections", "ansiblebindings"]
+  resources: ["awxconnections", "ansiblebindings", "ansiblebindingvms"]
   verbs: ["get", "list", "watch"]

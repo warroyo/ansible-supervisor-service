@@ -94,6 +94,7 @@ func resolveVMGVR(d versionDiscoverer) (schema.GroupVersionResource, error) {
 
 var awxConnGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "awxconnections"}
 var ansBindGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "ansiblebindings"}
+var ansBindVMGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "ansiblebindingvms"}
 
 // ReconcileRequestedAtAnnotation is the annotation a user bumps to force
 // a re-run of an AnsibleBinding that's already up to date
@@ -158,6 +159,26 @@ func convertAnsibleBinding(u *unstructured.Unstructured) (AnsibleBinding, error)
 	var c AnsibleBinding
 	err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &c)
 	return c, err
+}
+
+func convertAnsibleBindingVM(u *unstructured.Unstructured) (AnsibleBindingVM, error) {
+	var c AnsibleBindingVM
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &c)
+	return c, err
+}
+
+// childName is the deterministic name of the AnsibleBindingVM a binding
+// creates for one VM. Deterministic so the parent can create it blind
+// and let AlreadyExists mean "nothing to do", rather than listing first
+// and racing with its own previous pass.
+//
+// Two bindings whose names and VM names happen to concatenate the same
+// way would collide here. The parent refuses to adopt a child whose
+// spec.bindingName is not its own rather than fighting over it, which is
+// the same refusal the AWX host path already makes on its ownership
+// marker.
+func childName(bindingName, vmName string) string {
+	return bindingName + "-" + vmName
 }
 
 // getSecretValue reads a base64-encoded key out of a Secret's data map.

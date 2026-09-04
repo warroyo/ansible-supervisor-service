@@ -185,7 +185,133 @@ type AnsibleBindingStatus struct {
 	// The decision to (re)launch is made per VM, against the equivalent
 	// fields in VMStatus, so a request made while one VM's job is still
 	// in flight is not lost.
-	ObservedGeneration int64      `json:"observedGeneration,omitempty"`
-	LastAppliedTrigger string     `json:"lastAppliedTrigger,omitempty"`
-	VMs                []VMStatus `json:"vms,omitempty"`
+	ObservedGeneration int64  `json:"observedGeneration,omitempty"`
+	LastAppliedTrigger string `json:"lastAppliedTrigger,omitempty"`
+	// Summary counts the AnsibleBindingVM children by phase. It is fixed
+	// size no matter how many VMs the selector matches, which is what
+	// keeps the binding writable at fleet scale - the per-VM detail it
+	// replaced grew without bound and stopped fitting in the object.
+	Summary *BindingSummary `json:"summary,omitempty"`
+	// VMs is the pre-split per-VM detail. Nothing writes it any more; it
+	// is read once to seed the children during migration and then
+	// cleared. Removed a release after the split.
+	VMs []VMStatus `json:"vms,omitempty"`
+}
+
+// BindingSummary is the rollup a binding reports in place of per-VM
+// entries.
+type BindingSummary struct {
+	Total     int `json:"total"`
+	Succeeded int `json:"succeeded,omitempty"`
+	Running   int `json:"running,omitempty"`
+	Pending   int `json:"pending,omitempty"`
+	Failed    int `json:"failed,omitempty"`
+	// FailedVMs names a bounded sample of the failing VMs, and
+	// FirstFailure carries one of their messages, so the common case -
+	// "why is this binding red" - is answerable without listing the
+	// children.
+	FailedVMs    []string `json:"failedVMs,omitempty"`
+	FirstFailure string   `json:"firstFailure,omitempty"`
+}
+
+// AnsibleBindingVM is one VM's unit of work under an AnsibleBinding:
+// the AWX inventory host for that VM, and the run launched against it.
+//
+// It exists so the per-VM work is one Kubernetes object rather than one
+// entry in a list on the binding. That is what keeps status O(1) per VM
+// instead of O(N) per binding, lets the workqueue reconcile VMs in
+// parallel across workers, and - once teardown hooks land - gives each
+// VM its own finalizer so a deprovision resumes across requeues instead
+// of restarting a whole binding's worth of work every pass.
+//
+// Its ownerReference points at the VirtualMachine, not the binding, so
+// the garbage collector deletes it when the VM goes away. The binding
+// deletes it when the VM merely stops matching the selector. Both routes
+// end in this object's own finalizer, which is where a teardown hook
+// will hang.
+type AnsibleBindingVM struct {
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              *AnsibleBindingVMSpec   `json:"spec,omitempty"`
+	Status            *AnsibleBindingVMStatus `json:"status,omitempty"`
+}
+
+// BindingLabel is set on every child to the name of the AnsibleBinding
+// that created it, so a parent can list its own children with a label
+// selector rather than reading every child in the namespace.
+const BindingLabel = "field.vmware.com/binding"
+
+// AdoptStatusAnnotation carries a child's seed status at creation time,
+// as JSON, during migration from a pre-split AnsibleBinding.
+//
+// Status is a subresource, so a child cannot be created with one: it
+// would be created empty, and its first reconcile would see a VM that
+// has never run and launch the playbook again. Every VM under every
+// binding would re-run on upgrade. Seeding through an annotation the
+// child reads on its first pass closes that window entirely, because the
+// child has its prior appliedGeneration in hand before it decides
+// whether to launch anything. The child clears the annotation once the
+// status is persisted.
+const AdoptStatusAnnotation = "ansible.field.vmware.com/adopt-status"
+
+type AnsibleBindingVMSpec struct {
+	// VMName is the VirtualMachine in this namespace this object tracks.
+	VMName string `json:"vmName"`
+	// BindingName is the AnsibleBinding that owns this child. The AWX
+	// host ownership marker is keyed to it rather than to this object,
+	// so hosts provisioned before the split are adopted unchanged.
+	BindingName string `json:"bindingName"`
+
+	// The rest is copied down from the binding at create time rather
+	// than read back through it. A child has to be able to finalize
+	// after its parent is already gone - deleting a binding deletes its
+	// children, and the parent may well win that race - so it cannot
+	// hold a pointer to a spec that may not be there.
+	AWXConnectionRef string            `json:"awxConnectionRef"`
+	Template         TemplateRef       `json:"template"`
+	HostName         string            `json:"hostName,omitempty"`
+	HostVariables    map[string]string `json:"hostVariables,omitempty"`
+	UseDefaultLimit  bool              `json:"useDefaultLimit,omitempty"`
+	ExtraVars        map[string]string `json:"extraVars,omitempty"`
+	CleanupPolicy    string            `json:"cleanupPolicy,omitempty"`
+
+	// BindingGeneration and BindingTrigger are the binding's generation
+	// and reconcile-requested-at value as of the last time the parent
+	// wrote this spec. The child compares them against the equivalent
+	// fields in its own status to decide whether to (re)launch, which is
+	// how a spec change or a re-run request reaches a VM now that the
+	// child cannot see the binding's own metadata.
+	BindingGeneration int64  `json:"bindingGeneration,omitempty"`
+	BindingTrigger    string `json:"bindingTrigger,omitempty"`
+}
+
+// AnsibleBindingVMStatus is what VMStatus used to be, plus the generic
+// state/message/ready every CRD here carries.
+//
+// There is no pendingCleanup: the object itself is the record that a
+// cleanup is outstanding, since it sits in Terminating until its
+// finalizer clears.
+type AnsibleBindingVMStatus struct {
+	State       string `json:"state,omitempty"`
+	Message     string `json:"message,omitempty"`
+	Ready       bool   `json:"ready,omitempty"`
+	LastUpdated string `json:"lastUpdated,omitempty"`
+
+	ObservedIP string `json:"observedIP,omitempty"`
+	Phase      string `json:"phase,omitempty"`
+
+	AWXHostID      int64  `json:"awxHostID,omitempty"`
+	AWXInventoryID int64  `json:"awxInventoryID,omitempty"`
+	AWXHostName    string `json:"awxHostName,omitempty"`
+	AWXHostCreated bool   `json:"awxHostCreated,omitempty"`
+
+	LastJobID     int64  `json:"lastJobID,omitempty"`
+	LastJobURL    string `json:"lastJobURL,omitempty"`
+	LastJobStatus string `json:"lastJobStatus,omitempty"`
+
+	// AppliedGeneration and AppliedTrigger record the spec.bindingGeneration
+	// and spec.bindingTrigger this VM last launched a run for, so a
+	// request made while a job was in flight is not swallowed.
+	AppliedGeneration int64               `json:"appliedGeneration,omitempty"`
+	AppliedTrigger    string              `json:"appliedTrigger,omitempty"`
+	History           []VMRunHistoryEntry `json:"history,omitempty"`
 }

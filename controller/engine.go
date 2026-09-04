@@ -27,7 +27,11 @@ import (
 // merge via server-side apply instead of one clobbering the other.
 const StatusFieldManager = "status-controller"
 
-const numWorkers = 2
+// numWorkers is the per-controller worker pool. Raised from 2 with the
+// per-VM split: the work that used to be one long reconcile over N VMs
+// is now N independent items, and the pool is what turns that into
+// parallelism rather than a longer queue.
+const numWorkers = 8
 
 // StatusUpdater computes the generic status fields for a resource, given
 // whether provisioning just succeeded and any error it returned.

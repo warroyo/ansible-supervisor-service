@@ -108,10 +108,13 @@ outputs:
     type: string
     title: Ansible state
     value: ${resource.Webserver_Ansible.object.status.state}
-  ansibleJobUrl:
+  ansibleDetail:
     type: string
-    title: AWX job
-    value: ${resource.Webserver_Ansible.object.status.vms[0].lastJobURL}
+    title: Ansible detail
+    # Per-VM job URLs live on the AnsibleBindingVM children, which a
+    # blueprint cannot reference. status.message carries the rollup,
+    # including the reason when a VM has failed.
+    value: ${resource.Webserver_Ansible.object.status.message}
 
 resources:
 
@@ -283,7 +286,7 @@ Give it a `title` that says so on the request form. Consumers read "Configuratio
 
 ## Multiple VMs
 
-One binding fans out to every VM its selector matches, so a blueprint that provisions several VMs of the same role needs exactly one `AnsibleBinding` for all of them. Label each VM with the same `app` and `deployment` pair and leave the binding as-is: each VM gets its own AWX inventory host, its own run, and its own entry in `status.vms`, and the binding is `Ready` only once all of them have succeeded.
+One binding fans out to every VM its selector matches, so a blueprint that provisions several VMs of the same role needs exactly one `AnsibleBinding` for all of them. Label each VM with the same `app` and `deployment` pair and leave the binding as-is: each VM gets its own AWX inventory host, its own run, and its own `AnsibleBindingVM`, and the binding is `Ready` only once all of them have succeeded.
 
 Different roles get different bindings pointed at different templates - `app: webserver` at one, `app: database` at another - each with the same per-deployment label, and each with its own `wait` if the deployment should block on it.
 
@@ -313,8 +316,8 @@ Everything here is visible with `kubectl` against the project's Supervisor names
 ```bash
 kubectl get ansiblebinding -n <project-supervisor-namespace>
 kubectl get ansiblebinding <name> -n <project-supervisor-namespace> -o jsonpath='{.status.message}'
-kubectl get ansiblebinding <name> -n <project-supervisor-namespace> \
-  -o jsonpath='{range .status.vms[*]}{.name}{"\t"}{.phase}{"\t"}{.lastJobURL}{"\n"}{end}'
+kubectl get ansiblebindingvm -n <project-supervisor-namespace> -l field.vmware.com/binding=<name> \
+  -o jsonpath='{range .items[*]}{.spec.vmName}{"\t"}{.status.phase}{"\t"}{.status.lastJobURL}{"\n"}{end}'
 ```
 
 Full CRD reference in the [README](README.md), edge cases in the [FAQ](FAQ.md).

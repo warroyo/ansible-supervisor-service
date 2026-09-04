@@ -116,26 +116,42 @@ func main() {
 		Queue:            workqueue.NewRateLimitingQueue(newRateLimiter()),
 	}
 
-	// Both CRDs are namespace-scoped and tenant-owned, but the controller
-	// itself watches cluster-wide (no namespace allowlist to maintain) -
-	// same for the VirtualMachine lookups applyAnsibleBinding does
+	// One AnsibleBindingVM per matched VM, created by the binding above.
+	// Its finalizer cleans up that VM's AWX inventory host - the work
+	// that used to happen inside the binding's own finalizer for every
+	// VM at once, and so could not fit in one reconcile at scale.
+	ansBindVMController := &Controller{
+		client:           dynClient,
+		gvr:              ansBindVMGVR,
+		finalizerName:    "field.vmware.com/ansible-binding-vm-cleanup",
+		provisionFunc:    applyAnsibleBindingVM,
+		cleanupFunc:      cleanupAnsibleBindingVM,
+		updateStatusFunc: updateAnsibleBindingVMStatus,
+		Queue:            workqueue.NewRateLimitingQueue(newRateLimiter()),
+	}
+
+	// Every CRD here is namespace-scoped and tenant-owned, but the
+	// controller itself watches cluster-wide (no namespace allowlist to
+	// maintain) - same for the VirtualMachine lookups the children do
 	// per-namespace on demand.
 	awxConnInformer := setupInformer(ctx, dynClient, awxConnController.gvr, awxConnController, resyncPeriod)
 	ansBindInformer := setupInformer(ctx, dynClient, ansBindController.gvr, ansBindController, resyncPeriod)
+	ansBindVMInformer := setupInformer(ctx, dynClient, ansBindVMController.gvr, ansBindVMController, resyncPeriod)
 
 	go awxConnInformer.Run(ctx.Done())
 	go ansBindInformer.Run(ctx.Done())
+	go ansBindVMInformer.Run(ctx.Done())
 
-	if !cache.WaitForCacheSync(ctx.Done(), awxConnInformer.HasSynced, ansBindInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), awxConnInformer.HasSynced, ansBindInformer.HasSynced, ansBindVMInformer.HasSynced) {
 		fmt.Fprintln(os.Stderr, "error waiting for cache sync")
 		os.Exit(1)
 	}
 	fmt.Println("ansible supervisor controller started successfully")
 
 	// Each Run returns once its queue has drained, so the process stays
-	// alive until both controllers have finished the work in hand.
+	// alive until every controller has finished the work in hand.
 	var wg sync.WaitGroup
-	for _, c := range []*Controller{awxConnController, ansBindController} {
+	for _, c := range []*Controller{awxConnController, ansBindController, ansBindVMController} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

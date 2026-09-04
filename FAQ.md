@@ -29,7 +29,7 @@ Two differences are worth internalizing rather than skimming:
 
 **A selector is not a machine.** `Cloud.Ansible.Tower` could only ever touch the machine it was attached to. `vmSelector` reaches every matching VM in the namespace, including VMs from other deployments - which is what makes "configure this whole tier" a single CR, and what makes a careless selector dangerous. Label per deployment and match on that label.
 
-**Configuration is a persistent binding, not a provisioning step.** The CR stays around after the run, so re-running a playbook is a day-2 update to an object rather than a redeploy, and each VM keeps its own phase, job URL and bounded run history in `status.vms`.
+**Configuration is a persistent binding, not a provisioning step.** The CR stays around after the run, so re-running a playbook is a day-2 update to an object rather than a redeploy, and each VM keeps its own phase, job URL and bounded run history on its own `AnsibleBindingVM`.
 
 Driving all of this from a VCF Automation 9.x blueprint - where the binding becomes a `CCI.Supervisor.Resource` and deployment success waits on the playbook - is covered in [VCFA blueprints](VCFA-BLUEPRINTS.md).
 
@@ -110,4 +110,4 @@ Workflow templates commonly have no inventory of their own, since each node can 
 
 The run is tracked independently of the VM, so nothing is lost. A job already running is still polled to completion, and the VM keeps its last run's phase rather than reverting to `Pending`.
 
-Re-run requests made during downtime aren't swallowed either. Whether a run is needed is decided per VM (`status.vms[].appliedGeneration` / `appliedTrigger`), so a spec change or annotation bump made while one VM's job is still running - or while a VM is powered off - is honored as soon as that VM can act on it.
+Re-run requests made during downtime aren't swallowed either. Whether a run is needed is decided per VM (each `AnsibleBindingVM`'s `status.appliedGeneration` / `appliedTrigger` against the `bindingGeneration` / `bindingTrigger` its binding copied down), so a spec change or annotation bump made while one VM's job is still running - or while a VM is powered off - is honored as soon as that VM can act on it.

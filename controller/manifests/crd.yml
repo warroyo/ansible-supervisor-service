@@ -175,9 +175,31 @@ spec:
                 lastAppliedTrigger:
                   type: string
                   description: informational - the reconcile-requested-at annotation value the controller most recently saw. see vms[].appliedTrigger for what each VM actually ran
+                summary:
+                  type: object
+                  description: rollup of the AnsibleBindingVM children by phase. fixed size however many VMs the selector matches, which is what replaced the unbounded per-VM list below
+                  properties:
+                    total:
+                      type: integer
+                    succeeded:
+                      type: integer
+                    running:
+                      type: integer
+                    pending:
+                      type: integer
+                    failed:
+                      type: integer
+                    failedVMs:
+                      type: array
+                      description: a bounded sample of the failing VMs, so "why is this binding red" is answerable without listing the children
+                      items:
+                        type: string
+                    firstFailure:
+                      type: string
+                      description: the message from one of the failing children
                 vms:
                   type: array
-                  description: per-VM run status for every VM currently matched by vmSelector
+                  description: deprecated - pre-split per-VM detail. nothing writes it any more; it is read once to seed the AnsibleBindingVM children and then cleared. see the ansiblebindingvms resource
                   items:
                     type: object
                     properties:
@@ -243,6 +265,12 @@ spec:
         - name: State
           type: string
           jsonPath: .status.state
+        - name: VMs
+          type: integer
+          jsonPath: .status.summary.total
+        - name: Failed
+          type: integer
+          jsonPath: .status.summary.failed
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
@@ -253,3 +281,163 @@ spec:
     kind: AnsibleBinding
     shortNames:
       - ansbind
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ansiblebindingvms.field.vmware.com
+spec:
+  group: field.vmware.com
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: one VM's inventory host and run under an AnsibleBinding. created and deleted by the binding controller - not something to write by hand
+          properties:
+            spec:
+              type: object
+              properties:
+                vmName:
+                  type: string
+                  description: the VirtualMachine in this namespace this object tracks
+                bindingName:
+                  type: string
+                  description: the AnsibleBinding that owns this child. the AWX host ownership marker is keyed to it, so hosts provisioned before the per-VM split are adopted unchanged
+                awxConnectionRef:
+                  type: string
+                  description: name of an AWXConnection in this namespace to launch through
+                template:
+                  type: object
+                  description: the AWX job or workflow template to launch against this VM
+                  properties:
+                    name:
+                      type: string
+                    type:
+                      type: string
+                      enum:
+                        - JobTemplate
+                        - WorkflowTemplate
+                  required:
+                    - name
+                    - type
+                hostName:
+                  type: string
+                  description: override the Ansible inventory host name (defaults to the VM's resource name)
+                hostVariables:
+                  type: object
+                  description: extra host variables merged into the upserted inventory host
+                  additionalProperties:
+                    type: string
+                useDefaultLimit:
+                  type: boolean
+                  description: if true, launch without a --limit so the template's own configured limit/inventory applies
+                  default: false
+                extraVars:
+                  type: object
+                  description: extra variables passed to the template launch
+                  additionalProperties:
+                    type: string
+                cleanupPolicy:
+                  type: string
+                  description: whether the controller deletes the AWX inventory host it created when this object is deleted
+                  enum:
+                    - Delete
+                    - Retain
+                  default: Delete
+                bindingGeneration:
+                  type: integer
+                  description: the binding's generation as of the last time the parent wrote this spec. compared against status.appliedGeneration to decide whether to relaunch
+                bindingTrigger:
+                  type: string
+                  description: the binding's reconcile-requested-at value as of the last time the parent wrote this spec. compared against status.appliedTrigger to decide whether to relaunch
+              required:
+                - vmName
+                - bindingName
+                - awxConnectionRef
+                - template
+            status:
+              type: object
+              description: current status of this VM's inventory host and run
+              properties:
+                state:
+                  type: string
+                message:
+                  type: string
+                ready:
+                  type: boolean
+                lastUpdated:
+                  type: string
+                  format: date-time
+                observedIP:
+                  type: string
+                phase:
+                  type: string
+                  description: Pending, Running, Succeeded, or Failed
+                awxHostID:
+                  type: integer
+                  description: AWX inventory host ID for this VM, used to target launches and to drive cleanup
+                awxInventoryID:
+                  type: integer
+                  description: AWX inventory the host above lives in, tracked so repointing the template at another inventory moves the host instead of leaving it behind
+                awxHostName:
+                  type: string
+                  description: inventory host name last used for this VM, tracked so a rename retires the old host instead of orphaning it
+                awxHostCreated:
+                  type: boolean
+                  description: whether this controller owns the AWX host. ownership is stamped into the host description in AWX so it survives this resource being deleted and recreated. hosts that already existed unmarked are adopted and never deleted
+                appliedGeneration:
+                  type: integer
+                  description: spec.bindingGeneration this VM last launched a run for
+                appliedTrigger:
+                  type: string
+                  description: spec.bindingTrigger this VM last launched a run for
+                lastJobID:
+                  type: integer
+                lastJobURL:
+                  type: string
+                lastJobStatus:
+                  type: string
+                history:
+                  type: array
+                  description: bounded log of recent runs for this VM, most recent first
+                  items:
+                    type: object
+                    properties:
+                      jobID:
+                        type: integer
+                      status:
+                        type: string
+                      startedAt:
+                        type: string
+                        format: date-time
+                      finishedAt:
+                        type: string
+                        format: date-time
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: VM
+          type: string
+          jsonPath: .spec.vmName
+        - name: Binding
+          type: string
+          jsonPath: .spec.bindingName
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Job
+          type: integer
+          jsonPath: .status.lastJobID
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+  scope: Namespaced
+  names:
+    plural: ansiblebindingvms
+    singular: ansiblebindingvm
+    kind: AnsibleBindingVM
+    shortNames:
+      - ansbindvm
