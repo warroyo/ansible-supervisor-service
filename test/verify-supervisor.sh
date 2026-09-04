@@ -67,6 +67,14 @@ CREATED=0
 log()  { echo "[verify] $*"; }
 fail() { echo "[verify] FAILED: $*" >&2; exit 1; }
 
+# The per-VM detail lives on one AnsibleBindingVM per matched VM. Their
+# names carry a hash of the binding/VM pair, so they are looked up by the
+# label the binding stamps on them rather than reconstructed.
+children() { kubectl get ansiblebindingvm -n "$SUPERVISOR_NS" -l "field.vmware.com/binding=${BINDING}" "$@"; }
+child_field() {  # child_field <vm name> <status field>
+  children -o jsonpath="{.items[?(@.spec.vmName=='$1')].status.$2}"
+}
+
 cleanup() {
   status=$?
   if [[ $status -ne 0 && -n "$CTRL_NS" ]]; then
@@ -247,7 +255,13 @@ RESYNC="$(kubectl get deployment ansible-supervisor-controller -n "$CTRL_NS" \
   -o jsonpath='{.spec.template.spec.containers[0].args}' \
   | grep -o 'resync-period=[0-9]*' | cut -d= -f2 || true)"
 RESYNC="${RESYNC:-60}"
-log "resync period is ${RESYNC}s"
+# The host check period likewise: it decides whether a child is expected
+# to touch AWX during the idle window at all.
+HOST_CHECK_PERIOD="$(kubectl get deployment ansible-supervisor-controller -n "$CTRL_NS" \
+  -o jsonpath='{.spec.template.spec.containers[0].args}' \
+  | grep -o 'host-check-period=[0-9]*' | cut -d= -f2 || true)"
+HOST_CHECK_PERIOD="${HOST_CHECK_PERIOD:-600}"
+log "resync period is ${RESYNC}s, host check period is ${HOST_CHECK_PERIOD}s"
 
 # --- phase 2: a real run against a real AWX and a real VM -------------
 
@@ -295,16 +309,21 @@ EOF
 # seconds. A failure here is as likely to be the playbook or the Machine
 # credential as the controller - the log dump on exit says which.
 wait_for "every matched VM reaches Succeeded" 900 bash -c \
-  "kubectl get ansiblebinding $BINDING -n $SUPERVISOR_NS -o json \
-   | python3 -c \"import json,sys; v=json.load(sys.stdin).get('status',{}).get('vms',[]); sys.exit(0 if v and all(x.get('phase')=='Succeeded' for x in v) else 1)\""
+  "kubectl get ansiblebindingvm -n $SUPERVISOR_NS -l field.vmware.com/binding=$BINDING -o json \
+   | python3 -c \"import json,sys; v=json.load(sys.stdin).get('items',[]); sys.exit(0 if v and all(x.get('status',{}).get('phase')=='Succeeded' for x in v) else 1)\""
 
-TRACKED="$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o json | jqp "len(d['status']['vms'])")"
+TRACKED="$(children -o json | jqp "len(d['items'])")"
 [[ "$TRACKED" == "$VM_COUNT" ]] \
-  || fail "binding tracks $TRACKED VM(s) but $VM_COUNT match the selector - fan-out is wrong"
+  || fail "binding has $TRACKED child(ren) but $VM_COUNT VM(s) match the selector - fan-out is wrong"
 log "all $TRACKED matched VM(s) succeeded"
 
-HOST_ID="$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" \
-  -o jsonpath="{.status.vms[?(@.name=='${VM_NAME}')].awxHostID}")"
+# The rollup has to agree with the children it is a rollup of.
+SUMMARY="$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o jsonpath='{.status.summary.total}/{.status.summary.succeeded}')"
+[[ "$SUMMARY" == "${VM_COUNT}/${VM_COUNT}" ]] \
+  || fail "expected the rollup to read ${VM_COUNT}/${VM_COUNT} (total/succeeded), got $SUMMARY"
+log "status.summary agrees with the children: $SUMMARY"
+
+HOST_ID="$(child_field "$VM_NAME" awxHostID)"
 [[ -n "$HOST_ID" ]] || fail "no awxHostID recorded for $VM_NAME"
 
 # Read the host back out of the real AWX rather than trusting status: the
@@ -332,6 +351,7 @@ log "AWX host $HOST_ID exists with ansible_host=$HOST_IP, matching the live VM"
 
 log "phase 3: checking an idle binding goes quiet (${RESYNC}s resync)"
 RV_BEFORE="$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o jsonpath='{.metadata.resourceVersion}')"
+CHECKS_BEFORE="$(child_field "$VM_NAME" lastHostCheck)"
 HOST_MODIFIED_BEFORE="$(echo "$HOST_JSON" | jqp "d.get('modified','')")"
 
 IDLE=$(( RESYNC * 3 + 10 ))
@@ -350,11 +370,22 @@ HOST_MODIFIED_AFTER="$(awx "/hosts/${HOST_ID}/" | jqp "d.get('modified','')")"
   || fail "AWX host $HOST_ID was rewritten while nothing changed: $HOST_MODIFIED_BEFORE -> $HOST_MODIFIED_AFTER"
 log "AWX host untouched across the same window: steady state writes nothing to AWX either"
 
+# A child is not quite as quiet as its binding: it stamps
+# status.lastHostCheck each time it reconciles its inventory host against
+# AWX. What it must not do is stamp it every resync - that would mean the
+# host check is still happening on every pass, which is the traffic this
+# release exists to remove.
+CHILD_CHECKS="$(children -o jsonpath="{.items[*].status.lastHostCheck}" | tr ' ' '\n' | sort -u | wc -l)"
+CHECKS_AFTER="$(child_field "$VM_NAME" lastHostCheck)"
+if [[ "$HOST_CHECK_PERIOD" -gt "$(( RESYNC * 2 ))" && "$CHECKS_BEFORE" != "$CHECKS_AFTER" ]]; then
+  fail "the host check ran during the idle window: lastHostCheck $CHECKS_BEFORE -> $CHECKS_AFTER, with a ${HOST_CHECK_PERIOD}s period"
+fi
+log "child host check stayed on its ${HOST_CHECK_PERIOD}s period across the idle window (${CHILD_CHECKS} distinct timestamp(s))"
+
 # --- phase 4: teardown removes what it created ------------------------
 
 log "phase 4: checking cleanup"
-HOST_CREATED="$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" \
-  -o jsonpath="{.status.vms[?(@.name=='${VM_NAME}')].awxHostCreated}")"
+HOST_CREATED="$(child_field "$VM_NAME" awxHostCreated)"
 
 kubectl delete ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" --timeout=180s >/dev/null \
   || fail "the binding did not delete cleanly - the finalizer never released"
