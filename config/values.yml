@@ -2,6 +2,11 @@
 ---
 
 resync_period: "60"
+#! maximum time one reconcile of one resource may take, in seconds. the AWX
+#! client's own timeout is per request, so without a bound a binding matching
+#! many VMs can hold one of the controller's workers for a long time against a
+#! slow AWX, delaying every other resource.
+reconcile_timeout: "300"
 namespace: ""
 #! identity stamped on AWX inventory hosts this supervisor owns, so one AWX
 #! instance can be shared by several supervisors without them fighting over

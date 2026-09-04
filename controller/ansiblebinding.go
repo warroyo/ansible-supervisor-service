@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -116,6 +117,23 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 			ac.Spec.Template.Name)
 	}
 
+	ownerMarker := hostOwnerMarker(ac.Namespace, ac.Name)
+
+	// One list of the hosts this binding already owns, rather than a
+	// lookup per VM inside the loop below. A host missing from it - never
+	// provisioned, deleted in the AWX UI, or created by hand and waiting
+	// to be adopted - still takes the per-host path, so adoption and the
+	// "owned by another binding" check are unchanged. Steady state, where
+	// every matched VM's host is already ours, costs one AWX request for
+	// the whole binding instead of one per VM.
+	ownedHosts := map[string]hostResult{}
+	if tmpl.Inventory != nil {
+		ownedHosts, err = awxClient.ListOwnedHosts(ctx, *tmpl.Inventory, ownerMarker)
+		if err != nil {
+			return fmt.Errorf("listing the AWX hosts this binding owns: %w", err)
+		}
+	}
+
 	priorByName := map[string]VMStatus{}
 	if ac.Status != nil {
 		for _, v := range ac.Status.VMs {
@@ -139,6 +157,20 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 		}
 	}
 
+	// record files one VM's status, stamping LastUpdated only when
+	// something about that VM actually changed. Re-stamping it every pass
+	// would make status differ on every reconcile purely because time
+	// passed, so the apply below could never be skipped and every binding
+	// would write to etcd every resync whether or not anything happened.
+	record := func(vs, prior VMStatus) {
+		if vmStatusEqual(vs, prior) {
+			vs.LastUpdated = prior.LastUpdated
+		} else {
+			vs.LastUpdated = nowRFC3339()
+		}
+		newVMStatuses = append(newVMStatuses, vs)
+	}
+
 	for i := range vms {
 		vm := vms[i]
 		name := vm.GetName()
@@ -148,7 +180,6 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 		vs := prior
 		vs.Name = name
 		vs.PendingCleanup = false
-		vs.LastUpdated = nowRFC3339()
 		vs.History = append([]VMRunHistoryEntry(nil), prior.History...)
 
 		// Poll any in-flight job first: its outcome doesn't depend on
@@ -159,7 +190,7 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 			if sErr != nil {
 				vs.Phase = PhaseRunning
 				recordErr(fmt.Errorf("polling job %d for VM %q: %w", prior.LastJobID, name, sErr))
-				newVMStatuses = append(newVMStatuses, vs)
+				record(vs, prior)
 				continue
 			}
 			vs.LastJobStatus = status
@@ -169,7 +200,7 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 				// appliedGeneration/appliedTrigger alone so a re-run
 				// requested mid-flight is honored once it finishes.
 				vs.History = upsertHistory(vs.History, VMRunHistoryEntry{JobID: prior.LastJobID, Status: status})
-				newVMStatuses = append(newVMStatuses, vs)
+				record(vs, prior)
 				continue
 			}
 			vs.History = upsertHistory(vs.History, VMRunHistoryEntry{
@@ -185,7 +216,7 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 			if vs.LastJobID == 0 {
 				vs.Phase = PhasePending
 			}
-			newVMStatuses = append(newVMStatuses, vs)
+			record(vs, prior)
 			continue
 		}
 
@@ -210,7 +241,7 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 						// Leave the recorded host in place and retry,
 						// rather than losing track of it.
 						recordErr(fmt.Errorf("retiring AWX host %q for VM %q: %w", vs.AWXHostName, name, dErr))
-						newVMStatuses = append(newVMStatuses, vs)
+						record(vs, prior)
 						continue
 					}
 				}
@@ -230,13 +261,21 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 			// status cannot see it: the run would then fail forever with
 			// "--limit does not match any hosts", or quietly run against
 			// hand-edited variables, and nothing would ever repair it.
-			// UpsertHost PATCHes only when the variables actually differ,
-			// so a steady state costs one GET per VM per resync.
-			hostID, owned, hErr := awxClient.UpsertHost(ctx, *tmpl.Inventory, hostName, hostOwnerMarker(ac.Namespace, ac.Name), hostVars)
+			// ownedHosts is that read of AWX, taken once for the whole
+			// binding; a host absent from it falls back to its own lookup.
+			// Either way the PATCH only goes out when the variables differ.
+			var hostID int
+			var owned bool
+			var hErr error
+			if known, ok := ownedHosts[hostName]; ok {
+				hostID, owned, hErr = awxClient.UpsertKnownHost(ctx, *tmpl.Inventory, hostName, ownerMarker, hostVars, known)
+			} else {
+				hostID, owned, hErr = awxClient.UpsertHost(ctx, *tmpl.Inventory, hostName, ownerMarker, hostVars)
+			}
 			if hErr != nil {
 				vs.Phase = PhaseFailed
 				recordErr(fmt.Errorf("upserting AWX host for VM %q: %w", name, hErr))
-				newVMStatuses = append(newVMStatuses, vs)
+				record(vs, prior)
 				continue
 			}
 			vs.AWXHostID = int64(hostID)
@@ -252,7 +291,7 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 			vs.AppliedGeneration != ac.Generation ||
 			vs.AppliedTrigger != triggerValue
 		if !needsRun {
-			newVMStatuses = append(newVMStatuses, vs)
+			record(vs, prior)
 			continue
 		}
 
@@ -284,7 +323,7 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 			}
 			recordErr(fmt.Errorf("launching template for VM %q: %w", name, lErr))
 		}
-		newVMStatuses = append(newVMStatuses, vs)
+		record(vs, prior)
 	}
 
 	// VMs that were previously tracked but no longer match the selector
@@ -305,19 +344,45 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 			// it from status would lose the ID and the retry with it.
 			stale := prior
 			stale.PendingCleanup = true
-			stale.LastUpdated = nowRFC3339()
-			newVMStatuses = append(newVMStatuses, stale)
+			record(stale, prior)
 		}
 	}
 
 	sort.Slice(newVMStatuses, func(i, j int) bool { return newVMStatuses[i].Name < newVMStatuses[j].Name })
 
-	if detailErr := writeAnsibleBindingDetails(ctx, client, u, newVMStatuses, ac.Generation, triggerValue); detailErr != nil {
-		log.Printf("[AnsibleBinding/%s/%s] failed to persist per-VM status: %v", ac.Namespace, ac.Name, detailErr)
-		recordErr(detailErr)
+	// ac was read fresh at the top of this reconcile, so what it carries is
+	// what the API server holds: if this pass computed the same details,
+	// applying them would be a round trip that changes nothing.
+	if !ansibleBindingDetailsCurrent(ac.Status, newVMStatuses, ac.Generation, triggerValue) {
+		if detailErr := writeAnsibleBindingDetails(ctx, client, u, newVMStatuses, ac.Generation, triggerValue); detailErr != nil {
+			log.Printf("[AnsibleBinding/%s/%s] failed to persist per-VM status: %v", ac.Namespace, ac.Name, detailErr)
+			recordErr(detailErr)
+		}
 	}
 
 	return firstErr
+}
+
+// vmStatusEqual compares two per-VM entries ignoring LastUpdated, which
+// records when the rest of the entry last changed and so cannot take part
+// in deciding whether it changed.
+func vmStatusEqual(a, b VMStatus) bool {
+	a.LastUpdated, b.LastUpdated = "", ""
+	return reflect.DeepEqual(a, b)
+}
+
+// ansibleBindingDetailsCurrent reports whether the details half of status
+// already says exactly what this pass computed. Both lists are sorted by
+// VM name, and record() has already held LastUpdated steady for entries
+// that did not change, so an unchanged binding compares equal.
+func ansibleBindingDetailsCurrent(prior *AnsibleBindingStatus, vms []VMStatus, observedGeneration int64, lastTrigger string) bool {
+	if prior == nil {
+		return false
+	}
+	if prior.ObservedGeneration != observedGeneration || prior.LastAppliedTrigger != lastTrigger {
+		return false
+	}
+	return reflect.DeepEqual(prior.VMs, vms)
 }
 
 func writeAnsibleBindingDetails(ctx context.Context, client *dynamic.DynamicClient, obj *unstructured.Unstructured, vms []VMStatus, observedGeneration int64, lastTrigger string) error {

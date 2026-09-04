@@ -69,6 +69,7 @@ imgpkg copy -b <bundle-ref-from-ansible-supervisor.yml> --to-repo your-repo.exam
 | Field           | Default | Description |
 |-----------------|---------|-------------|
 | `resync_period` | `"60"`  | Periodic reconcile interval in seconds |
+| `reconcile_timeout` | `"300"` | Maximum seconds one reconcile of one resource may take. Bounds how long a binding matching many VMs can hold a worker against a slow AWX |
 | `namespace`     | `""`    | Namespace to deploy into (filled by the supervisor, do not edit) |
 | `supervisor_id` | `""`    | Identity stamped on AWX hosts this supervisor owns. Empty derives it from the `kube-system` namespace UID - set something readable (e.g. `sup-lab-01`) if you share one AWX between supervisors and want its inventory legible |
 

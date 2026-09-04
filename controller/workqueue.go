@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,6 +17,15 @@ import (
 // up again, so a permanently broken resource stops spinning without
 // being forgotten for good.
 const maxReconcileRetries = 10
+
+// reconcileTimeout bounds one pass over one resource. The AWX client's
+// timeout is per request, so without this a binding matching many VMs
+// can hold a worker for that timeout multiplied by the number of VMs -
+// and there are only numWorkers of them, shared by every resource in the
+// cluster. Cancelling mid-pass is safe: the reconcile returns an error
+// and is retried, and finalization is never abandoned either way.
+// Set at startup from --reconcile-timeout.
+var reconcileTimeout = 5 * time.Minute
 
 func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	// Get() blocks until an item is available.
@@ -62,6 +72,9 @@ func (c *Controller) reconcileByKey(ctx context.Context, key string) error {
 	if err != nil {
 		return fmt.Errorf("invalid resource key: %s", key)
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancel()
 
 	u, err := c.client.Resource(c.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {

@@ -27,9 +27,11 @@ func main() {
 	defer stop()
 
 	resync := flag.Int("resync-period", 60, "reconcile resync interval, in seconds")
+	reconcileTimeoutFlag := flag.Int("reconcile-timeout", 300, "maximum time one reconcile of one resource may take, in seconds, so a slow AWX cannot pin a worker indefinitely")
 	supervisorIDFlag := flag.String("supervisor-id", "", "identity stamped on AWX inventory hosts this supervisor owns, so one AWX instance can be shared by several supervisors (default: the kube-system namespace UID)")
 	flag.Parse()
 	resyncPeriod := time.Duration(*resync) * time.Second
+	reconcileTimeout = time.Duration(*reconcileTimeoutFlag) * time.Second
 
 	// A kubeconfig is for local development; running as a supervisor
 	// service there is none and the service account is used instead.

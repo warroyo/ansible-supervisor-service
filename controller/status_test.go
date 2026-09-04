@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -116,6 +117,84 @@ func TestUpdateAnsibleBindingStatusReconcileError(t *testing.T) {
 	}
 	if !strings.Contains(got["message"].(string), "AWX unreachable") {
 		t.Errorf("message %q does not carry the underlying error", got["message"])
+	}
+}
+
+// The whole point of holding LastUpdated steady is that an idle binding
+// produces byte-identical status, so the apply can be skipped and the
+// resource stops writing to etcd once per resync forever.
+func TestAnsibleBindingDetailsCurrent(t *testing.T) {
+	vms := []VMStatus{
+		{Name: "web-1", Phase: PhaseSucceeded, LastJobID: 7, LastUpdated: "2026-09-04T10:00:00Z"},
+		{Name: "web-2", Phase: PhaseSucceeded, LastJobID: 8, LastUpdated: "2026-09-04T10:00:00Z"},
+	}
+	prior := &AnsibleBindingStatus{ObservedGeneration: 3, LastAppliedTrigger: "t1", VMs: vms}
+
+	if !ansibleBindingDetailsCurrent(prior, vms, 3, "t1") {
+		t.Error("identical details should be reported as current")
+	}
+	if ansibleBindingDetailsCurrent(nil, vms, 3, "t1") {
+		t.Error("a binding with no status yet is never current")
+	}
+	if ansibleBindingDetailsCurrent(prior, vms, 4, "t1") {
+		t.Error("a new generation is not current")
+	}
+	if ansibleBindingDetailsCurrent(prior, vms, 3, "t2") {
+		t.Error("a new re-run trigger is not current")
+	}
+
+	changed := []VMStatus{vms[0], {Name: "web-2", Phase: PhaseFailed, LastJobID: 8, LastUpdated: "2026-09-04T10:00:00Z"}}
+	if ansibleBindingDetailsCurrent(prior, changed, 3, "t1") {
+		t.Error("a VM whose phase changed is not current")
+	}
+
+	dropped := []VMStatus{vms[0]}
+	if ansibleBindingDetailsCurrent(prior, dropped, 3, "t1") {
+		t.Error("a VM that left the selector is not current")
+	}
+}
+
+func TestVMStatusEqualIgnoresLastUpdated(t *testing.T) {
+	a := VMStatus{Name: "web-1", Phase: PhaseRunning, LastUpdated: "2026-09-04T10:00:00Z"}
+	b := VMStatus{Name: "web-1", Phase: PhaseRunning, LastUpdated: "2026-09-04T11:00:00Z"}
+	if !vmStatusEqual(a, b) {
+		t.Error("entries differing only in LastUpdated are equal - it records when the rest changed")
+	}
+
+	b.History = []VMRunHistoryEntry{{JobID: 1, Status: "successful"}}
+	if vmStatusEqual(a, b) {
+		t.Error("a new history entry is a real change")
+	}
+}
+
+func TestGenericStatusCurrent(t *testing.T) {
+	obj := func(state, message string, ready bool) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]interface{}{
+			"status": map[string]interface{}{
+				"state": state, "message": message, "ready": ready,
+				"lastUpdated": "2026-09-04T10:00:00Z",
+			},
+		}}
+	}
+	want := map[string]interface{}{
+		"state": "Ready", "message": "All 2 VM(s) completed the requested run successfully.",
+		"ready": true, "lastUpdated": metav1.Now(),
+	}
+
+	if !genericStatusCurrent(obj("Ready", "All 2 VM(s) completed the requested run successfully.", true), want) {
+		t.Error("status matching on everything but lastUpdated should be current")
+	}
+	if genericStatusCurrent(obj("Failed", "All 2 VM(s) completed the requested run successfully.", true), want) {
+		t.Error("a changed state is not current")
+	}
+	if genericStatusCurrent(obj("Ready", "1 of 2 VM(s) failed their last run: web-1.", true), want) {
+		t.Error("a changed message is not current")
+	}
+	if genericStatusCurrent(obj("Ready", "All 2 VM(s) completed the requested run successfully.", false), want) {
+		t.Error("a changed ready flag is not current")
+	}
+	if genericStatusCurrent(&unstructured.Unstructured{Object: map[string]interface{}{}}, want) {
+		t.Error("an object with no status yet is never current")
 	}
 }
 

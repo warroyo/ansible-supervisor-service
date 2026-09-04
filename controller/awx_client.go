@@ -380,7 +380,55 @@ func findHostByName(results []hostResult, hostname string) *hostResult {
 
 type listHostsResponse struct {
 	Count   int          `json:"count"`
+	Next    string       `json:"next"`
 	Results []hostResult `json:"results"`
+}
+
+// maxHostListPages bounds pagination so a filter an instance ignored, or
+// a "next" link that loops, cannot spin forever. At AWX's maximum page
+// size this is 20,000 hosts, far past the point where the status object
+// holding them would already have hit etcd's size limit.
+const maxHostListPages = 100
+
+// ListOwnedHosts returns every host in the inventory whose description is
+// exactly ownerMarker, keyed by host name.
+//
+// One call replaces the per-host lookup UpsertHost would otherwise make
+// for each VM, which is what dominated a binding's AWX traffic: the
+// steady state for a binding matching N VMs goes from N requests to one.
+// Drift detection is unchanged - this still reads AWX itself rather than
+// trusting status, so a host deleted or edited in the AWX UI is still
+// seen. A host missing from the result is simply not one we own yet, and
+// the caller falls back to the per-host path that adopts it.
+func (c *AWXClient) ListOwnedHosts(ctx context.Context, inventoryID int, ownerMarker string) (map[string]hostResult, error) {
+	owned := map[string]hostResult{}
+	// page_size is capped by the instance's own max_page_size (200 by
+	// default); asking for more than it allows is clamped, not rejected.
+	path := fmt.Sprintf("%s/inventories/%d/hosts/?description=%s&page_size=200",
+		c.basePath, inventoryID, url.QueryEscape(ownerMarker))
+
+	for pages := 0; path != "" && pages < maxHostListPages; pages++ {
+		var lr listHostsResponse
+		if err := c.do(ctx, http.MethodGet, path, nil, &lr); err != nil {
+			return nil, fmt.Errorf("listing AWX hosts owned by %q: %w", ownerMarker, err)
+		}
+		for _, h := range lr.Results {
+			// Re-checked for the same reason findHostByName re-checks the
+			// name: ?description= is field-lookup filtering, not published
+			// API, so an instance that ignored it would hand back every
+			// host in the inventory and we would claim all of them.
+			if strings.TrimSpace(h.Description) == ownerMarker {
+				owned[h.Name] = h
+			}
+		}
+		// AWX returns "next" as a path on this same host. Anything else is
+		// not something to follow blindly with our own credentials.
+		if !strings.HasPrefix(lr.Next, "/") {
+			break
+		}
+		path = lr.Next
+	}
+	return owned, nil
 }
 
 // mergeHostVariables merges ours into an existing AWX host variables
@@ -421,13 +469,28 @@ func mergeHostVariables(existing string, ours map[string]string) (string, error)
 //   - unmarked (pre-existing, someone made it by hand) -> adopted:
 //     variables merged, description left alone, never deleted
 func (c *AWXClient) UpsertHost(ctx context.Context, inventoryID int, hostname, ownerMarker string, vars map[string]string) (id int, owned bool, err error) {
-	var lr listHostsResponse
-	listPath := fmt.Sprintf("%s/inventories/%d/hosts/?name=%s", c.basePath, inventoryID, url.QueryEscape(hostname))
-	if err := c.do(ctx, http.MethodGet, listPath, nil, &lr); err != nil {
-		return 0, false, fmt.Errorf("looking up host %q: %w", hostname, err)
+	return c.upsertHost(ctx, inventoryID, hostname, ownerMarker, vars, nil)
+}
+
+// UpsertKnownHost is UpsertHost for a host already read by
+// ListOwnedHosts, skipping the per-host lookup. known must be the host
+// AWX currently holds under this name, not what status remembers of it,
+// or a hand-edit in the AWX UI would go unrepaired.
+func (c *AWXClient) UpsertKnownHost(ctx context.Context, inventoryID int, hostname, ownerMarker string, vars map[string]string, known hostResult) (id int, owned bool, err error) {
+	return c.upsertHost(ctx, inventoryID, hostname, ownerMarker, vars, &known)
+}
+
+func (c *AWXClient) upsertHost(ctx context.Context, inventoryID int, hostname, ownerMarker string, vars map[string]string, existing *hostResult) (id int, owned bool, err error) {
+	if existing == nil {
+		var lr listHostsResponse
+		listPath := fmt.Sprintf("%s/inventories/%d/hosts/?name=%s", c.basePath, inventoryID, url.QueryEscape(hostname))
+		if err := c.do(ctx, http.MethodGet, listPath, nil, &lr); err != nil {
+			return 0, false, fmt.Errorf("looking up host %q: %w", hostname, err)
+		}
+		existing = findHostByName(lr.Results, hostname)
 	}
 
-	if existing := findHostByName(lr.Results, hostname); existing != nil {
+	if existing != nil {
 		existingMarker := strings.TrimSpace(existing.Description)
 
 		if existingMarker != ownerMarker && strings.HasPrefix(existingMarker, hostMarkerPrefix) {

@@ -35,6 +35,7 @@ spec:
         image: controller
         args:
         - #@ "--resync-period=" + data.values.resync_period
+        - #@ "--reconcile-timeout=" + data.values.reconcile_timeout
         - #@ "--supervisor-id=" + data.values.supervisor_id
         securityContext:
           allowPrivilegeEscalation: false

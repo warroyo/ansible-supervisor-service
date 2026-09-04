@@ -99,6 +99,30 @@ func updateGenericStatus(u *unstructured.Unstructured, success bool, reconcileEr
 	}
 }
 
+// genericStatusCurrent reports whether the object already carries the
+// state/message/ready this pass computed.
+//
+// lastUpdated is deliberately not compared: it is set to now on every
+// call, so comparing it would make every reconcile look like a change.
+// Skipping the apply when the rest matches is what stops an idle
+// resource writing to etcd once per resync forever - server-side apply
+// would collapse to a no-op anyway, but only after the round trip.
+func genericStatusCurrent(u *unstructured.Unstructured, statusMap map[string]interface{}) bool {
+	for _, field := range []string{"state", "message"} {
+		want, _ := statusMap[field].(string)
+		got, found, err := unstructured.NestedString(u.Object, "status", field)
+		if err != nil || !found || got != want {
+			return false
+		}
+	}
+	want, _ := statusMap["ready"].(bool)
+	got, found, err := unstructured.NestedBool(u.Object, "status", "ready")
+	if err != nil || !found {
+		return false
+	}
+	return got == want
+}
+
 // key formats a namespace/name pair the way the workqueue does.
 func key(namespace, name string) string { return namespace + "/" + name }
 
@@ -244,10 +268,14 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 				return
 			}
 
+			// An error that repeats every pass - AWX down, a bad template
+			// name - would otherwise rewrite the same message forever.
 			statusMap := c.updateStatusFunc(latestU, false, reconcileErr)
-			if statusPatchErr := patchStatus(ctx, c.client, c.gvr, latestU, statusMap, StatusFieldManager); statusPatchErr != nil {
-				if !apierrors.IsNotFound(statusPatchErr) && !apierrors.IsConflict(statusPatchErr) {
-					log.Printf("%s CRITICAL: failed to patch status after error: %v\n", logPrefix, statusPatchErr)
+			if !genericStatusCurrent(latestU, statusMap) {
+				if statusPatchErr := patchStatus(ctx, c.client, c.gvr, latestU, statusMap, StatusFieldManager); statusPatchErr != nil {
+					if !apierrors.IsNotFound(statusPatchErr) && !apierrors.IsConflict(statusPatchErr) {
+						log.Printf("%s CRITICAL: failed to patch status after error: %v\n", logPrefix, statusPatchErr)
+					}
 				}
 			}
 
@@ -351,9 +379,11 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 	}
 
 	statusMap := c.updateStatusFunc(latestU, true, nil)
-	if statusPatchErr := patchStatus(ctx, c.client, c.gvr, latestU, statusMap, StatusFieldManager); statusPatchErr != nil {
-		log.Printf("%s Warning: failed to patch status after successful provisioning: %v. Requeuing...\n", logPrefix, statusPatchErr)
-		return statusPatchErr
+	if !genericStatusCurrent(latestU, statusMap) {
+		if statusPatchErr := patchStatus(ctx, c.client, c.gvr, latestU, statusMap, StatusFieldManager); statusPatchErr != nil {
+			log.Printf("%s Warning: failed to patch status after successful provisioning: %v. Requeuing...\n", logPrefix, statusPatchErr)
+			return statusPatchErr
+		}
 	}
 
 	log.Printf("%s Reconciliation complete and status updated.\n", logPrefix)

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -107,15 +109,28 @@ func TestResponseBodyIsCapped(t *testing.T) {
 
 // hostStore is a minimal stand-in for an AWX inventory.
 type hostStore struct {
-	hosts   map[int]map[string]interface{}
-	next    int
-	patched int
-	created int
-	deleted map[int]bool
+	hosts    map[int]map[string]interface{}
+	next     int
+	patched  int
+	created  int
+	gets     int
+	pageSize int
+	deleted  map[int]bool
 }
 
 func newHostStore() *hostStore {
 	return &hostStore{hosts: map[int]map[string]interface{}{}, next: 1, deleted: map[int]bool{}}
+}
+
+// ids returns host IDs in insertion order, so paging over them is stable
+// rather than following Go's map iteration order.
+func (s *hostStore) ids() []int {
+	out := make([]int, 0, len(s.hosts))
+	for id := range s.hosts {
+		out = append(out, id)
+	}
+	sort.Ints(out)
+	return out
 }
 
 func (s *hostStore) handler() http.Handler {
@@ -123,15 +138,47 @@ func (s *hostStore) handler() http.Handler {
 		path := strings.TrimPrefix(r.URL.Path, APIBasePathLegacy)
 		switch {
 		case strings.HasPrefix(path, "/inventories/") && r.Method == http.MethodGet:
+			s.gets++
 			name := r.URL.Query().Get("name")
+			description := r.URL.Query().Get("description")
 			results := []map[string]interface{}{}
-			for id, h := range s.hosts {
-				if s.deleted[id] || h["name"] != name {
+			for _, id := range s.ids() {
+				h := s.hosts[id]
+				if s.deleted[id] {
+					continue
+				}
+				if description != "" {
+					if h["description"] != description {
+						continue
+					}
+				} else if h["name"] != name {
 					continue
 				}
 				results = append(results, h)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"count": len(results), "results": results})
+			// Serve a page at a time so the caller's pagination is
+			// exercised, the way a real AWX does past its page size.
+			body := map[string]interface{}{"count": len(results)}
+			if s.pageSize > 0 && len(results) > s.pageSize {
+				page := 1
+				if p := r.URL.Query().Get("page"); p != "" {
+					_, _ = fmt.Sscanf(p, "%d", &page)
+				}
+				start := (page - 1) * s.pageSize
+				end := start + s.pageSize
+				if end < len(results) {
+					body["next"] = fmt.Sprintf("%s/inventories/1/hosts/?description=%s&page=%d",
+						APIBasePathLegacy, url.QueryEscape(description), page+1)
+				} else {
+					end = len(results)
+				}
+				if start > len(results) {
+					start = len(results)
+				}
+				results = results[start:end]
+			}
+			body["results"] = results
+			_ = json.NewEncoder(w).Encode(body)
 		case strings.HasPrefix(path, "/inventories/") && r.Method == http.MethodPost:
 			var body map[string]interface{}
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -263,6 +310,99 @@ func TestUpsertHostAdoptsAnUnmarkedHostWithoutClaimingIt(t *testing.T) {
 	}
 	if !strings.Contains(store.hosts[id]["variables"].(string), "made_by_hand") {
 		t.Error("adopting a host must not discard its existing variables")
+	}
+}
+
+func TestListOwnedHostsPagesAndClaimsOnlyItsOwn(t *testing.T) {
+	store := newHostStore()
+	store.pageSize = 2
+	c := testClient(t, store.handler())
+	marker := "ansible-supervisor:sup-1:ns/binding"
+
+	for _, name := range []string{"web-1", "web-2", "web-3", "web-4", "web-5"} {
+		store.seed(name, marker, "{}")
+	}
+	// Neither of these is ours, and neither may be claimed.
+	store.seed("db-1", "ansible-supervisor:sup-1:ns/other-binding", "{}")
+	store.seed("hand-made", "", "{}")
+
+	owned, err := c.ListOwnedHosts(context.Background(), 1, marker)
+	if err != nil {
+		t.Fatalf("ListOwnedHosts: %v", err)
+	}
+	if len(owned) != 5 {
+		t.Fatalf("claimed %d hosts, want 5: %v", len(owned), owned)
+	}
+	// Five results at two per page is three requests; without following
+	// "next" only the first two hosts would come back.
+	if store.gets != 3 {
+		t.Errorf("made %d requests, want 3 (pagination not followed)", store.gets)
+	}
+	for _, name := range []string{"db-1", "hand-made"} {
+		if _, claimed := owned[name]; claimed {
+			t.Errorf("claimed %q, which this binding does not own", name)
+		}
+	}
+}
+
+// An AWX that ignores the undocumented ?description= field lookup hands
+// back every host in the inventory. Claiming those would mean deleting
+// hosts belonging to another binding on the next cleanup pass.
+func TestListOwnedHostsRechecksTheMarkerItFilteredOn(t *testing.T) {
+	marker := "ansible-supervisor:sup-1:ns/binding"
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"count": 2,
+			"results": []map[string]interface{}{
+				{"id": 1, "name": "web-1", "description": marker},
+				{"id": 2, "name": "db-1", "description": "ansible-supervisor:sup-1:ns/other"},
+			},
+		})
+	}))
+
+	owned, err := c.ListOwnedHosts(context.Background(), 1, marker)
+	if err != nil {
+		t.Fatalf("ListOwnedHosts: %v", err)
+	}
+	if len(owned) != 1 {
+		t.Fatalf("claimed %d hosts, want 1: %v", len(owned), owned)
+	}
+	if _, claimed := owned["db-1"]; claimed {
+		t.Error("claimed a host owned by another binding when the filter was ignored")
+	}
+}
+
+func TestUpsertKnownHostSkipsTheLookupButStillRepairsDrift(t *testing.T) {
+	store := newHostStore()
+	c := testClient(t, store.handler())
+	marker := "ansible-supervisor:sup-1:ns/binding"
+	vars := map[string]string{"ansible_host": "10.0.0.5"}
+
+	id := store.seed("web-1", marker, `{"ansible_host":"10.0.0.5"}`)
+	known := hostResult{ID: id, Name: "web-1", Description: marker, Variables: `{"ansible_host":"10.0.0.5"}`}
+
+	gotID, owned, err := c.UpsertKnownHost(context.Background(), 1, "web-1", marker, vars, known)
+	if err != nil || gotID != id || !owned {
+		t.Fatalf("UpsertKnownHost: id=%d owned=%v err=%v", gotID, owned, err)
+	}
+	if store.gets != 0 {
+		t.Errorf("made %d per-host lookups, want 0 - the host was already known", store.gets)
+	}
+	if store.patched != 0 {
+		t.Errorf("patched %d times with nothing to change, want 0", store.patched)
+	}
+
+	// The IP moved: the variables differ from what AWX holds, so this
+	// still has to be repaired without a lookup.
+	drifted := hostResult{ID: id, Name: "web-1", Description: marker, Variables: `{"ansible_host":"10.0.0.9"}`}
+	if _, _, err := c.UpsertKnownHost(context.Background(), 1, "web-1", marker, vars, drifted); err != nil {
+		t.Fatalf("UpsertKnownHost after drift: %v", err)
+	}
+	if store.patched != 1 {
+		t.Errorf("patched %d times, want 1", store.patched)
+	}
+	if store.gets != 0 {
+		t.Errorf("made %d per-host lookups, want 0", store.gets)
 	}
 }
 
