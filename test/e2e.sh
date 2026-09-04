@@ -106,16 +106,35 @@ else:
 " "$2" "$3"
 }
 
+child_name() {    # child_name <binding> <vm> -> prints the AnsibleBindingVM's name
+  # Child names carry a hash of the binding/VM pair, so they are no
+  # longer <binding>-<vm> and are not worth reconstructing here. The
+  # binding label plus spec.vmName is how the controller finds them too.
+  kubectl get ansiblebindingvm -n "$TEST_NS" -l "field.vmware.com/binding=$1" \
+    -o jsonpath="{.items[?(@.spec.vmName=='$2')].metadata.name}" 2>/dev/null
+}
+
 vm_field() {      # vm_field <binding> <vm> <status field> -> prints the value
   # The per-VM detail that used to live in the binding's status.vms[] is
-  # now one AnsibleBindingVM per VM, named <binding>-<vm>.
-  kubectl get ansiblebindingvm "$1-$2" -n "$TEST_NS" -o jsonpath="{.status.$3}" 2>/dev/null
+  # now one AnsibleBindingVM per VM.
+  local name
+  name=$(child_name "$1" "$2")
+  [[ -n "$name" ]] || return 0
+  kubectl get ansiblebindingvm "$name" -n "$TEST_NS" -o jsonpath="{.status.$3}" 2>/dev/null
+}
+
+# Host and template requests the controller has made to one fake AWX.
+# Pings are excluded: the AWXConnection validates itself every resync
+# whatever the bindings under it are doing.
+awx_work_requests() {  # awx_work_requests <addr> -> prints a count
+  curl -sf "http://$1/_test/request-count" \
+    | python3 -c "import json,sys; c=json.load(sys.stdin); print(c.get('hosts',0)+c.get('templates',0))"
 }
 
 # wait_for runs its command with "$@", which for a `bash -c "..."` check is
 # a brand new shell: without exporting these, a helper used inside one is
 # "command not found" and the check passes or fails for the wrong reason.
-export -f host_deleted host_field vm_field
+export -f host_deleted host_field vm_field child_name awx_work_requests
 export TEST_NS
 
 log "creating kind cluster $CLUSTER_NAME"
@@ -196,7 +215,11 @@ FAKENOFILTER_PID=$!
 wait_for "fakenofilter listening" 15 curl -sf "http://${NOFILTER_ADDR}/api/v2/me/"
 
 log "starting controller as the ansible-supervisor service account"
-KUBECONFIG="$WORK_DIR/sa.kubeconfig" "$WORK_DIR/controller" --resync-period=2 > "$WORK_DIR/controller.log" 2>&1 &
+# --host-check-period is deliberately a few resyncs long, not equal to
+# one: the drift checks below still have to see a host repaired on a
+# timer, and the idle-traffic check has to see the passes in between make
+# no AWX requests at all.
+KUBECONFIG="$WORK_DIR/sa.kubeconfig" "$WORK_DIR/controller" --resync-period=2 --host-check-period=6 > "$WORK_DIR/controller.log" 2>&1 &
 CONTROLLER_PID=$!
 wait_for "controller started" 30 grep -q "controller started successfully" "$WORK_DIR/controller.log"
 
@@ -319,6 +342,48 @@ if [[ "$PATCH_COUNT" != "0" ]]; then
 fi
 log "unchanged host was never re-PATCHed across resyncs"
 
+# --- an idle child must stop calling AWX between host checks ---
+# Every pass used to resolve the template and look up the host, so with
+# one object per VM the AWX request rate scaled with the number of VMs
+# rather than the number of bindings. What bounds it now is the host
+# check running on its own period, with the passes in between deciding
+# from status alone that there is nothing to do.
+log "checking an idle child makes no AWX requests between host checks"
+wait_for "the binding settles before measuring" 30 bash -c \
+  "[[ \$(vm_field e2e-config web-1 phase) == Succeeded ]]"
+
+QUIET=0
+MAX_QUIET=0
+PREV=$(awx_work_requests "$AWX_ADDR")
+for _ in $(seq 1 30); do   # 15s at 0.5s per sample
+  sleep 0.5
+  NOW=$(awx_work_requests "$AWX_ADDR")
+  if [[ "$NOW" == "$PREV" ]]; then
+    QUIET=$((QUIET + 1))
+    if [[ $QUIET -gt $MAX_QUIET ]]; then MAX_QUIET=$QUIET; fi
+  else
+    QUIET=0
+  fi
+  PREV="$NOW"
+done
+# The resync is 2s and the host check period is 6s. If every pass hit AWX
+# no quiet run could reach 2s (4 samples); a working bail-out leaves
+# roughly 6s (12 samples) of silence between checks.
+if [[ $MAX_QUIET -lt 7 ]]; then
+  echo "expected AWX to go quiet between host checks, longest quiet run was only $((MAX_QUIET / 2))s"
+  exit 1
+fi
+log "AWX quiet for $((MAX_QUIET / 2))s at a stretch between host checks"
+
+# --- the binding's rollup must reflect its children ---
+SUMMARY_TOTAL=$(kubectl get ansiblebinding e2e-config -n "$TEST_NS" -o jsonpath='{.status.summary.total}')
+SUMMARY_OK=$(kubectl get ansiblebinding e2e-config -n "$TEST_NS" -o jsonpath='{.status.summary.succeeded}')
+if [[ "$SUMMARY_TOTAL" != "1" || "$SUMMARY_OK" != "1" ]]; then
+  echo "expected the rollup to show 1 of 1 succeeded, got total=$SUMMARY_TOTAL succeeded=$SUMMARY_OK"
+  exit 1
+fi
+log "binding rollup reflects its child: total=$SUMMARY_TOTAL succeeded=$SUMMARY_OK"
+
 # --- a host deleted out of band must be recreated, not trusted ---
 # Deleting the inventory host in AWX is drift like any other. Status
 # alone cannot see it, and every later run would fail with "--limit does
@@ -347,7 +412,7 @@ log "dropping the VM out of vmSelector, expecting its AWX host to be cleaned up"
 kubectl label virtualmachine web-1 -n "$TEST_NS" app- >/dev/null
 
 wait_for "AnsibleBindingVM removed for the unmatched VM" 30 bash -c \
-  "! kubectl get ansiblebindingvm e2e-config-web-1 -n ${TEST_NS} >/dev/null 2>&1"
+  "[[ -z \$(child_name e2e-config web-1) ]]"
 
 wait_for "AWX host deleted" 15 host_deleted "$AWX_ADDR" "$HOST_ID"
 log "unmatched VM's AWX host was cleaned up (id=$HOST_ID)"
@@ -510,7 +575,7 @@ spec:
 EOF
 
 wait_for "foreign-owned host is refused" 30 bash -c \
-  "kubectl get ansiblebindingvm e2e-foreign-web-3 -n ${TEST_NS} -o jsonpath='{.status.phase}{.status.message}' | grep -q 'owned by another'"
+  "{ vm_field e2e-foreign web-3 phase; vm_field e2e-foreign web-3 message; } | grep -q 'owned by another'"
 
 if ! curl -sf "http://${AWX_ADDR}/_test/hosts" | grep -q '192.168.99.99'; then
   echo "the other supervisor's host variables were overwritten"
@@ -772,6 +837,42 @@ if host_deleted "$NOFILTER_ADDR" "$UNRELATED_ID"; then
 fi
 log "unrelated host survived cleanup"
 
+# --- a hand-made AnsibleBindingVM must be refused, not reconciled ---
+# Nothing garbage-collects a child with no owner and no parent reaps one
+# with no binding label, but it would otherwise reconcile happily:
+# creating AWX hosts, launching jobs, and - because spec.bindingName keys
+# the AWX ownership marker - able to point itself at another binding's
+# hosts.
+log "checking a hand-made AnsibleBindingVM with no VirtualMachine owner is refused"
+JOBS_BEFORE_HANDMADE=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleBindingVM
+metadata:
+  name: e2e-handmade
+  namespace: ${TEST_NS}
+spec:
+  vmName: web-1
+  bindingName: e2e-not-a-binding
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+EOF
+
+wait_for "hand-made child is refused" 30 bash -c \
+  "kubectl get ansiblebindingvm e2e-handmade -n ${TEST_NS} -o jsonpath='{.status.message}' | grep -q ownerReference"
+
+sleep 4   # a couple of resyncs to relaunch on, if it were going to
+JOBS_AFTER_HANDMADE=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
+if [[ "$JOBS_BEFORE_HANDMADE" != "$JOBS_AFTER_HANDMADE" ]]; then
+  echo "a hand-made child launched a job: count went $JOBS_BEFORE_HANDMADE -> $JOBS_AFTER_HANDMADE"
+  exit 1
+fi
+kubectl delete ansiblebindingvm e2e-handmade -n "$TEST_NS" --timeout=30s >/dev/null
+log "hand-made child refused and launched nothing"
+
 # --- upgrading a pre-split binding must not re-run anything ---
 # The migration hazard, tested directly: a child created for a VM that
 # already ran, without its previous appliedGeneration seeded, concludes it
@@ -829,9 +930,10 @@ wait "$CONTROLLER_PID" 2>/dev/null || true
 # Drop the finalizer first: with no controller running, deleting the child
 # outright would wedge it in Terminating, and letting its finalizer run
 # would delete the very AWX host the migration is supposed to adopt.
-kubectl patch ansiblebindingvm e2e-migrate-web-7 -n "$TEST_NS" --type=merge \
+MIG_CHILD=$(child_name e2e-migrate web-7)
+kubectl patch ansiblebindingvm "$MIG_CHILD" -n "$TEST_NS" --type=merge \
   -p '{"metadata":{"finalizers":null}}' >/dev/null
-kubectl delete ansiblebindingvm e2e-migrate-web-7 -n "$TEST_NS" --timeout=30s >/dev/null
+kubectl delete ansiblebindingvm "$MIG_CHILD" -n "$TEST_NS" --timeout=30s >/dev/null
 
 kubectl patch ansiblebinding e2e-migrate -n "$TEST_NS" --subresource=status --type=merge \
   -p "{\"status\":{\"vms\":[{\"name\":\"web-7\",\"phase\":\"Succeeded\",\"awxHostID\":${MIG_HOST},\"awxHostName\":\"${MIG_HOSTNAME}\",\"awxHostCreated\":true,\"lastJobID\":${MIG_JOB},\"lastJobStatus\":\"successful\",\"appliedGeneration\":${MIG_GEN}}]}}" >/dev/null
@@ -840,7 +942,7 @@ log "staged: status.vms[] restored, child removed, AWX host $MIG_HOST left in pl
 JOBS_BEFORE_MIGRATE=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
 
 log "restarting the controller - this is the upgrade"
-KUBECONFIG="$WORK_DIR/sa.kubeconfig" "$WORK_DIR/controller" --resync-period=2 >> "$WORK_DIR/controller.log" 2>&1 &
+KUBECONFIG="$WORK_DIR/sa.kubeconfig" "$WORK_DIR/controller" --resync-period=2 --host-check-period=6 >> "$WORK_DIR/controller.log" 2>&1 &
 CONTROLLER_PID=$!
 wait_for "controller restarted" 30 bash -c \
   "[[ \$(grep -c 'controller started successfully' '$WORK_DIR/controller.log') -ge 2 ]]"

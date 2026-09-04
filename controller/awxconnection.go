@@ -82,45 +82,49 @@ func awxClientFor(ctx context.Context, client *dynamic.DynamicClient, conn AWXCo
 // and validates that AWX accepts the credentials, so a broken connection
 // surfaces as Failed on the AWXConnection itself rather than on every
 // AnsibleBinding that references it.
-func applyAWXConnection(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) error {
+func applyAWXConnection(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) (Result, error) {
 	u, err := toUnstructured(obj)
 	if err != nil {
-		return err
+		return Result{}, err
 	}
 	conn, err := convertAWXConnection(u)
 	if err != nil {
-		return fmt.Errorf("decoding AWXConnection: %w", err)
+		return Result{}, fmt.Errorf("decoding AWXConnection: %w", err)
 	}
 	if conn.Spec == nil {
-		return fmt.Errorf("spec is required")
+		return Result{}, fmt.Errorf("spec is required")
 	}
 	if conn.Spec.URL == "" {
-		return fmt.Errorf("spec.url is required")
+		return Result{}, fmt.Errorf("spec.url is required")
 	}
 	if conn.Spec.SecretRef == "" {
-		return fmt.Errorf("spec.secretRef is required")
+		return Result{}, fmt.Errorf("spec.secretRef is required")
 	}
 
+	// Deliberately not the cached client the bindings use: this pass
+	// exists to validate the credentials as they are now, so it reads
+	// the token and pings on every pass. That is once per connection per
+	// resync, not once per VM.
 	token, err := getSecretValue(ctx, client, conn.Namespace, conn.Spec.SecretRef, "token")
 	if err != nil {
-		return fmt.Errorf("reading token from secret %q: %w", conn.Spec.SecretRef, err)
+		return Result{}, fmt.Errorf("reading token from secret %q: %w", conn.Spec.SecretRef, err)
 	}
 
 	awxClient, basePath, err := awxClientFor(ctx, client, conn, token)
 	if err != nil {
-		return fmt.Errorf("preparing a client for %s: %w", conn.Spec.URL, err)
+		return Result{}, fmt.Errorf("preparing a client for %s: %w", conn.Spec.URL, err)
 	}
 	if err := awxClient.Ping(ctx); err != nil {
-		return fmt.Errorf("validating connection to %s (API base path %s): %w", conn.Spec.URL, basePath, err)
+		return Result{}, fmt.Errorf("validating connection to %s (API base path %s): %w", conn.Spec.URL, basePath, err)
 	}
 
 	// Cache it so every reconcile of every binding doesn't re-probe.
 	if conn.Status == nil || conn.Status.APIBasePath != basePath {
 		if err := writeAWXConnectionDetails(ctx, client, u, basePath); err != nil {
-			return fmt.Errorf("recording the detected API base path: %w", err)
+			return Result{}, fmt.Errorf("recording the detected API base path: %w", err)
 		}
 	}
-	return nil
+	return Result{}, nil
 }
 
 func writeAWXConnectionDetails(ctx context.Context, client *dynamic.DynamicClient, obj *unstructured.Unstructured, basePath string) error {

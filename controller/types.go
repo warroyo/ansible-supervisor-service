@@ -192,6 +192,12 @@ type AnsibleBindingStatus struct {
 	// keeps the binding writable at fleet scale - the per-VM detail it
 	// replaced grew without bound and stopped fitting in the object.
 	Summary *BindingSummary `json:"summary,omitempty"`
+	// LastOrphanScan is when this binding last listed the AWX hosts it
+	// owns looking for ones no child claims. Kept in status for the same
+	// reason as the child's lastHostCheck: the scan is rare and costs an
+	// AWX request, and a pass has to be able to work out whether one is
+	// due from the object rather than from process memory.
+	LastOrphanScan string `json:"lastOrphanScan,omitempty"`
 	// VMs is the pre-split per-VM detail. Nothing writes it any more; it
 	// is read once to seed the children during migration and then
 	// cleared. Removed a release after the split.
@@ -212,6 +218,14 @@ type BindingSummary struct {
 	// children.
 	FailedVMs    []string `json:"failedVMs,omitempty"`
 	FirstFailure string   `json:"firstFailure,omitempty"`
+	// Terminating counts children being deleted. They are counted apart
+	// from the phase buckets, and not in Total, because a child on its
+	// way out is not something the binding's readiness turns on - but
+	// nor can it be dropped silently. A child wedged in Terminating (an
+	// AWX host that will not delete) would otherwise vanish from the
+	// rollup entirely and leave the binding above it reading Ready while
+	// something underneath it retried forever.
+	Terminating int `json:"terminating,omitempty"`
 }
 
 // AnsibleBindingVM is one VM's unit of work under an AnsibleBinding:
@@ -307,6 +321,13 @@ type AnsibleBindingVMStatus struct {
 	LastJobID     int64  `json:"lastJobID,omitempty"`
 	LastJobURL    string `json:"lastJobURL,omitempty"`
 	LastJobStatus string `json:"lastJobStatus,omitempty"`
+
+	// LastHostCheck is when this VM's inventory host was last reconciled
+	// against AWX itself. It lives in status rather than in memory so the
+	// decision survives a controller restart and stays a function of
+	// observed state: a pass works out whether a check is due by looking
+	// at the object, not by remembering what it did last time.
+	LastHostCheck string `json:"lastHostCheck,omitempty"`
 
 	// AppliedGeneration and AppliedTrigger record the spec.bindingGeneration
 	// and spec.bindingTrigger this VM last launched a run for, so a

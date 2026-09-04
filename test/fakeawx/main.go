@@ -57,6 +57,11 @@ type server struct {
 	nextHostID int
 	nextJobID  int
 
+	// requests counts API requests by category, so the e2e suite can
+	// assert what an idle steady state costs rather than only that it
+	// eventually converges. Keyed "ping", "hosts", "templates", "jobs".
+	requests map[string]int
+
 	jobTemplates      []templateRec
 	workflowTemplates []templateRec
 	hosts             map[int]*hostRec
@@ -80,8 +85,9 @@ func newServer(basePath string, ignoreNameFilter bool) *server {
 		workflowTemplates: []templateRec{
 			{ID: 2, Name: "Configure Webserver Workflow", Inventory: &inv, AskLimitOnLaunch: true, AskVariablesOnLaunch: true},
 		},
-		hosts: map[int]*hostRec{},
-		jobs:  map[int]*jobRec{},
+		hosts:    map[int]*hostRec{},
+		jobs:     map[int]*jobRec{},
+		requests: map[string]int{},
 	}
 }
 
@@ -320,6 +326,38 @@ func (s *server) handleTestHosts(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// count buckets one API request by what it is for. "hosts" and
+// "templates" are the ones an idle binding must stop making between host
+// checks; "ping" is the AWXConnection validating itself and goes on
+// regardless.
+func (s *server) count(path string) {
+	bucket := "other"
+	switch {
+	case path == "/ping/" || path == "/me/":
+		bucket = "ping"
+	case strings.Contains(path, "hosts/"):
+		bucket = "hosts"
+	case strings.Contains(path, "templates/"):
+		bucket = "templates"
+	case strings.HasPrefix(path, "/jobs/") || strings.HasPrefix(path, "/workflow_jobs/"):
+		bucket = "jobs"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests[bucket]++
+	s.requests["total"]++
+}
+
+func (s *server) handleTestRequestCount(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	counts := map[string]int{}
+	for k, v := range s.requests {
+		counts[k] = v
+	}
+	writeJSON(w, 200, counts)
+}
+
 func (s *server) handleTestDeletedHosts(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -353,6 +391,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/_test/deleted-hosts":
 		s.handleTestDeletedHosts(w, r)
 		return
+	case "/_test/request-count":
+		s.handleTestRequestCount(w, r)
+		return
 	}
 
 	if !strings.HasPrefix(path, s.basePath+"/") {
@@ -360,6 +401,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path = strings.TrimPrefix(path, s.basePath)
+	s.count(path)
 
 	switch {
 	case path == "/ping/":

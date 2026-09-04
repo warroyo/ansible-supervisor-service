@@ -92,6 +92,14 @@ spec:
 
 Host names are only inventory labels - the real address rides in `ansible_host` - so a prefix costs nothing but what `inventory_hostname` looks like inside playbooks. Changing the prefix later retires the old host entry rather than orphaning it.
 
+## I edited a host in the AWX UI. How long until the controller puts it back?
+
+Up to `host_check_period` (600s by default). Each VM's inventory host is reconciled against AWX itself - not against what the CR's status claims it pushed - so a host deleted, renamed or hand-edited in the AWX UI is drift like any other and is repaired. What changed is the cadence: the check runs on its own period rather than on every resync, because with one object per VM a per-pass check made the AWX request rate scale with the number of VMs rather than the number of bindings.
+
+Everything else in an idle pass is answered from the controller's own caches, so between checks a matched, up-to-date VM costs AWX nothing at all. Lower `host_check_period` if hand edits in AWX are common; raise it if AWX is the bottleneck. A spec change or a re-run annotation is not affected either way - both take the full path immediately.
+
+The same period governs one other thing: each binding periodically lists the AWX hosts it owns and deletes any that no VM and no child accounts for - a host leaked by a controller killed mid-cleanup, say. Only hosts carrying this supervisor's ownership marker for that binding are ever considered, so adopted hosts and other supervisors' hosts are never touched, and `cleanupPolicy: Retain` disables it entirely.
+
 ## How do I find AWX hosts a supervisor left behind?
 
 Hosts can outlive their binding if you used `cleanupPolicy: Retain`, or if finalizers were stripped by hand during an uninstall. The ownership marker makes them findable:

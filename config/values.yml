@@ -8,6 +8,12 @@ resync_period: "60"
 #! slow AWX, delaying every other resource.
 reconcile_timeout: "300"
 namespace: ""
+#! how often, in seconds, each VM's AWX inventory host is reconciled against AWX
+#! itself. everything else in an idle pass is served from the controller's own
+#! informer caches, so this is what sets the steady-state AWX request rate - and
+#! it is the worst case for repairing a host deleted or edited by hand in the AWX
+#! UI.
+host_check_period: "600"
 #! identity stamped on AWX inventory hosts this supervisor owns, so one AWX
 #! instance can be shared by several supervisors without them fighting over
 #! host entries. leave empty to derive it from the kube-system namespace UID.

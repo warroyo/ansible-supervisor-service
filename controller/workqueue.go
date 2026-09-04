@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -64,9 +62,13 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	return true
 }
 
-// reconcileByKey re-fetches the object from the API before reconciling it,
-// rather than trusting the (possibly stale) object handed to the informer
-// callback, so reconciliation is level-triggered.
+// reconcileByKey reads the object from this kind's informer store and
+// reconciles whatever it currently says, rather than replaying whichever
+// event put the key on the queue. That is what makes the pass
+// level-triggered - not where the read comes from. The informer holds
+// every object of this kind already, kept current by watch, so fetching
+// each one again from the API server was a round trip per resource per
+// pass for a copy the process was handed anyway.
 func (c *Controller) reconcileByKey(ctx context.Context, key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -76,13 +78,13 @@ func (c *Controller) reconcileByKey(ctx context.Context, key string) error {
 	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 	defer cancel()
 
-	u, err := c.client.Resource(c.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	u, err := c.cachedGet(ctx, namespace, name)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			// Resource is gone; nothing left to reconcile.
-			return nil
-		}
 		return fmt.Errorf("failed to fetch resource %s: %w", key, err)
+	}
+	if u == nil {
+		// Resource is gone; nothing left to reconcile.
+		return nil
 	}
 
 	return c.Reconcile(ctx, u)

@@ -274,19 +274,19 @@ func TestAnsibleBindingDetailsCurrent(t *testing.T) {
 	summary := BindingSummary{Total: 2, Succeeded: 2}
 	prior := &AnsibleBindingStatus{ObservedGeneration: 3, LastAppliedTrigger: "t1", Summary: &summary}
 
-	if !ansibleBindingDetailsCurrent(prior, summary, 3, "t1", false) {
+	if !ansibleBindingDetailsCurrent(prior, summary, 3, "t1", false, "") {
 		t.Error("an identical rollup should be reported as current")
 	}
-	if ansibleBindingDetailsCurrent(nil, summary, 3, "t1", false) {
+	if ansibleBindingDetailsCurrent(nil, summary, 3, "t1", false, "") {
 		t.Error("a binding with no status yet is never current")
 	}
-	if ansibleBindingDetailsCurrent(prior, summary, 4, "t1", false) {
+	if ansibleBindingDetailsCurrent(prior, summary, 4, "t1", false, "") {
 		t.Error("a new generation is not current")
 	}
-	if ansibleBindingDetailsCurrent(prior, summary, 3, "t2", false) {
+	if ansibleBindingDetailsCurrent(prior, summary, 3, "t2", false, "") {
 		t.Error("a new re-run trigger is not current")
 	}
-	if ansibleBindingDetailsCurrent(prior, BindingSummary{Total: 2, Succeeded: 1, Failed: 1}, 3, "t1", false) {
+	if ansibleBindingDetailsCurrent(prior, BindingSummary{Total: 2, Succeeded: 1, Failed: 1}, 3, "t1", false, "") {
 		t.Error("a changed rollup is not current")
 	}
 
@@ -296,11 +296,17 @@ func TestAnsibleBindingDetailsCurrent(t *testing.T) {
 		ObservedGeneration: 3, LastAppliedTrigger: "t1", Summary: &summary,
 		VMs: []VMStatus{{Name: "web-1"}},
 	}
-	if ansibleBindingDetailsCurrent(withLegacy, summary, 3, "t1", true) {
+	if ansibleBindingDetailsCurrent(withLegacy, summary, 3, "t1", true, "") {
 		t.Error("a binding still carrying legacy vms[] is not current when they are due to be cleared")
 	}
-	if !ansibleBindingDetailsCurrent(withLegacy, summary, 3, "t1", false) {
+	if !ansibleBindingDetailsCurrent(withLegacy, summary, 3, "t1", false, "") {
 		t.Error("legacy vms[] that are not yet due to be cleared do not force a write")
+	}
+
+	// A completed orphan scan has to reach status, or the scan repeats
+	// on every pass and its AWX request stops being once per period.
+	if ansibleBindingDetailsCurrent(prior, summary, 3, "t1", false, "2026-01-01T00:00:00Z") {
+		t.Error("a fresh orphan scan timestamp is not current")
 	}
 }
 

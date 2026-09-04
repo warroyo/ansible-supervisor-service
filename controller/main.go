@@ -29,9 +29,11 @@ func main() {
 	resync := flag.Int("resync-period", 60, "reconcile resync interval, in seconds")
 	reconcileTimeoutFlag := flag.Int("reconcile-timeout", 300, "maximum time one reconcile of one resource may take, in seconds, so a slow AWX cannot pin a worker indefinitely")
 	supervisorIDFlag := flag.String("supervisor-id", "", "identity stamped on AWX inventory hosts this supervisor owns, so one AWX instance can be shared by several supervisors (default: the kube-system namespace UID)")
+	hostCheckFlag := flag.Int("host-check-period", 600, "how often, in seconds, each VM's AWX inventory host is reconciled against AWX itself - the worst case for repairing a host deleted or edited by hand in the AWX UI, and what sets the steady-state AWX request rate")
 	flag.Parse()
 	resyncPeriod := time.Duration(*resync) * time.Second
 	reconcileTimeout = time.Duration(*reconcileTimeoutFlag) * time.Second
+	hostCheckPeriod = time.Duration(*hostCheckFlag) * time.Second
 
 	// A kubeconfig is for local development; running as a supervisor
 	// service there is none and the service account is used instead.
@@ -134,9 +136,28 @@ func main() {
 	// controller itself watches cluster-wide (no namespace allowlist to
 	// maintain) - same for the VirtualMachine lookups the children do
 	// per-namespace on demand.
-	awxConnInformer := setupInformer(ctx, dynClient, awxConnController.gvr, awxConnController, resyncPeriod)
-	ansBindInformer := setupInformer(ctx, dynClient, ansBindController.gvr, ansBindController, resyncPeriod)
-	ansBindVMInformer := setupInformer(ctx, dynClient, ansBindVMController.gvr, ansBindVMController, resyncPeriod)
+	awxConnInformer := setupInformer(ctx, dynClient, awxConnController.gvr, awxConnController, resyncPeriod, nil)
+	ansBindInformer := setupInformer(ctx, dynClient, ansBindController.gvr, ansBindController, resyncPeriod, nil)
+	ansBindVMInformer := setupInformer(ctx, dynClient, ansBindVMController.gvr, ansBindVMController, resyncPeriod, cache.Indexers{
+		childrenByBindingIndex: childrenByBindingIndexFunc,
+	})
+
+	// These stores were already being maintained and read by nothing but
+	// the event handlers that enqueue keys. Every object in them was then
+	// fetched again over the wire by the reconcile that followed.
+	awxConnStore = awxConnInformer.GetIndexer()
+	ansBindVMStore = ansBindVMInformer.GetIndexer()
+
+	// The parent watches its children, which is the one standard
+	// parent-child mechanism the split left out.
+	//
+	// This carries no intent: the event says "look again", and the pass
+	// it triggers re-derives the whole rollup from a full list of
+	// children exactly as a resync-driven pass does. A dropped event
+	// costs latency, not correctness. Without it status.summary is stale
+	// by up to a full resync at all times, including immediately after a
+	// run finishes.
+	watchChildren(ansBindVMInformer, ansBindController)
 
 	go awxConnInformer.Run(ctx.Done())
 	go ansBindInformer.Run(ctx.Done())

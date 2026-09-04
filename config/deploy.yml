@@ -37,6 +37,7 @@ spec:
         - #@ "--resync-period=" + data.values.resync_period
         - #@ "--reconcile-timeout=" + data.values.reconcile_timeout
         - #@ "--supervisor-id=" + data.values.supervisor_id
+        - #@ "--host-check-period=" + data.values.host_check_period
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true

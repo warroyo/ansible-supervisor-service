@@ -175,6 +175,10 @@ spec:
                 lastAppliedTrigger:
                   type: string
                   description: informational - the reconcile-requested-at annotation value the controller most recently saw. see vms[].appliedTrigger for what each VM actually ran
+                lastOrphanScan:
+                  type: string
+                  format: date-time
+                  description: when this binding last listed the AWX hosts it owns looking for ones no child claims. the scan costs an AWX request, so it runs on the controller's --host-check-period rather than every pass
                 summary:
                   type: object
                   description: rollup of the AnsibleBindingVM children by phase. fixed size however many VMs the selector matches, which is what replaced the unbounded per-VM list below
@@ -197,6 +201,9 @@ spec:
                     firstFailure:
                       type: string
                       description: the message from one of the failing children
+                    terminating:
+                      type: integer
+                      description: children being deleted, counted apart from the phases above and not included in total. a child wedged in Terminating would otherwise drop out of the rollup entirely and leave the binding reading Ready
                 vms:
                   type: array
                   description: deprecated - pre-split per-VM detail. nothing writes it any more; it is read once to seed the AnsibleBindingVM children and then cleared. see the ansiblebindingvms resource
@@ -388,6 +395,10 @@ spec:
                 awxHostCreated:
                   type: boolean
                   description: whether this controller owns the AWX host. ownership is stamped into the host description in AWX so it survives this resource being deleted and recreated. hosts that already existed unmarked are adopted and never deleted
+                lastHostCheck:
+                  type: string
+                  format: date-time
+                  description: when this VM's inventory host was last reconciled against AWX itself. kept in status so the decision survives a controller restart. the period is the controller's --host-check-period
                 appliedGeneration:
                   type: integer
                   description: spec.bindingGeneration this VM last launched a run for

@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 )
@@ -27,31 +29,34 @@ const vmDetailsFieldManager = "ansible-supervisor-vm-details"
 // applyAnsibleBinding, with one difference that matters: it operates on
 // one VM, so the work is bounded no matter how many VMs a binding
 // selects, and the workqueue can run several of these at once.
-func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) error {
+func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) (Result, error) {
 	u, err := toUnstructured(obj)
 	if err != nil {
-		return err
+		return Result{}, err
 	}
 	child, err := convertAnsibleBindingVM(u)
 	if err != nil {
-		return fmt.Errorf("decoding AnsibleBindingVM: %w", err)
+		return Result{}, fmt.Errorf("decoding AnsibleBindingVM: %w", err)
 	}
 	if child.Spec == nil {
-		return fmt.Errorf("spec is required")
+		return Result{}, fmt.Errorf("spec is required")
 	}
 	if child.Spec.VMName == "" {
-		return fmt.Errorf("spec.vmName is required")
+		return Result{}, fmt.Errorf("spec.vmName is required")
 	}
 	if child.Spec.BindingName == "" {
-		return fmt.Errorf("spec.bindingName is required")
+		return Result{}, fmt.Errorf("spec.bindingName is required")
 	}
 	if child.Spec.AWXConnectionRef == "" {
-		return fmt.Errorf("spec.awxConnectionRef is required")
+		return Result{}, fmt.Errorf("spec.awxConnectionRef is required")
+	}
+	if err := checkOwnedByItsVM(&child); err != nil {
+		return Result{}, err
 	}
 
 	prior, adopted, err := priorVMState(&child)
 	if err != nil {
-		return err
+		return Result{}, err
 	}
 
 	// st is what this pass will write. It starts as what the object
@@ -67,11 +72,16 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		}
 	}
 
+	// requeueAfter is what this pass asks the engine for on its way out.
+	// The resync wakes every child anyway; this is what lets the host
+	// check run on its own period rather than the resync's.
+	var requeueAfter time.Duration
+
 	// finish persists whatever this pass worked out and returns the
 	// first error, if any. Every exit below goes through it: a VM whose
 	// host upsert failed still has to record the host ID it already had,
 	// or the next pass loses track of it.
-	finish := func() error {
+	finish := func() (Result, error) {
 		if !ansibleBindingVMDetailsCurrent(child.Status, st) {
 			if wErr := writeAnsibleBindingVMDetails(ctx, client, u, st); wErr != nil {
 				log.Printf("[AnsibleBindingVM/%s/%s] failed to persist status: %v", child.Namespace, child.Name, wErr)
@@ -83,60 +93,71 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 				log.Printf("[AnsibleBindingVM/%s/%s] failed to clear the adopt-status annotation: %v", child.Namespace, child.Name, cErr)
 			}
 		}
-		return firstErr
+		return Result{Object: childWithStatus(u, st), RequeueAfter: requeueAfter}, firstErr
 	}
 
-	awxConnObj, err := client.Resource(awxConnGVR).Namespace(child.Namespace).Get(ctx, child.Spec.AWXConnectionRef, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("fetching AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
-	}
-	awxConn, err := convertAWXConnection(awxConnObj)
-	if err != nil {
-		return fmt.Errorf("decoding AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
-	}
-	if awxConn.Spec == nil {
-		return fmt.Errorf("AWXConnection %q has no spec", child.Spec.AWXConnectionRef)
-	}
-	token, err := getSecretValue(ctx, client, child.Namespace, awxConn.Spec.SecretRef, "token")
-	if err != nil {
-		return fmt.Errorf("reading AWX token from secret %q: %w", awxConn.Spec.SecretRef, err)
-	}
-	awxClient, _, err := awxClientFor(ctx, client, awxConn, token)
-	if err != nil {
-		return fmt.Errorf("preparing a client for AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
-	}
-
-	tmpl, err := resolveTemplate(ctx, awxClient, child.Spec.Template)
-	if err != nil {
-		return err
-	}
-
-	targetsHost := !child.Spec.UseDefaultLimit && tmpl.Inventory != nil
-
-	// AWX silently drops launch fields the template isn't configured to
-	// accept. Re-checked here rather than only on the binding because
-	// this is where the launch actually happens: a template edited in
-	// AWX between the parent's pass and this one must not quietly widen
-	// the run to the whole inventory.
-	if err := checkTemplateLaunchFields(tmpl, child.Spec.Template.Name, targetsHost, len(child.Spec.ExtraVars) > 0); err != nil {
-		return err
-	}
-
+	// The VirtualMachine is the one object below the workqueue still
+	// read from the API server on every pass - there is no VM informer
+	// yet, deliberately, since caching every VM on the Supervisor costs
+	// memory proportional to the whole cluster.
 	vm, err := client.Resource(vmGVR).Namespace(child.Namespace).Get(ctx, child.Spec.VMName, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// The VM is gone, so this object is on its way out: the
 			// garbage collector deletes it once the owner reference
 			// resolves to nothing. Nothing to reconcile in the meantime.
-			return nil
+			return Result{}, nil
 		}
-		return fmt.Errorf("fetching VirtualMachine %q: %w", child.Spec.VMName, err)
+		return Result{}, fmt.Errorf("fetching VirtualMachine %q: %w", child.Spec.VMName, err)
+	}
+
+	ip, ready := vmReady(vm)
+	st.ObservedIP = ip
+
+	// Everything from here on costs AWX requests, so the three questions
+	// that decide whether any of it is needed are answered first, from
+	// what is already in hand. All three have to be quiet for the pass
+	// to stop: a job still in flight takes the full path however idle
+	// the rest of it looks.
+	inFlight := prior.LastJobID != 0 && !isTerminalAWXStatus(prior.LastJobStatus)
+	wantsRun := needsRun(st, child.Spec)
+	hostCheckDue, untilNextHostCheck := dueFor(st.LastHostCheck, hostCheckPeriod)
+
+	if !inFlight && !ready {
+		// No address means no host to write and nothing to run against.
+		// Pending means "never ran, waiting on the VM" - a VM that
+		// already has a run keeps that run's phase.
+		if st.LastJobID == 0 {
+			st.Phase = PhasePending
+		}
+		return finish()
+	}
+
+	if !inFlight && !wantsRun && !hostCheckDue {
+		requeueAfter = untilNextHostCheck
+		return finish()
+	}
+
+	awxConnObj, err := getAWXConnection(ctx, client, child.Namespace, child.Spec.AWXConnectionRef)
+	if err != nil {
+		return Result{}, fmt.Errorf("fetching AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
+	}
+	awxConn, err := convertAWXConnection(awxConnObj)
+	if err != nil {
+		return Result{}, fmt.Errorf("decoding AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
+	}
+	if awxConn.Spec == nil {
+		return Result{}, fmt.Errorf("AWXConnection %q has no spec", child.Spec.AWXConnectionRef)
+	}
+	awxClient, _, err := awxClientForConnection(ctx, client, awxConn)
+	if err != nil {
+		return Result{}, fmt.Errorf("preparing a client for AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
 	}
 
 	// Poll any in-flight job first: its outcome doesn't depend on the
 	// VM's current power state, so this must happen even if the VM has
-	// since powered off.
-	if prior.LastJobID != 0 && !isTerminalAWXStatus(prior.LastJobStatus) {
+	// since powered off - and it needs no template lookup.
+	if inFlight {
 		status, sErr := pollJobStatus(ctx, awxClient, child.Spec.Template.Type, prior.LastJobID)
 		if sErr != nil {
 			st.Phase = PhaseRunning
@@ -157,15 +178,41 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		})
 	}
 
-	ip, ready := vmReady(vm)
-	st.ObservedIP = ip
-	if !ready {
-		// Pending means "never ran, waiting on the VM" - a VM that
-		// already has a run keeps that run's phase.
-		if st.LastJobID == 0 {
+	// The job that was in flight has just finished, and nothing else is
+	// asking for AWX this pass.
+	if !ready || (!wantsRun && !hostCheckDue) {
+		if !ready && st.LastJobID == 0 {
 			st.Phase = PhasePending
 		}
+		if ready {
+			requeueAfter = untilNextHostCheck
+		}
 		return finish()
+	}
+
+	// A launch resolves the template from AWX every time, never from the
+	// cache: ask_limit_on_launch is what stops a run going against the
+	// whole inventory, and it can be switched off in the AWX UI between
+	// one pass and the next.
+	var tmpl *AWXTemplate
+	if wantsRun {
+		tmpl, err = resolveTemplateForLaunch(ctx, awxClient, child.Namespace, child.Spec.AWXConnectionRef, child.Spec.Template)
+	} else {
+		tmpl, err = resolveTemplateCached(ctx, awxClient, child.Namespace, child.Spec.AWXConnectionRef, child.Spec.Template)
+	}
+	if err != nil {
+		return Result{}, err
+	}
+
+	targetsHost := !child.Spec.UseDefaultLimit && tmpl.Inventory != nil
+
+	// AWX silently drops launch fields the template isn't configured to
+	// accept. Re-checked here rather than only on the binding because
+	// this is where the launch actually happens: a template edited in
+	// AWX between the parent's pass and this one must not quietly widen
+	// the run to the whole inventory.
+	if err := checkTemplateLaunchFields(tmpl, child.Spec.Template.Name, targetsHost, len(child.Spec.ExtraVars) > 0); err != nil {
+		return Result{}, err
 	}
 
 	hostName := child.Spec.VMName
@@ -230,7 +277,14 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		st.AWXInventoryID = inventoryID
 	}
 
-	if !needsRun(st, child.Spec) {
+	// Reaching here means the host is as AWX should have it (or the
+	// template has no inventory and there is no host to keep). Recording
+	// when that was true is what lets the next several passes skip AWX
+	// entirely.
+	st.LastHostCheck = nowRFC3339()
+
+	if !wantsRun {
+		requeueAfter = hostCheckPeriod
 		return finish()
 	}
 
@@ -262,7 +316,70 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		}
 		recordErr(fmt.Errorf("launching template: %w", lErr))
 	}
+	requeueAfter = hostCheckPeriod
 	return finish()
+}
+
+// checkOwnedByItsVM refuses to reconcile a child that is not owned by
+// the VirtualMachine it claims to be for.
+//
+// Without this, an AnsibleBindingVM written by hand reconciles happily:
+// it creates AWX hosts and launches jobs, nothing garbage-collects it
+// (no ownerReference) and no parent reaps it (no binding label). Because
+// spec.bindingName keys the AWX host ownership marker, one could also be
+// pointed at another binding's marker to interfere with its hosts. The
+// user-facing roles are read-only on this kind, so this closes the gap a
+// cluster-admin could still walk through.
+//
+// The presence of an ownerReference is not the check. A reference to a
+// deleted VM sits in the list until the garbage collector gets to the
+// object, and a reference to some unrelated live VM would pass just as
+// easily. The reference has to name this child's own VM.
+func checkOwnedByItsVM(child *AnsibleBindingVM) error {
+	for _, ref := range child.OwnerReferences {
+		if ref.Kind != "VirtualMachine" || ref.Name != child.Spec.VMName {
+			continue
+		}
+		gv, err := schema.ParseGroupVersion(ref.APIVersion)
+		if err != nil || gv.Group != vmGroup {
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("AnsibleBindingVM %q has no ownerReference to VirtualMachine %q: "+
+		"children are created by their AnsibleBinding, not written by hand: %w",
+		child.Name, child.Spec.VMName, errPermanentConfig)
+}
+
+// childWithStatus is the child as this pass leaves it: the object it was
+// given, with the status just written merged in, so the engine can
+// derive the generic state from it without re-reading the object.
+//
+// The engine's own field manager owns state/message/ready/lastUpdated,
+// so those are carried across from the object rather than recomputed
+// here; everything else is replaced wholesale, exactly as the
+// server-side apply does, so a field that fell away actually disappears.
+func childWithStatus(u *unstructured.Unstructured, st AnsibleBindingVMStatus) *unstructured.Unstructured {
+	out := u.DeepCopy()
+	details, err := structToMap(vmDetailsOf(st))
+	if err != nil {
+		return out
+	}
+	status := map[string]interface{}{}
+	if existing, found, _ := unstructured.NestedMap(out.Object, "status"); found {
+		for _, generic := range []string{"state", "message", "ready", "lastUpdated"} {
+			if v, ok := existing[generic]; ok {
+				status[generic] = v
+			}
+		}
+	}
+	for k, v := range details {
+		status[k] = v
+	}
+	if err := unstructured.SetNestedMap(out.Object, status, "status"); err != nil {
+		return u.DeepCopy()
+	}
+	return out
 }
 
 // needsRun decides whether this VM should launch, comparing what it last
@@ -416,7 +533,7 @@ func cleanupAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient,
 			child.Namespace, child.Name, reason, child.Status.AWXHostID, err)
 	}
 
-	awxConnObj, err := client.Resource(awxConnGVR).Namespace(child.Namespace).Get(ctx, child.Spec.AWXConnectionRef, metav1.GetOptions{})
+	awxConnObj, err := getAWXConnection(ctx, client, child.Namespace, child.Spec.AWXConnectionRef)
 	if err != nil {
 		if !isPermanent(err) {
 			return fmt.Errorf("fetching AWXConnection %q to clean up AWX host %d: %w", child.Spec.AWXConnectionRef, child.Status.AWXHostID, err)
@@ -429,20 +546,17 @@ func cleanupAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient,
 		abandon(fmt.Sprintf("AWXConnection %q is malformed", child.Spec.AWXConnectionRef), err)
 		return nil
 	}
-	token, err := getSecretValue(ctx, client, child.Namespace, awxConn.Spec.SecretRef, "token")
+	// A missing token, or a base path that will not resolve, is the
+	// difference between "this will never work" and "AWX is unreachable
+	// right now" - and the second is worth retrying rather than leaking
+	// a host over.
+	awxClient, _, err := awxClientForConnection(ctx, client, awxConn)
 	if err != nil {
-		if !isPermanent(err) {
-			return fmt.Errorf("reading the AWX token to clean up AWX host %d: %w", child.Status.AWXHostID, err)
+		if isPermanent(err) {
+			abandon("the AWX token is gone or the connection is malformed", err)
+			return nil
 		}
-		abandon("the AWX token is gone", err)
-		return nil
-	}
-	// A base path that will not resolve means AWX is unreachable right
-	// now - exactly the transient case worth retrying rather than
-	// leaking a host over.
-	awxClient, _, err := awxClientFor(ctx, client, awxConn, token)
-	if err != nil {
-		return fmt.Errorf("resolving the AWX API base path to clean up AWX host %d "+
+		return fmt.Errorf("preparing a client to clean up AWX host %d "+
 			"(set spec.cleanupPolicy: Retain to release this object and leave it in place): %w", child.Status.AWXHostID, err)
 	}
 	if err := awxClient.DeleteHost(ctx, int(child.Status.AWXHostID)); err != nil {

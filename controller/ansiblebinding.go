@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,45 +34,45 @@ const detailsFieldManager = "ansible-supervisor-details"
 // this pass O(1) in API calls no matter how many VMs are selected, and
 // lets several VMs reconcile in parallel instead of queueing behind one
 // another inside a single binding's reconcile.
-func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) error {
+func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) (Result, error) {
 	u, err := toUnstructured(obj)
 	if err != nil {
-		return err
+		return Result{}, err
 	}
 	ac, err := convertAnsibleBinding(u)
 	if err != nil {
-		return fmt.Errorf("decoding AnsibleBinding: %w", err)
+		return Result{}, fmt.Errorf("decoding AnsibleBinding: %w", err)
 	}
 	if ac.Spec == nil {
-		return fmt.Errorf("spec is required")
+		return Result{}, fmt.Errorf("spec is required")
 	}
 	if ac.Spec.AWXConnectionRef == "" {
-		return fmt.Errorf("spec.awxConnectionRef is required")
+		return Result{}, fmt.Errorf("spec.awxConnectionRef is required")
 	}
 	// An empty selector would match every VM in the namespace and run
 	// the playbook against all of them. Refuse rather than guess.
 	if len(ac.Spec.VMSelector) == 0 {
-		return fmt.Errorf("spec.vmSelector must not be empty: an empty selector would target every VM in the namespace")
+		return Result{}, fmt.Errorf("spec.vmSelector must not be empty: an empty selector would target every VM in the namespace")
 	}
 	if ac.Spec.Template.Type != TemplateTypeJob && ac.Spec.Template.Type != TemplateTypeWorkflow {
-		return fmt.Errorf("spec.template.type must be %q or %q, got %q", TemplateTypeJob, TemplateTypeWorkflow, ac.Spec.Template.Type)
+		return Result{}, fmt.Errorf("spec.template.type must be %q or %q, got %q", TemplateTypeJob, TemplateTypeWorkflow, ac.Spec.Template.Type)
 	}
 
 	vms, err := listVirtualMachines(ctx, client, ac.Namespace, ac.Spec.VMSelector)
 	if err != nil {
-		return fmt.Errorf("listing target VMs: %w", err)
+		return Result{}, fmt.Errorf("listing target VMs: %w", err)
 	}
 
 	// A hostName override renames the inventory host, so it can only
 	// apply to a single VM - across several matches they'd collide on
 	// one AWX host.
 	if ac.Spec.HostName != "" && len(vms) > 1 {
-		return fmt.Errorf("spec.hostName is set but vmSelector matches %d VMs: an inventory host name can only stand for one VM", len(vms))
+		return Result{}, fmt.Errorf("spec.hostName is set but vmSelector matches %d VMs: an inventory host name can only stand for one VM", len(vms))
 	}
 
-	children, err := listBindingChildren(ctx, client, ac.Namespace, ac.Name)
+	children, err := listBindingChildrenCached(ctx, client, ac.Namespace, ac.Name)
 	if err != nil {
-		return fmt.Errorf("listing the AnsibleBindingVMs for this binding: %w", err)
+		return Result{}, fmt.Errorf("listing the AnsibleBindingVMs for this binding: %w", err)
 	}
 	childByVM := map[string]AnsibleBindingVM{}
 	for _, c := range children {
@@ -92,8 +94,11 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 
 	triggerValue := ac.Annotations[ReconcileRequestedAtAnnotation]
 
+	var mu sync.Mutex
 	var firstErr error
 	recordErr := func(e error) {
+		mu.Lock()
+		defer mu.Unlock()
 		if firstErr == nil {
 			firstErr = e
 		}
@@ -101,6 +106,14 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 
 	matched := map[string]bool{}
 	createdThisPass := false
+
+	// The writes this pass wants, collected before any of them is
+	// issued. A generation bump across a binding matching thousands of
+	// VMs used to mean that many sequential Updates inside one reconcile
+	// - the exact shape the split existed to remove, reappearing one
+	// level up. Collecting them first is what lets the burst be bounded
+	// and the rest carried to the next pass.
+	var writes []func() error
 
 	for i := range vms {
 		vm := vms[i]
@@ -111,17 +124,21 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 
 		existing, ok := childByVM[name]
 		if !ok {
-			if cErr := createBindingChild(ctx, client, &ac, &vm, desired, legacy[name]); cErr != nil {
-				if apierrors.IsAlreadyExists(cErr) {
-					// Another pass got there first, or a child exists
-					// under this name for a different binding. Either way
-					// the next reconcile sees it in the list and decides.
-					continue
-				}
-				recordErr(fmt.Errorf("creating the AnsibleBindingVM for VM %q: %w", name, cErr))
-				continue
-			}
+			seed := legacy[name]
 			createdThisPass = true
+			writes = append(writes, func() error {
+				if cErr := createBindingChild(ctx, client, &ac, &vm, desired, seed); cErr != nil {
+					if apierrors.IsAlreadyExists(cErr) {
+						// Another pass got there first, or a child exists
+						// under this name for a different binding. Either
+						// way the next reconcile sees it in the list and
+						// decides.
+						return nil
+					}
+					return fmt.Errorf("creating the AnsibleBindingVM for VM %q: %w", name, cErr)
+				}
+				return nil
+			})
 			continue
 		}
 
@@ -136,9 +153,13 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 		if reflect.DeepEqual(*existing.Spec, desired) {
 			continue
 		}
-		if uErr := updateBindingChildSpec(ctx, client, existing.Namespace, existing.Name, desired); uErr != nil {
-			recordErr(fmt.Errorf("updating the AnsibleBindingVM for VM %q: %w", name, uErr))
-		}
+		childNamespace, childObjName := existing.Namespace, existing.Name
+		writes = append(writes, func() error {
+			if uErr := applyBindingChildSpec(ctx, client, childNamespace, childObjName, desired); uErr != nil {
+				return fmt.Errorf("updating the AnsibleBindingVM for VM %q: %w", name, uErr)
+			}
+			return nil
+		})
 	}
 
 	// A child whose VM no longer matches is deleted. Its own finalizer
@@ -151,10 +172,20 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 		if !c.DeletionTimestamp.IsZero() {
 			continue
 		}
-		if dErr := client.Resource(ansBindVMGVR).Namespace(c.Namespace).Delete(ctx, c.Name, metav1.DeleteOptions{}); dErr != nil && !apierrors.IsNotFound(dErr) {
-			recordErr(fmt.Errorf("deleting the AnsibleBindingVM for VM %q: %w", c.Spec.VMName, dErr))
-		}
+		child := c
+		writes = append(writes, func() error {
+			if dErr := client.Resource(ansBindVMGVR).Namespace(child.Namespace).Delete(ctx, child.Name, metav1.DeleteOptions{}); dErr != nil && !apierrors.IsNotFound(dErr) {
+				return fmt.Errorf("deleting the AnsibleBindingVM for VM %q: %w", child.Spec.VMName, dErr)
+			}
+			return nil
+		})
 	}
+
+	issued, wErr := issueChildWrites(writes)
+	if wErr != nil {
+		recordErr(wErr)
+	}
+	deferred := len(writes) - issued
 
 	summary := summarize(children, matched)
 
@@ -171,14 +202,107 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 		}
 	}
 
-	if !ansibleBindingDetailsCurrent(ac.Status, summary, ac.Generation, triggerValue, clearLegacy) {
-		if dErr := writeAnsibleBindingDetails(ctx, client, u, summary, ac.Generation, triggerValue, clearLegacy); dErr != nil {
+	// Orphan reaping is rare, destructive and costs an AWX request, so
+	// it runs on its own period rather than every pass - and never while
+	// writes are still outstanding, since the children that would claim
+	// those hosts do not exist yet.
+	orphanScan := ""
+	if ac.Status != nil {
+		orphanScan = ac.Status.LastOrphanScan
+	}
+	if due, _ := dueFor(orphanScan, orphanScanPeriod()); due && deferred == 0 && firstErr == nil {
+		if rErr := reapOrphanHosts(ctx, client, &ac, children, matched); rErr != nil {
+			recordErr(fmt.Errorf("reaping orphaned AWX hosts: %w", rErr))
+		} else {
+			orphanScan = nowRFC3339()
+		}
+	}
+
+	if !ansibleBindingDetailsCurrent(ac.Status, summary, ac.Generation, triggerValue, clearLegacy, orphanScan) {
+		if dErr := writeAnsibleBindingDetails(ctx, client, u, summary, ac.Generation, triggerValue, clearLegacy, orphanScan); dErr != nil {
 			log.Printf("[AnsibleBinding/%s/%s] failed to persist status: %v", ac.Namespace, ac.Name, dErr)
 			recordErr(dErr)
 		}
 	}
 
-	return firstErr
+	result := Result{Object: bindingWithDetails(u, summary, ac.Generation, triggerValue, clearLegacy, orphanScan)}
+	if deferred > 0 {
+		// Level-triggered, so the next pass simply recomputes what is
+		// still missing. Coming straight back keeps a large rollout
+		// moving rather than waiting on the resync.
+		log.Printf("[AnsibleBinding/%s/%s] issued %d child write(s), %d deferred to the next pass",
+			ac.Namespace, ac.Name, issued, deferred)
+		result.RequeueAfter = time.Second
+	}
+	return result, firstErr
+}
+
+// burstChildWrites bounds how many children one pass will create, update
+// or delete. Past it the rest is carried to the next pass, which is
+// bounded by --reconcile-timeout and would otherwise be spent entirely
+// on one binding.
+const burstChildWrites = 500
+
+// issueChildWrites runs up to burstChildWrites of the collected writes,
+// in parallel batches that double in size, and reports how many it
+// issued.
+//
+// This is ReplicaSet's slowStartBatch: a capped burst on its own just
+// moves the stall, because the writes are still sequential. Doubling
+// from a small first batch means a systematic failure - a webhook
+// rejecting every child, an exhausted quota - costs a handful of
+// requests rather than the whole burst.
+//
+// It differs from ReplicaSet's in one way: a batch that fails only in
+// part carries on. Stopping there would let one permanently broken VM
+// starve every VM ordered behind it, pass after pass, since the order is
+// stable. A batch in which everything failed is the systematic case, and
+// that still stops the burst.
+func issueChildWrites(writes []func() error) (int, error) {
+	remaining := len(writes)
+	if remaining > burstChildWrites {
+		remaining = burstChildWrites
+	}
+
+	var firstErr error
+	issued := 0
+	index := 0
+	for batchSize := min(remaining, 1); batchSize > 0; batchSize = min(2*batchSize, remaining) {
+		errCh := make(chan error, batchSize)
+		var wg sync.WaitGroup
+		wg.Add(batchSize)
+		for i := 0; i < batchSize; i++ {
+			go func(idx int) {
+				defer wg.Done()
+				if err := writes[idx](); err != nil {
+					errCh <- err
+				}
+			}(index + i)
+		}
+		wg.Wait()
+		close(errCh)
+
+		failures := 0
+		for err := range errCh {
+			failures++
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		index += batchSize
+		issued += batchSize
+		remaining -= batchSize
+		// A batch of more than one in which everything failed is the
+		// systematic case - a webhook rejecting every child, an
+		// exhausted quota - and stops the burst. The first batch is a
+		// single write, so this deliberately does not fire on it: one
+		// permanently broken VM at the front of the list would otherwise
+		// starve every VM behind it, pass after pass.
+		if batchSize > 1 && failures == batchSize {
+			return issued, firstErr
+		}
+	}
+	return issued, firstErr
 }
 
 // childSpecFor is the spec the binding wants on the child for one VM.
@@ -276,20 +400,62 @@ func adoptStatusFrom(v VMStatus) AnsibleBindingVMStatus {
 	}
 }
 
-func updateBindingChildSpec(ctx context.Context, client *dynamic.DynamicClient, namespace, name string, spec AnsibleBindingVMSpec) error {
+// childSpecFieldManager owns the child's spec. The parent applies the
+// spec and nothing else, so the labels, annotations and ownerReference
+// set at creation time - and the adopt-status annotation the child
+// clears for itself - are owned by another manager and left alone.
+const childSpecFieldManager = "ansible-supervisor-binding"
+
+// applyBindingChildSpec server-side-applies the spec the binding wants
+// on one child. The GET-then-Update it replaces was two round trips to
+// write one field set, per child, on every generation bump.
+func applyBindingChildSpec(ctx context.Context, client *dynamic.DynamicClient, namespace, name string, spec AnsibleBindingVMSpec) error {
 	specMap, err := structToMap(spec)
 	if err != nil {
 		return fmt.Errorf("encoding spec: %w", err)
 	}
-	current, err := client.Resource(ansBindVMGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-	if err := unstructured.SetNestedMap(current.Object, specMap, "spec"); err != nil {
-		return err
-	}
-	_, err = client.Resource(ansBindVMGVR).Namespace(namespace).Update(ctx, current, metav1.UpdateOptions{})
+	child := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": ansBindVMGVR.GroupVersion().String(),
+		"kind":       "AnsibleBindingVM",
+		"metadata": map[string]interface{}{
+			"name":      name,
+			"namespace": namespace,
+		},
+		"spec": specMap,
+	}}
+	_, err = client.Resource(ansBindVMGVR).Namespace(namespace).Apply(
+		ctx, name, child, metav1.ApplyOptions{FieldManager: childSpecFieldManager, Force: true},
+	)
 	return err
+}
+
+// listBindingChildrenCached lists a binding's children out of the
+// informer store, through the namespace-and-binding index, so the
+// parent's pass costs no API server read at all. The live list below is
+// kept for the two places that must not act on a stale answer: releasing
+// the binding's finalizer, and deleting an AWX host.
+func listBindingChildrenCached(ctx context.Context, client *dynamic.DynamicClient, namespace, bindingName string) ([]AnsibleBindingVM, error) {
+	if ansBindVMStore == nil {
+		return listBindingChildren(ctx, client, namespace, bindingName)
+	}
+	objs, err := ansBindVMStore.ByIndex(childrenByBindingIndex, key(namespace, bindingName))
+	if err != nil {
+		return listBindingChildren(ctx, client, namespace, bindingName)
+	}
+	out := make([]AnsibleBindingVM, 0, len(objs))
+	for _, obj := range objs {
+		u, cErr := toUnstructured(obj)
+		if cErr != nil {
+			continue
+		}
+		c, cErr := convertAnsibleBindingVM(u)
+		if cErr != nil {
+			return nil, fmt.Errorf("decoding AnsibleBindingVM %q: %w", u.GetName(), cErr)
+		}
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 func listBindingChildren(ctx context.Context, client *dynamic.DynamicClient, namespace, bindingName string) ([]AnsibleBindingVM, error) {
@@ -317,7 +483,20 @@ func listBindingChildren(ctx context.Context, client *dynamic.DynamicClient, nam
 func summarize(children []AnsibleBindingVM, matched map[string]bool) BindingSummary {
 	var s BindingSummary
 	for _, c := range children {
-		if c.Spec == nil || !matched[c.Spec.VMName] {
+		if c.Spec == nil {
+			continue
+		}
+		// A child being deleted is counted apart from the phases rather
+		// than dropped. Its VM is usually no longer matched - that is
+		// what deleted it - so without this a child wedged in
+		// Terminating disappears from the rollup entirely and the
+		// binding above it reads Ready while something underneath it
+		// retries forever.
+		if !c.DeletionTimestamp.IsZero() {
+			s.Terminating++
+			continue
+		}
+		if !matched[c.Spec.VMName] {
 			continue
 		}
 		s.Total++
@@ -357,11 +536,14 @@ func summarize(children []AnsibleBindingVM, matched map[string]bool) BindingSumm
 // summaryNameLimit bounds how many failing VM names the rollup lists.
 const summaryNameLimit = 3
 
-func ansibleBindingDetailsCurrent(prior *AnsibleBindingStatus, summary BindingSummary, observedGeneration int64, lastTrigger string, clearLegacy bool) bool {
+func ansibleBindingDetailsCurrent(prior *AnsibleBindingStatus, summary BindingSummary, observedGeneration int64, lastTrigger string, clearLegacy bool, lastOrphanScan string) bool {
 	if prior == nil {
 		return false
 	}
 	if prior.ObservedGeneration != observedGeneration || prior.LastAppliedTrigger != lastTrigger {
+		return false
+	}
+	if prior.LastOrphanScan != lastOrphanScan {
 		return false
 	}
 	if clearLegacy && len(prior.VMs) > 0 {
@@ -373,22 +555,169 @@ func ansibleBindingDetailsCurrent(prior *AnsibleBindingStatus, summary BindingSu
 	return reflect.DeepEqual(*prior.Summary, summary)
 }
 
-func writeAnsibleBindingDetails(ctx context.Context, client *dynamic.DynamicClient, obj *unstructured.Unstructured, summary BindingSummary, observedGeneration int64, lastTrigger string, clearLegacy bool) error {
+// ansibleBindingDetails is what this file's field manager owns in the
+// binding's status.
+func ansibleBindingDetails(summary BindingSummary, observedGeneration int64, lastTrigger string, clearLegacy bool, lastOrphanScan string) (map[string]interface{}, error) {
 	summaryMap, err := structToMap(summary)
 	if err != nil {
-		return fmt.Errorf("encoding the summary: %w", err)
+		return nil, fmt.Errorf("encoding the summary: %w", err)
 	}
 	statusData := map[string]interface{}{
 		"summary":            summaryMap,
 		"observedGeneration": observedGeneration,
 		"lastAppliedTrigger": lastTrigger,
 	}
+	if lastOrphanScan != "" {
+		statusData["lastOrphanScan"] = lastOrphanScan
+	}
 	if clearLegacy {
 		// Owned by this field manager, so applying an empty list removes
 		// the entries rather than merging with them.
 		statusData["vms"] = []interface{}{}
 	}
+	return statusData, nil
+}
+
+func writeAnsibleBindingDetails(ctx context.Context, client *dynamic.DynamicClient, obj *unstructured.Unstructured, summary BindingSummary, observedGeneration int64, lastTrigger string, clearLegacy bool, lastOrphanScan string) error {
+	statusData, err := ansibleBindingDetails(summary, observedGeneration, lastTrigger, clearLegacy, lastOrphanScan)
+	if err != nil {
+		return err
+	}
 	return patchStatus(ctx, client, ansBindGVR, obj, statusData, detailsFieldManager)
+}
+
+// bindingWithDetails is the binding as this pass leaves it: the object
+// it was given, with the rollup just written merged in, so the engine
+// can derive the aggregate state from it without re-reading the object
+// it was handed a moment ago.
+func bindingWithDetails(u *unstructured.Unstructured, summary BindingSummary, observedGeneration int64, lastTrigger string, clearLegacy bool, lastOrphanScan string) *unstructured.Unstructured {
+	out := u.DeepCopy()
+	details, err := ansibleBindingDetails(summary, observedGeneration, lastTrigger, clearLegacy, lastOrphanScan)
+	if err != nil {
+		return out
+	}
+	status, found, sErr := unstructured.NestedMap(out.Object, "status")
+	if !found || sErr != nil {
+		status = map[string]interface{}{}
+	}
+	for k, v := range details {
+		status[k] = v
+	}
+	if err := unstructured.SetNestedMap(out.Object, status, "status"); err != nil {
+		return u.DeepCopy()
+	}
+	return out
+}
+
+// reapOrphanHosts deletes AWX inventory hosts this binding owns that no
+// child accounts for.
+//
+// A leaked host is by definition one no child knows about, so no child
+// can find it - which is why this is the parent's job and not the
+// child's. The marker filter means only hosts this controller created
+// for this binding are ever considered; an adopted host carries no
+// marker and cannot be returned here.
+//
+// The candidate list is built from the cached children, and then
+// re-checked against a fresh list read from the API server immediately
+// before anything is deleted. Reaping is rare and destructive, which is
+// exactly when a quorum read is worth paying for: without it, a child
+// created moments ago but not yet in the cache would have the host it is
+// about to use deleted out from under a running playbook.
+func reapOrphanHosts(ctx context.Context, client *dynamic.DynamicClient, ac *AnsibleBinding, children []AnsibleBindingVM, matched map[string]bool) error {
+	if ac.Spec.CleanupPolicy == CleanupPolicyRetain {
+		return nil
+	}
+
+	inventories := map[int64]bool{}
+	for _, c := range children {
+		if c.Status != nil && c.Status.AWXInventoryID != 0 {
+			inventories[c.Status.AWXInventoryID] = true
+		}
+	}
+	if len(inventories) == 0 {
+		// No child has ever provisioned a host, so there is nothing this
+		// binding could have left behind - and no inventory to look in
+		// without resolving the template, which the parent no longer does.
+		return nil
+	}
+
+	awxConnObj, err := getAWXConnection(ctx, client, ac.Namespace, ac.Spec.AWXConnectionRef)
+	if err != nil {
+		return fmt.Errorf("fetching AWXConnection %q: %w", ac.Spec.AWXConnectionRef, err)
+	}
+	awxConn, err := convertAWXConnection(awxConnObj)
+	if err != nil || awxConn.Spec == nil {
+		return fmt.Errorf("decoding AWXConnection %q: %w", ac.Spec.AWXConnectionRef, err)
+	}
+	awxClient, _, err := awxClientForConnection(ctx, client, awxConn)
+	if err != nil {
+		return fmt.Errorf("preparing a client for AWXConnection %q: %w", ac.Spec.AWXConnectionRef, err)
+	}
+
+	marker := hostOwnerMarker(ac.Namespace, ac.Name)
+	claimed := claimedHostNames(ac, awxConn.Spec.HostNamePrefix, children, matched)
+
+	var candidates []hostResult
+	for inventory := range inventories {
+		hosts, lErr := awxClient.ListOwnedHosts(ctx, int(inventory), marker)
+		if lErr != nil {
+			return lErr
+		}
+		for name, h := range hosts {
+			if !claimed[name] {
+				candidates = append(candidates, h)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	fresh, err := listBindingChildren(ctx, client, ac.Namespace, ac.Name)
+	if err != nil {
+		return fmt.Errorf("re-reading the children before deleting an orphaned host: %w", err)
+	}
+	claimed = claimedHostNames(ac, awxConn.Spec.HostNamePrefix, fresh, matched)
+
+	for _, h := range candidates {
+		if claimed[h.Name] {
+			continue
+		}
+		log.Printf("[AnsibleBinding/%s/%s] deleting orphaned AWX host %q (id %d): owned by this binding, claimed by no VM",
+			ac.Namespace, ac.Name, h.Name, h.ID)
+		if dErr := awxClient.DeleteHost(ctx, h.ID); dErr != nil {
+			return fmt.Errorf("deleting orphaned AWX host %d: %w", h.ID, dErr)
+		}
+	}
+	return nil
+}
+
+// claimedHostNames is every inventory host name this binding can account
+// for: the one each child last recorded, and the one each currently
+// matched VM would be given. The second half covers the child that
+// exists but has not provisioned its host yet.
+func claimedHostNames(ac *AnsibleBinding, prefix string, children []AnsibleBindingVM, matched map[string]bool) map[string]bool {
+	claimed := map[string]bool{}
+	for _, c := range children {
+		if c.Status != nil && c.Status.AWXHostName != "" {
+			claimed[c.Status.AWXHostName] = true
+		}
+		if c.Spec != nil {
+			claimed[prefix+expectedHostName(ac, c.Spec.VMName)] = true
+		}
+	}
+	for vmName := range matched {
+		claimed[prefix+expectedHostName(ac, vmName)] = true
+	}
+	return claimed
+}
+
+func expectedHostName(ac *AnsibleBinding, vmName string) string {
+	if ac.Spec.HostName != "" {
+		return ac.Spec.HostName
+	}
+	return vmName
 }
 
 // cleanupAnsibleBinding deletes the binding's children and waits for
@@ -459,12 +788,14 @@ func updateAnsibleBindingStatus(u *unstructured.Unstructured, success bool, reco
 	if err != nil {
 		return status("Pending", fmt.Sprintf("Could not read the per-VM rollup: %s", err), false)
 	}
-	if ab.Status == nil || ab.Status.Summary == nil || ab.Status.Summary.Total == 0 {
+	if ab.Status == nil || ab.Status.Summary == nil || (ab.Status.Summary.Total == 0 && ab.Status.Summary.Terminating == 0) {
 		return status("Pending", "No VirtualMachines match vmSelector yet.", false)
 	}
 
 	s := ab.Status.Summary
 	switch {
+	case s.Total == 0 && s.Terminating > 0:
+		return status("Terminating", fmt.Sprintf("%d VM(s) still cleaning up.", s.Terminating), false)
 	case s.Failed > 0:
 		msg := fmt.Sprintf("%d of %d VM(s) failed their last run: %s.", s.Failed, s.Total, nameList(s.FailedVMs))
 		if s.FirstFailure != "" {
@@ -475,6 +806,11 @@ func updateAnsibleBindingStatus(u *unstructured.Unstructured, success bool, reco
 		return status("Running", fmt.Sprintf("%d of %d VM(s) still running.", s.Running, s.Total), false)
 	case s.Pending > 0:
 		return status("Pending", fmt.Sprintf("%d of %d VM(s) not ready to run (powered off, or no reported IP).", s.Pending, s.Total), false)
+	case s.Terminating > 0:
+		// Every matched VM is done, but something underneath is still
+		// being torn down. Ready would be a lie while a child is stuck
+		// on an AWX host that will not delete.
+		return status("Running", fmt.Sprintf("All %d VM(s) succeeded; %d child(ren) still cleaning up.", s.Total, s.Terminating), false)
 	default:
 		return status("Ready", fmt.Sprintf("All %d VM(s) completed the requested run successfully.", s.Total), true)
 	}

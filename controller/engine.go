@@ -37,6 +37,23 @@ const numWorkers = 8
 // whether provisioning just succeeded and any error it returned.
 type StatusUpdater func(*unstructured.Unstructured, bool, error) map[string]interface{}
 
+// Result is what a provisionFunc hands back to the engine.
+//
+// Object, when set, is the resource as provisioning left it: the copy it
+// was given, with the status it just wrote merged in. The engine derives
+// the generic state/message/ready from that rather than re-reading the
+// object from the API server, which is one round trip per resource per
+// pass that bought nothing - provisioning already knows what it wrote.
+//
+// RequeueAfter, when non-zero, asks for another pass after that delay.
+// The queue is a RateLimitingInterface, so AddAfter is already there;
+// this is the only thing that was missing to let a reconcile say "come
+// back in ten minutes" instead of needing its own resync period.
+type Result struct {
+	Object       *unstructured.Unstructured
+	RequeueAfter time.Duration
+}
+
 // Controller is a generic reconcile loop for one CRD kind: fetch by key,
 // manage a cleanup finalizer, call provisionFunc/cleanupFunc, patch
 // status. Every kind this service manages (AWXConnection,
@@ -52,11 +69,51 @@ type Controller struct {
 	// longer does. They are stripped on sight, so resources created by an
 	// older version of the controller stay deletable after an upgrade.
 	staleFinalizers  []string
-	provisionFunc    func(context.Context, *dynamic.DynamicClient, interface{}) error
+	provisionFunc    func(context.Context, *dynamic.DynamicClient, interface{}) (Result, error)
 	cleanupFunc      func(context.Context, *dynamic.DynamicClient, interface{}) error
 	updateStatusFunc StatusUpdater
 
+	// indexer is this kind's informer store. Reads below the workqueue
+	// go through it rather than to the API server: the informer already
+	// holds every object of this kind, kept current by watch, and a
+	// reconcile that re-derives the world from it is exactly as
+	// level-triggered as one that re-fetches - the guard against acting
+	// on a stale read is the conflict on the write (resourceVersion on
+	// the finalizer patch, retry in patchStatus), not the freshness of
+	// the read.
+	indexer cache.Indexer
+
 	Queue workqueue.RateLimitingInterface
+}
+
+// cachedGet reads one object of this controller's kind from the informer
+// store. A miss means the object is gone as far as this controller is
+// concerned; there is nothing to reconcile and nothing to patch.
+//
+// The returned object is a deep copy: the store's copy is shared with
+// every other reader of the informer and must never be mutated.
+func (c *Controller) cachedGet(ctx context.Context, namespace, name string) (*unstructured.Unstructured, error) {
+	if c.indexer == nil {
+		// No informer wired up (unit tests, and any future controller
+		// that runs without one) - fall back to the API server.
+		u, err := c.client.Resource(c.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return u, err
+	}
+	obj, exists, err := c.indexer.GetByKey(key(namespace, name))
+	if err != nil {
+		return nil, fmt.Errorf("reading %s from the informer cache: %w", key(namespace, name), err)
+	}
+	if !exists {
+		return nil, nil
+	}
+	u, err := toUnstructured(obj)
+	if err != nil {
+		return nil, err
+	}
+	return u.DeepCopy(), nil
 }
 
 // errCleanupPending wraps a finalization failure. The workqueue never
@@ -180,36 +237,58 @@ func patchStatus(ctx context.Context, client dynamic.Interface, gvr schema.Group
 	return fmt.Errorf("failed to apply status for %s/%s after %d attempts: %w", obj.GetNamespace(), obj.GetName(), maxRetries, lastErr)
 }
 
-// patchFinalizer adds or removes the finalizer using a JSON Merge Patch.
+// patchFinalizer rewrites metadata.finalizers, applying mutate to the
+// list the object currently carries, using a JSON Merge Patch.
+//
 // A merge patch on metadata.finalizers must carry the whole list, since
 // the array is replaced wholesale - which means a list read even
 // slightly out of date would silently drop another controller's
 // finalizer. Sending resourceVersion alongside it makes the API server
-// reject the patch with a conflict instead, and the reconcile retries
-// against a fresh read.
-func patchFinalizer(ctx context.Context, client dynamic.Interface, gvr schema.GroupVersionResource, obj *unstructured.Unstructured, finalizerName string, finalizers []string) error {
-	patchPayload := map[string]interface{}{
-		"metadata": map[string]interface{}{
-			"finalizers":      finalizers,
-			"resourceVersion": obj.GetResourceVersion(),
-		},
+// reject the patch with a conflict instead.
+//
+// The object in hand is now read from the informer cache, so a conflict
+// is an ordinary outcome rather than a rare one: retrying the pass would
+// only bring back the same stale copy. On conflict this re-reads the
+// object from the API server and applies the same intent to the list it
+// actually has - which is why mutate is a function of the current list
+// rather than a list computed by the caller.
+func patchFinalizer(ctx context.Context, client dynamic.Interface, gvr schema.GroupVersionResource, obj *unstructured.Unstructured, mutate func([]string) []string) error {
+	target := obj
+	for attempt := 0; ; attempt++ {
+		patchPayload := map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"finalizers":      mutate(target.GetFinalizers()),
+				"resourceVersion": target.GetResourceVersion(),
+			},
+		}
+		patchData, err := json.Marshal(patchPayload)
+		if err != nil {
+			return fmt.Errorf("marshaling finalizer patch: %w", err)
+		}
+		_, err = client.Resource(gvr).Namespace(target.GetNamespace()).Patch(
+			ctx, target.GetName(), types.MergePatchType, patchData, metav1.PatchOptions{},
+		)
+		if err == nil {
+			return nil
+		}
+		if !apierrors.IsConflict(err) || attempt > 0 {
+			return fmt.Errorf("patching finalizers on %s/%s: %w", target.GetNamespace(), target.GetName(), err)
+		}
+		fresh, getErr := client.Resource(gvr).Namespace(target.GetNamespace()).Get(ctx, target.GetName(), metav1.GetOptions{})
+		if getErr != nil {
+			return fmt.Errorf("re-reading %s/%s after a finalizer patch conflict: %w", target.GetNamespace(), target.GetName(), getErr)
+		}
+		target = fresh
 	}
-	patchData, err := json.Marshal(patchPayload)
-	if err != nil {
-		return fmt.Errorf("marshaling finalizer patch: %w", err)
-	}
-	_, err = client.Resource(gvr).Namespace(obj.GetNamespace()).Patch(
-		ctx, obj.GetName(), types.MergePatchType, patchData, metav1.PatchOptions{},
-	)
-	if err != nil {
-		return fmt.Errorf("patching finalizer %s on %s/%s: %w", finalizerName, obj.GetNamespace(), obj.GetName(), err)
-	}
-	return nil
 }
 
 func containsFinalizer(obj *unstructured.Unstructured, finalizerName string) bool {
-	for _, f := range obj.GetFinalizers() {
-		if f == finalizerName {
+	return containsString(obj.GetFinalizers(), finalizerName)
+}
+
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
 			return true
 		}
 	}
@@ -225,23 +304,45 @@ func removeString(slice []string, s string) (result []string) {
 	return
 }
 
-// desiredFinalizers is metadata.finalizers as this controller wants it:
-// its own finalizer present, and any finalizer it no longer manages
-// removed. Returns false if the list is already correct.
-func (c *Controller) desiredFinalizers(u *unstructured.Unstructured) ([]string, bool) {
-	desired := u.GetFinalizers()
-	changed := false
+// holdFinalizers is metadata.finalizers as this controller wants it
+// while the resource is alive: its own finalizer present, and any
+// finalizer it no longer manages removed.
+func (c *Controller) holdFinalizers(existing []string) []string {
+	desired := existing
+	for _, stale := range c.staleFinalizers {
+		desired = removeString(desired, stale)
+	}
+	if c.finalizerName != "" && !containsString(desired, c.finalizerName) {
+		desired = append(desired, c.finalizerName)
+	}
+	return desired
+}
+
+// releaseFinalizers is metadata.finalizers with everything this
+// controller holds taken off, for once cleanup has succeeded.
+func (c *Controller) releaseFinalizers(existing []string) []string {
+	remaining := existing
+	if c.finalizerName != "" {
+		remaining = removeString(remaining, c.finalizerName)
+	}
+	for _, stale := range c.staleFinalizers {
+		remaining = removeString(remaining, stale)
+	}
+	return remaining
+}
+
+// finalizersNeedUpdate reports whether the live resource is already
+// holding exactly what holdFinalizers wants.
+func (c *Controller) finalizersNeedUpdate(u *unstructured.Unstructured) bool {
+	if c.finalizerName != "" && !containsFinalizer(u, c.finalizerName) {
+		return true
+	}
 	for _, stale := range c.staleFinalizers {
 		if containsFinalizer(u, stale) {
-			desired = removeString(desired, stale)
-			changed = true
+			return true
 		}
 	}
-	if c.finalizerName != "" && !containsFinalizer(u, c.finalizerName) {
-		desired = append(desired, c.finalizerName)
-		changed = true
-	}
-	return desired, changed
+	return false
 }
 
 func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileResult error) {
@@ -260,14 +361,14 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 		if reconcileErr != nil {
 			log.Printf("%s DEFER STATUS UPDATE: patching status after error: %v\n", logPrefix, reconcileErr)
 
-			latestU, getErr := c.client.Resource(c.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+			latestU, getErr := c.cachedGet(ctx, namespace, name)
 			if getErr != nil {
-				if apierrors.IsNotFound(getErr) {
-					log.Printf("%s Status patch skipped: resource was deleted during defer execution.\n", logPrefix)
-					reconcileResult = reconcileErr
-					return
-				}
-				log.Printf("%s CRITICAL: failed to re-fetch object for status patch: %v. Returning original error.\n", logPrefix, getErr)
+				log.Printf("%s CRITICAL: failed to re-read object for status patch: %v. Returning original error.\n", logPrefix, getErr)
+				reconcileResult = reconcileErr
+				return
+			}
+			if latestU == nil {
+				log.Printf("%s Status patch skipped: resource was deleted during defer execution.\n", logPrefix)
 				reconcileResult = reconcileErr
 				return
 			}
@@ -293,7 +394,6 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 		// Everything this controller holds on the object comes off in one
 		// patch: its own finalizer once cleanup has actually succeeded,
 		// plus any finalizer an older version left behind.
-		remaining := u.GetFinalizers()
 		releasing := false
 
 		if c.finalizerName != "" && containsFinalizer(u, c.finalizerName) {
@@ -306,12 +406,10 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 					return reconcileErr
 				}
 			}
-			remaining = removeString(remaining, c.finalizerName)
 			releasing = true
 		}
 		for _, stale := range c.staleFinalizers {
 			if containsFinalizer(u, stale) {
-				remaining = removeString(remaining, stale)
 				releasing = true
 			}
 		}
@@ -321,7 +419,7 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 			return nil
 		}
 
-		if err := patchFinalizer(ctx, c.client, c.gvr, u, c.finalizerName, remaining); err != nil {
+		if err := patchFinalizer(ctx, c.client, c.gvr, u, c.releaseFinalizers); err != nil {
 			log.Printf("%s ERROR patching to remove finalizer: %v\n", logPrefix, err)
 			reconcileErr = &errCleanupPending{fmt.Errorf("finalizer removal patch failed: %w", err)}
 			return reconcileErr
@@ -330,10 +428,10 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 		return nil
 	}
 
-	if desired, changed := c.desiredFinalizers(u); changed {
-		log.Printf("%s Updating finalizers to %v.\n", logPrefix, desired)
+	if c.finalizersNeedUpdate(u) {
+		log.Printf("%s Updating finalizers to %v.\n", logPrefix, c.holdFinalizers(u.GetFinalizers()))
 
-		if err := patchFinalizer(ctx, c.client, c.gvr, u, c.finalizerName, desired); err != nil {
+		if err := patchFinalizer(ctx, c.client, c.gvr, u, c.holdFinalizers); err != nil {
 			log.Printf("%s ERROR patching finalizers: %v\n", logPrefix, err)
 			reconcileErr = fmt.Errorf("finalizer patch failed: %w", err)
 			return reconcileErr
@@ -364,22 +462,23 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 	}
 
 	log.Printf("%s Running normal reconciliation.\n", logPrefix)
-	if provisionErr := c.provisionFunc(ctx, c.client, obj); provisionErr != nil {
+	result, provisionErr := c.provisionFunc(ctx, c.client, obj)
+	if provisionErr != nil {
 		reconcileErr = fmt.Errorf("provisioning failed: %w", provisionErr)
 		return reconcileErr // defer handles the status update and returns the error for retry
 	}
 
-	// Re-read before computing the aggregate status: provisioning writes
-	// the detail fields a StatusUpdater derives state from (per-VM run
-	// outcomes, say), and the copy this reconcile started from predates
-	// them.
-	latestU, getErr := c.client.Resource(c.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
-	if getErr != nil {
-		if apierrors.IsNotFound(getErr) {
-			log.Printf("%s Status patch skipped: resource was deleted during reconciliation.\n", logPrefix)
-			return nil
-		}
-		return fmt.Errorf("re-fetching %s for status: %w", key(namespace, name), getErr)
+	// A StatusUpdater derives the generic state from the detail fields
+	// provisioning just wrote (per-VM run outcomes, say), so it needs an
+	// object that carries them. provisionFunc hands one back rather than
+	// the engine re-reading the object it was just given.
+	latestU := result.Object
+	if latestU == nil {
+		latestU = u
+	}
+
+	if result.RequeueAfter > 0 {
+		c.Queue.AddAfter(key(namespace, name), result.RequeueAfter)
 	}
 
 	statusMap := c.updateStatusFunc(latestU, true, nil)
@@ -394,7 +493,69 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 	return nil
 }
 
-func setupInformer(ctx context.Context, client dynamic.Interface, gvr schema.GroupVersionResource, controller *Controller, resyncPeriod time.Duration) cache.SharedIndexInformer {
+// watchChildren wakes the parent controller whenever one of its children
+// changes, mapping the child to its binding's key the way
+// EnqueueRequestForOwner does in controller-runtime.
+//
+// A Deployment does not poke a Pod, but it does watch every Pod it owns,
+// and that watch is what makes its status mean anything. The event
+// carries nothing but "look again": the parent's pass lists all its
+// children afresh and recomputes the whole summary, so losing an event
+// costs latency and the next resync repairs it. The workqueue dedupes by
+// key, so twenty children changing at once is one parent pass.
+func watchChildren(informer cache.SharedIndexInformer, parent *Controller) {
+	parentKeyOf := func(obj interface{}) (string, bool) {
+		if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+			obj = tombstone.Obj
+		}
+		u, err := toUnstructured(obj)
+		if err != nil {
+			return "", false
+		}
+		binding := u.GetLabels()[BindingLabel]
+		if binding == "" {
+			// A child whose label was edited off is exactly the case the
+			// parent most needs to hear about - it is the one that would
+			// otherwise never be reaped.
+			binding, _, _ = unstructured.NestedString(u.Object, "spec", "bindingName")
+		}
+		if binding == "" {
+			return "", false
+		}
+		return key(u.GetNamespace(), binding), true
+	}
+
+	enqueueParent := func(obj interface{}) {
+		if k, ok := parentKeyOf(obj); ok {
+			parent.Queue.Add(k)
+		}
+	}
+
+	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: enqueueParent,
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldU, oldErr := toUnstructured(oldObj)
+			newU, newErr := toUnstructured(newObj)
+			if oldErr == nil && newErr == nil && oldU.GetResourceVersion() == newU.GetResourceVersion() {
+				// A resync redelivery rather than a change. The parent
+				// resyncs on its own schedule; waking it again here would
+				// only duplicate that.
+				return
+			}
+			enqueueParent(newObj)
+		},
+		DeleteFunc: enqueueParent,
+	})
+}
+
+// setupInformer builds the shared informer for one kind and points its
+// controller at the resulting store, so reconciles read from the cache
+// the informer is already maintaining instead of re-fetching every
+// object it holds.
+func setupInformer(ctx context.Context, client dynamic.Interface, gvr schema.GroupVersionResource, controller *Controller, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
+	if indexers == nil {
+		indexers = cache.Indexers{}
+	}
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
@@ -406,8 +567,9 @@ func setupInformer(ctx context.Context, client dynamic.Interface, gvr schema.Gro
 		},
 		&unstructured.Unstructured{},
 		resyncPeriod,
-		cache.Indexers{},
+		indexers,
 	)
+	controller.indexer = informer.GetIndexer()
 
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {

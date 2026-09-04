@@ -70,6 +70,7 @@ imgpkg copy -b <bundle-ref-from-ansible-supervisor.yml> --to-repo your-repo.exam
 |-----------------|---------|-------------|
 | `resync_period` | `"60"`  | Periodic reconcile interval in seconds |
 | `reconcile_timeout` | `"300"` | Maximum seconds one reconcile of one resource may take. Bounds how long a binding matching many VMs can hold a worker against a slow AWX |
+| `host_check_period` | `"600"` | How often, in seconds, each VM's AWX inventory host is reconciled against AWX itself. Everything else in an idle pass is served from the controller's own caches, so this is what sets the steady-state AWX request rate - and it is the worst case for repairing a host deleted or edited by hand in the AWX UI. Lower it if hand edits in AWX are common; raise it if AWX is the bottleneck |
 | `namespace`     | `""`    | Namespace to deploy into (filled by the supervisor, do not edit) |
 | `supervisor_id` | `""`    | Identity stamped on AWX hosts this supervisor owns. Empty derives it from the `kube-system` namespace UID - set something readable (e.g. `sup-lab-01`) if you share one AWX between supervisors and want its inventory legible |
 
@@ -217,12 +218,14 @@ kubectl get ansiblebinding <name> -n <namespace> -o jsonpath='{.status}'
 | `total` | VMs currently matched by `vmSelector` |
 | `succeeded`, `running`, `pending`, `failed` | How many children are in each phase |
 | `failedVMs`, `firstFailure` | A bounded sample of the failing VMs and one of their messages, so "why is this binding red" is answerable without listing the children |
+| `terminating` | Children still being deleted. Counted apart from the phases and not included in `total`, so a child stuck on an AWX host that will not delete is visible rather than silently absent |
 
-The per-VM detail lives on one `AnsibleBindingVM` per matched VM, named `<binding>-<vm>`. The controller creates and deletes these; they are not something to write by hand.
+The per-VM detail lives on one `AnsibleBindingVM` per matched VM, named `<binding>-<vm>-<hash>` - the hash of the pair keeps two bindings whose names concatenate the same way from colliding, and keeps the name inside the 253-character limit when both halves are long. The controller creates and deletes these; they are not something to write by hand. Look them up by label rather than by name:
 
 ```bash
 kubectl get ansiblebindingvm -n <namespace> -l field.vmware.com/binding=<binding>
-kubectl get ansiblebindingvm <binding>-<vm> -n <namespace> -o jsonpath='{.status}'
+kubectl get ansiblebindingvm -n <namespace> -l field.vmware.com/binding=<binding> \
+  -o jsonpath='{.items[?(@.spec.vmName=="<vm>")].status}'
 ```
 
 | Field | Meaning |
@@ -232,9 +235,10 @@ kubectl get ansiblebindingvm <binding>-<vm> -n <namespace> -o jsonpath='{.status
 | `awxHostID`, `awxHostName`, `awxInventoryID`, `awxHostCreated` | The AWX inventory host, the name and inventory it lives under, and whether this controller owns it (adopted hosts are never deleted) |
 | `lastJobID`, `lastJobURL`, `lastJobStatus` | The most recent run and a link to its output in AWX |
 | `appliedGeneration`, `appliedTrigger` | What this VM last launched a run for - how re-run requests are tracked per VM |
+| `lastHostCheck` | When the inventory host was last reconciled against AWX. The next check is due `host_check_period` after it; passes in between cost no AWX requests at all |
 | `history` | Bounded log of recent runs (one entry per run) |
 
-Each child's `ownerReference` points at its `VirtualMachine`, so deleting a VM removes its child through ordinary garbage collection. A child whose VM merely stops matching the selector is deleted by the binding instead. Either way the child's own finalizer cleans up the AWX host first.
+Each child's `ownerReference` points at its `VirtualMachine`, so deleting a VM removes its child through ordinary garbage collection. That reference is also required: a child whose owner is missing, or names a different VM, is refused rather than reconciled, so a hand-written `AnsibleBindingVM` cannot launch playbooks nothing would ever clean up. A child whose VM merely stops matching the selector is deleted by the binding instead. Either way the child's own finalizer cleans up the AWX host first.
 
 Upgrading from a version before this split needs no action: the binding seeds each child from its old `status.vms[]` entry - including what that VM last ran - and clears the list once every VM has one. Nothing is re-launched.
 
