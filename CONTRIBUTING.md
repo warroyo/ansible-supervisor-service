@@ -8,7 +8,7 @@
 | `controller/manifests/crd.yml` | both CRDs; copied into `config/` at release time |
 | `config/` | ytt templates for the deployed service: `Deployment`, `ServiceAccount`, RBAC, values schema |
 | `examples/` | the three manifests a user applies |
-| `test/` | the e2e suite and its fake AWX server, plus `verify-supervisor.sh` - the live pre-release gate |
+| `test/` | the e2e suite and its fake AWX server, plus the live pre-release gate: `install-supervisor-service.sh` and `verify-supervisor.sh` |
 
 ## Testing
 
@@ -64,7 +64,20 @@ Nothing here is wired into a workflow. `make test-unit` and `make test-e2e` rema
 make dev-release DEV_VERSION=1.0.1-rc1
 ```
 
-**2. Install it.** Upload the generated `ansible-supervisor.yml` in vCenter under **Workload Management → Services**, or upgrade the existing service to this version.
+**2. Install it.** The Supervisor's own RBAC refuses even a full vSphere administrator the right to create CRDs, ClusterRoles, PackageInstalls, namespaces or ServiceAccounts, so `kubectl apply` is not a fallback here - the vCenter service-install path is the only way this service lands. Broadcom documents it as a UI flow, but the REST endpoints exist and are drivable, so it is scripted:
+
+```bash
+read -rs "P?vCenter password: " && printf '%s' "$P" > /tmp/vc_pw && unset P
+export VC_HOST=vc01.example.lab VC_USER=administrator@vsphere.local VC_PASSWORD_FILE=/tmp/vc_pw
+export KUBECONFIG=/path/to/supervisor.kubeconfig    # optional, enables the rollout check
+make install-supervisor-service DEV_VERSION=1.0.1-rc1
+```
+
+It probes whether this vCenter serves `/namespace-management/clusters` or `/supervisors` rather than assuming (the widely-circulated PowerShell example uses the latter, which 404s on some vCenters), registers the service if it is new or adds the version if it is not, then installs or upgrades in place. `refName` and version are read out of the generated package, so it cannot install a version the file does not contain. The password goes to curl through a config file on stdin, not `-u`, so it never appears in the process list.
+
+Two things worth knowing about the API: **every successful write returns an empty body** - no id, no confirmation, not even `{}` - so the script reads each one back rather than trusting the status code. And **`current_version` flips before the Deployment rolls**; it reflects the PackageInstall, not the workload, and has been seen reporting the new version with a 12-minute-old pod still on the old image. With `KUBECONFIG` set the script waits for the rollout; either way step 3 asserts the running digest, which is the real answer.
+
+The service installs cluster-wide into an auto-named `svc-<name>-<random>` namespace that you don't choose and that is stable across upgrades. Nothing lands in the tenant namespace you test in.
 
 **3. Validate against the live environment.**
 

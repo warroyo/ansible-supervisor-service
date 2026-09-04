@@ -13,9 +13,8 @@ test-e2e:
 #
 # The loop before cutting a tag:
 #
-#   make dev-release DEV_VERSION=1.0.1-rc1     # build, push, package
-#   # upload ansible-supervisor.yml in vCenter (Workload Management ->
-#   # Services), or upgrade the existing service to this version
+#   make dev-release DEV_VERSION=1.0.1-rc1              # build, push, package
+#   make install-supervisor-service DEV_VERSION=1.0.1-rc1   # register + upgrade
 #   make verify-supervisor DEV_VERSION=1.0.1-rc1 \
 #     SUPERVISOR_NS=my-ns AWX_URL=... AWX_TOKEN=... \
 #     AWX_TEMPLATE="Configure Webserver" VM_LABEL=app=webserver
@@ -31,6 +30,14 @@ dev-release:
 	@echo
 	@echo "ansible-supervisor.yml is built for $(DEV_VERSION)."
 	@echo "Install or upgrade the Supervisor service with it, then run: make verify-supervisor DEV_VERSION=$(DEV_VERSION) ..."
+
+# The Supervisor's RBAC refuses even a full vSphere administrator the
+# right to create CRDs, ClusterRoles, PackageInstalls, namespaces or
+# ServiceAccounts, so there is no `kubectl apply` shortcut here: the
+# vCenter service-install path is the only way this service lands. It is
+# scripted rather than clicked so the release loop is repeatable.
+install-supervisor-service:
+	test/install-supervisor-service.sh
 
 # EXPECT_IMAGE is resolved here rather than in the script so the check is
 # against the digest actually in the registry for this version - which is
