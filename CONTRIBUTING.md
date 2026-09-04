@@ -8,7 +8,7 @@
 | `controller/manifests/crd.yml` | both CRDs; copied into `config/` at release time |
 | `config/` | ytt templates for the deployed service: `Deployment`, `ServiceAccount`, RBAC, values schema |
 | `examples/` | the three manifests a user applies |
-| `test/` | the e2e suite and its fake AWX server, plus the live pre-release gate: `install-supervisor-service.sh` and `verify-supervisor.sh` |
+| `test/` | the e2e suite and its fake AWX server, plus the live pre-release gate: `install-supervisor-service.sh`, `fixture.sh`, `verify-supervisor.sh` |
 
 ## Testing
 
@@ -88,10 +88,22 @@ make verify-supervisor DEV_VERSION=1.0.1-rc1 \
   AWX_URL=https://awx.example.com \
   AWX_TOKEN=... \
   AWX_TEMPLATE="Configure Webserver" \
-  VM_LABEL=app=webserver
+  SSH_PUBLIC_KEY_FILE=~/.ssh/awx_ansible.pub
 ```
 
-`AWX_TEMPLATE` must have Prompt on Launch enabled for Limit and must have an inventory; `VM_LABEL` must match at least one powered-on VM that already reports an IP. Both are checked in a preflight pass before anything is created, so a misconfigured run fails in seconds rather than after an install.
+`AWX_TEMPLATE` must have Prompt on Launch enabled for Limit and must have an inventory. It is checked in a preflight pass before anything is created, so a misconfigured run fails in seconds rather than after an install.
+
+**The VM it runs against is part of the harness.** With no `VM_LABEL`, `verify-supervisor` creates its own fixture VM and destroys it afterwards, discovering the image, class and storage class from the namespace. It needs a public key whose private half AWX already holds in the Machine credential on the template:
+
+```bash
+export SSH_PUBLIC_KEY_FILE=~/.ssh/awx_ansible.pub
+```
+
+For a lab you own, `MANAGE_AWX_CREDENTIAL=1` instead generates a fresh keypair per run and writes the private half into that credential. It is destructive - the credential's previous private key is overwritten and cannot be read back first, so anything else authenticating with it breaks. `AWX_CREDENTIAL_ID` picks the credential explicitly when the template has more than one.
+
+Set `VM_LABEL` to point at a VM you manage yourself and the harness leaves fixtures alone entirely. `make test-fixture-up` / `make test-fixture-down` manage one by hand, which is worth doing when iterating: reusing a fixture across several verify runs saves the boot each time.
+
+An IP is not a running sshd - vm-operator reports the address while cloud-init is still writing `authorized_keys` - so the fixture waits `FIXTURE_SETTLE_SECONDS` (default 90) after the IP appears before handing over.
 
 What it asserts, in order:
 

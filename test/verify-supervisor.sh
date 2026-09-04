@@ -27,6 +27,7 @@
 # already reports an IP. Both are checked before anything is created.
 set -euo pipefail
 
+HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="$(mktemp -d)"
 KEEP=0
 for arg in "$@"; do
@@ -39,7 +40,16 @@ done
 : "${AWX_URL:?set AWX_URL to a reachable AWX/AAP instance}"
 : "${AWX_TOKEN:?set AWX_TOKEN to an API token for that instance}"
 : "${AWX_TEMPLATE:?set AWX_TEMPLATE to a job template name with Prompt on Launch for Limit}"
-: "${VM_LABEL:?set VM_LABEL to a key=value matching an existing powered-on VM}"
+
+# The VM to run against. Left unset, the harness creates and destroys its
+# own - the fixture is part of the gate rather than something built by
+# hand before each release. Set VM_LABEL to point at a VM you already
+# have and manage yourself.
+OWN_FIXTURE=0
+if [[ -z "${VM_LABEL:-}" ]]; then
+  OWN_FIXTURE=1
+  VM_LABEL="${FIXTURE_LABEL:-app=${FIXTURE_NAME:-ansible-verify-fixture}}"
+fi
 
 TEMPLATE_TYPE="${TEMPLATE_TYPE:-JobTemplate}"
 # EXPECT_IMAGE, when set, is the exact image reference the release under
@@ -75,6 +85,15 @@ cleanup() {
     kubectl delete secret "$SECRET" -n "$SUPERVISOR_NS" >/dev/null 2>&1 || true
   elif [[ $KEEP -eq 1 ]]; then
     log "--keep set: leaving $BINDING / $CONN / $SECRET in $SUPERVISOR_NS"
+  fi
+
+  # The fixture goes last: the binding's finalizer cleans up AWX hosts
+  # derived from the VM, so destroying the VM first would leave the
+  # binding reconciling against something that no longer exists.
+  if [[ $OWN_FIXTURE -eq 1 && $KEEP -eq 0 ]]; then
+    "${HARNESS_DIR}/fixture.sh" down || true
+  elif [[ $OWN_FIXTURE -eq 1 ]]; then
+    log "--keep set: leaving the fixture VM up. Remove it with test/fixture.sh down"
   fi
 
   rm -rf "$WORK_DIR"
@@ -154,6 +173,12 @@ TMPL_INVENTORY="$(echo "$TMPL_INFO" | sed -n 4p)"
 [[ "$TMPL_ASK_LIMIT" == "True" ]] || fail "template '$AWX_TEMPLATE' does not have Prompt on Launch enabled for Limit - the controller will refuse to launch it"
 [[ -n "$TMPL_INVENTORY" ]] || fail "template '$AWX_TEMPLATE' has no inventory, so no host is created and there is nothing to assert"
 log "template '$AWX_TEMPLATE' id=$TMPL_ID inventory=$TMPL_INVENTORY, Prompt on Launch for Limit is on"
+
+if [[ $OWN_FIXTURE -eq 1 ]]; then
+  log "no VM_LABEL given: bringing up the harness's own fixture VM"
+  SUPERVISOR_NS="$SUPERVISOR_NS" AWX_URL="$AWX_URL" AWX_TOKEN="$AWX_TOKEN" AWX_TEMPLATE="$AWX_TEMPLATE" \
+    "${HARNESS_DIR}/fixture.sh" up || fail "could not bring up the fixture VM"
+fi
 
 VM_COUNT="$(kubectl get virtualmachine -n "$SUPERVISOR_NS" -l "$VM_LABEL" -o json | jqp "len(d['items'])")"
 [[ "$VM_COUNT" -ge 1 ]] || fail "no VirtualMachine in $SUPERVISOR_NS matches $VM_LABEL"

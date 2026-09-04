@@ -39,6 +39,15 @@ dev-release:
 install-supervisor-service:
 	test/install-supervisor-service.sh
 
+# The VM verify-supervisor runs against. It creates and destroys this
+# itself, so these two are only for iterating: bring a fixture up once
+# and pass VM_LABEL to reuse it across several verify runs instead of
+# paying the boot time each time.
+test-fixture-up:
+	test/fixture.sh up
+test-fixture-down:
+	test/fixture.sh down
+
 # EXPECT_IMAGE is resolved here rather than in the script so the check is
 # against the digest actually in the registry for this version - which is
 # what catches a run validating a stale install.
