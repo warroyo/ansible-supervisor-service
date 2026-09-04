@@ -115,8 +115,7 @@ child_name() {    # child_name <binding> <vm> -> prints the AnsibleBindingVM's n
 }
 
 vm_field() {      # vm_field <binding> <vm> <status field> -> prints the value
-  # The per-VM detail that used to live in the binding's status.vms[] is
-  # now one AnsibleBindingVM per VM.
+  # The per-VM detail lives on one AnsibleBindingVM per VM.
   local name
   name=$(child_name "$1" "$2")
   [[ -n "$name" ]] || return 0
@@ -873,12 +872,13 @@ fi
 kubectl delete ansiblebindingvm e2e-handmade -n "$TEST_NS" --timeout=30s >/dev/null
 log "hand-made child refused and launched nothing"
 
-# --- upgrading a pre-split binding must not re-run anything ---
-# The migration hazard, tested directly: a child created for a VM that
-# already ran, without its previous appliedGeneration seeded, concludes it
-# has never run. Every VM under every binding would relaunch its playbook
-# the moment the new controller starts.
-log "checking an upgrade from a pre-split binding launches nothing"
+# --- a controller restart must not relaunch anything ---
+# A child records what it last ran for in its own status, so a restart
+# has to re-derive "this VM is already done" from the object rather than
+# from anything the process remembered. Getting this wrong relaunches
+# every playbook in the fleet the moment the controller comes back, which
+# is the single most expensive mistake this controller can make.
+log "checking a controller restart launches nothing"
 
 cat <<EOF | kubectl apply -f - >/dev/null
 apiVersion: vmoperator.vmware.com/v1alpha2
@@ -887,174 +887,65 @@ metadata:
   name: web-7
   namespace: ${TEST_NS}
   labels:
-    app: migrate
+    app: restart
 spec: {}
 status:
   powerState: PoweredOn
   network:
     primaryIP4: "10.0.0.77"
-EOF
-
-cat <<EOF | kubectl apply -f - >/dev/null
+---
 apiVersion: field.vmware.com/v1
 kind: AnsibleBinding
 metadata:
-  name: e2e-migrate
+  name: e2e-restart
   namespace: ${TEST_NS}
 spec:
   vmSelector:
-    app: migrate
+    app: restart
   awxConnectionRef: e2e-awx
   template:
     name: "Configure Webserver"
     type: JobTemplate
 EOF
 
-wait_for "migrate binding ran once" 60 bash -c \
-  "[[ \$(vm_field e2e-migrate web-7 phase) == Succeeded ]]"
+wait_for "the binding runs once" 60 bash -c \
+  "[[ \$(vm_field e2e-restart web-7 phase) == Succeeded ]]"
 
-MIG_HOST=$(vm_field e2e-migrate web-7 awxHostID)
-MIG_JOB=$(vm_field e2e-migrate web-7 lastJobID)
-MIG_GEN=$(vm_field e2e-migrate web-7 appliedGeneration)
-MIG_HOSTNAME=$(vm_field e2e-migrate web-7 awxHostName)
-log "provisioned: host=$MIG_HOST job=$MIG_JOB generation=$MIG_GEN"
+RESTART_HOST=$(vm_field e2e-restart web-7 awxHostID)
+RESTART_JOB=$(vm_field e2e-restart web-7 lastJobID)
+log "provisioned: host=$RESTART_HOST job=$RESTART_JOB"
 
-# Rewind to what the world looked like before the split: the AWX host
-# exists, the binding's status.vms[] describes it, and no child object
-# exists. The controller is stopped for this so it cannot recreate the
-# child from the selector before the legacy status is in place.
-log "stopping the controller to stage pre-split state"
+JOBS_BEFORE_RESTART=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
+
+log "restarting the controller"
 kill "$CONTROLLER_PID" 2>/dev/null || true
 wait "$CONTROLLER_PID" 2>/dev/null || true
 
-# Drop the finalizer first: with no controller running, deleting the child
-# outright would wedge it in Terminating, and letting its finalizer run
-# would delete the very AWX host the migration is supposed to adopt.
-MIG_CHILD=$(child_name e2e-migrate web-7)
-kubectl patch ansiblebindingvm "$MIG_CHILD" -n "$TEST_NS" --type=merge \
-  -p '{"metadata":{"finalizers":null}}' >/dev/null
-kubectl delete ansiblebindingvm "$MIG_CHILD" -n "$TEST_NS" --timeout=30s >/dev/null
-
-kubectl patch ansiblebinding e2e-migrate -n "$TEST_NS" --subresource=status --type=merge \
-  -p "{\"status\":{\"vms\":[{\"name\":\"web-7\",\"phase\":\"Succeeded\",\"awxHostID\":${MIG_HOST},\"awxHostName\":\"${MIG_HOSTNAME}\",\"awxHostCreated\":true,\"lastJobID\":${MIG_JOB},\"lastJobStatus\":\"successful\",\"appliedGeneration\":${MIG_GEN}}]}}" >/dev/null
-log "staged: status.vms[] restored, child removed, AWX host $MIG_HOST left in place"
-
-JOBS_BEFORE_MIGRATE=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
-
-log "restarting the controller - this is the upgrade"
 KUBECONFIG="$WORK_DIR/sa.kubeconfig" "$WORK_DIR/controller" --resync-period=2 --host-check-period=6 >> "$WORK_DIR/controller.log" 2>&1 &
 CONTROLLER_PID=$!
 wait_for "controller restarted" 30 bash -c \
   "[[ \$(grep -c 'controller started successfully' '$WORK_DIR/controller.log') -ge 2 ]]"
 
-wait_for "child recreated from the legacy entry" 60 bash -c \
-  "[[ -n \$(vm_field e2e-migrate web-7 lastJobID) ]]"
+# Several passes for it to relaunch in, if it were going to.
+sleep 8
 
-MIG_JOB_AFTER=$(vm_field e2e-migrate web-7 lastJobID)
-MIG_HOST_AFTER=$(vm_field e2e-migrate web-7 awxHostID)
-if [[ "$MIG_JOB_AFTER" != "$MIG_JOB" ]]; then
-  echo "migration relaunched: job went $MIG_JOB -> $MIG_JOB_AFTER"
+if [[ "$(vm_field e2e-restart web-7 lastJobID)" != "$RESTART_JOB" ]]; then
+  echo "the restart relaunched: job went $RESTART_JOB -> $(vm_field e2e-restart web-7 lastJobID)"
   exit 1
 fi
-if [[ "$MIG_HOST_AFTER" != "$MIG_HOST" ]]; then
-  echo "migration did not adopt the existing AWX host: $MIG_HOST -> $MIG_HOST_AFTER"
+if [[ "$(vm_field e2e-restart web-7 awxHostID)" != "$RESTART_HOST" ]]; then
+  echo "the restart did not recognise its own AWX host: $RESTART_HOST -> $(vm_field e2e-restart web-7 awxHostID)"
   exit 1
 fi
-
-# Give the resync a couple of passes to relaunch if it were going to.
-sleep 6
-JOBS_AFTER_MIGRATE=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
-if [[ "$JOBS_BEFORE_MIGRATE" != "$JOBS_AFTER_MIGRATE" ]]; then
-  echo "expected NO launches across the upgrade, but count went $JOBS_BEFORE_MIGRATE -> $JOBS_AFTER_MIGRATE"
+JOBS_AFTER_RESTART=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
+if [[ "$JOBS_BEFORE_RESTART" != "$JOBS_AFTER_RESTART" ]]; then
+  echo "expected NO launches across a restart, but the count went $JOBS_BEFORE_RESTART -> $JOBS_AFTER_RESTART"
   exit 1
 fi
-log "upgrade adopted host $MIG_HOST and job $MIG_JOB with zero new launches"
+log "restart kept host $RESTART_HOST and job $RESTART_JOB with zero new launches"
 
-wait_for "legacy status.vms cleared once every entry has a child" 60 bash -c \
-  "[[ \$(kubectl get ansiblebinding e2e-migrate -n ${TEST_NS} -o jsonpath='{.status.vms}') == '' || \$(kubectl get ansiblebinding e2e-migrate -n ${TEST_NS} -o jsonpath='{.status.vms}') == '[]' ]]"
-log "legacy per-VM status cleared"
-
-kubectl delete ansiblebinding e2e-migrate -n "$TEST_NS" --timeout=60s >/dev/null
-log "migrated binding deleted cleanly"
-
-# --- a pre-split entry with no VM and no child must still be cleaned ---
-# The migration seeds children from status.vms[], but only for VMs the
-# selector still matches. An entry for a VM that had already stopped
-# matching when the upgrade happened - which the pre-split controller
-# kept precisely because it had not managed to delete that host yet -
-# gets no child, so nothing would ever clean up its AWX host, and
-# status.vms[] could never be cleared either.
-log "checking a pre-split entry whose VM is gone is swept, not stranded"
-
-SUP_ID=$(grep -m1 'supervisor id:' "$WORK_DIR/controller.log" | awk '{print $3}')
-[[ -n "$SUP_ID" ]] || { echo "could not read the supervisor id from the controller log"; exit 1; }
-
-cat <<EOF | kubectl apply -f - >/dev/null
-apiVersion: vmoperator.vmware.com/v1alpha2
-kind: VirtualMachine
-metadata:
-  name: web-8
-  namespace: ${TEST_NS}
-  labels:
-    app: sweep
-spec: {}
-status:
-  powerState: PoweredOn
-  network:
-    primaryIP4: "10.0.0.88"
----
-apiVersion: field.vmware.com/v1
-kind: AnsibleBinding
-metadata:
-  name: e2e-sweep
-  namespace: ${TEST_NS}
-spec:
-  vmSelector:
-    app: sweep
-  awxConnectionRef: e2e-awx
-  template:
-    name: "Configure Webserver"
-    type: JobTemplate
-EOF
-
-wait_for "the sweep binding provisions its own VM" 60 bash -c \
-  "[[ -n \$(vm_field e2e-sweep web-8 awxHostID) ]]"
-LIVE_HOST=$(vm_field e2e-sweep web-8 awxHostID)
-
-# A host this binding owns, for a VM that no longer exists: exactly what
-# a pre-split entry left behind points at.
-GHOST_ID=$(curl -sf -X POST -H 'Content-Type: application/json' \
-  -d "{\"inventory\":1,\"name\":\"ghost-9\",\"description\":\"ansible-supervisor:${SUP_ID}:${TEST_NS}/e2e-sweep\"}" \
-  "http://${AWX_ADDR}/_test/hosts" | grep -o '"id":[0-9]*' | cut -d: -f2)
-
-# A second host with the same shape but owned by somebody else. Reading
-# the marker back before deleting is what keeps this one alive.
-FOREIGN_GHOST=$(curl -sf -X POST -H 'Content-Type: application/json' \
-  -d '{"inventory":1,"name":"ghost-10","description":"ansible-supervisor:other-supervisor:other-ns/other-binding"}' \
-  "http://${AWX_ADDR}/_test/hosts" | grep -o '"id":[0-9]*' | cut -d: -f2)
-
-kubectl patch ansiblebinding e2e-sweep -n "$TEST_NS" --subresource=status --type=merge \
-  -p "{\"status\":{\"vms\":[
-    {\"name\":\"ghost-9\",\"phase\":\"Succeeded\",\"awxHostID\":${GHOST_ID},\"awxHostName\":\"ghost-9\",\"awxHostCreated\":true},
-    {\"name\":\"ghost-10\",\"phase\":\"Succeeded\",\"awxHostID\":${FOREIGN_GHOST},\"awxHostName\":\"ghost-10\",\"awxHostCreated\":true}]}}" >/dev/null
-log "staged pre-split entries for ghost-9 (host $GHOST_ID, ours) and ghost-10 (host $FOREIGN_GHOST, another supervisor's)"
-
-wait_for "the stranded host is deleted" 60 host_deleted "$AWX_ADDR" "$GHOST_ID"
-wait_for "the stranded entries are cleared from status.vms" 60 bash -c \
-  "v=\$(kubectl get ansiblebinding e2e-sweep -n ${TEST_NS} -o jsonpath='{.status.vms}'); [[ -z \$v || \$v == '[]' ]]"
-
-if host_deleted "$AWX_ADDR" "$FOREIGN_GHOST"; then
-  echo "the sweep deleted host $FOREIGN_GHOST, which carries another supervisor's marker"
-  exit 1
-fi
-if host_deleted "$AWX_ADDR" "$LIVE_HOST"; then
-  echo "the sweep deleted the live host $LIVE_HOST"
-  exit 1
-fi
-log "stranded host cleaned up, another supervisor's left alone, live host untouched"
-
-kubectl delete ansiblebinding e2e-sweep -n "$TEST_NS" --timeout=60s >/dev/null
-wait_for "the sweep binding's own host is cleaned up" 30 host_deleted "$AWX_ADDR" "$LIVE_HOST"
-log "sweep binding deleted cleanly"
+kubectl delete ansiblebinding e2e-restart -n "$TEST_NS" --timeout=60s >/dev/null
+wait_for "the AWX host is cleaned up" 30 host_deleted "$AWX_ADDR" "$RESTART_HOST"
+log "restart binding deleted cleanly"
 
 log "ALL CHECKS PASSED"

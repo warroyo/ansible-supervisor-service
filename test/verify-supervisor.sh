@@ -344,10 +344,10 @@ except Exception:
 log "AWX host $HOST_ID exists with ansible_host=$HOST_IP, matching the live VM"
 
 # --- phase 3: an idle binding must cost nothing -----------------------
-# The reason this release exists. status.vms[].lastUpdated used to be
-# stamped every pass, so the object changed on every reconcile whether or
-# not anything happened, and every binding wrote to etcd once per resync
-# forever. Verified here rather than reasoned about.
+# The bug 1.0.1 fixed: a per-VM lastUpdated was stamped every pass, so
+# the object changed on every reconcile whether or not anything had
+# happened, and every binding wrote to etcd once per resync forever.
+# Verified here rather than reasoned about.
 
 log "phase 3: checking an idle binding goes quiet (${RESYNC}s resync)"
 RV_BEFORE="$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o jsonpath='{.metadata.resourceVersion}')"

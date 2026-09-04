@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"reflect"
@@ -19,7 +18,7 @@ import (
 )
 
 // detailsFieldManager owns status.summary/observedGeneration/
-// lastAppliedTrigger/vms. It's deliberately different from
+// lastAppliedTrigger/lastOrphanScan. It's deliberately different from
 // StatusFieldManager so the generic state/message/ready/lastUpdated
 // patch (applied by the engine after provisionFunc returns) never
 // clobbers these fields, and vice versa.
@@ -82,16 +81,6 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 		childByVM[c.Spec.VMName] = c
 	}
 
-	// Legacy per-VM entries from before the split. Their state is seeded
-	// into the child at creation so the upgrade does not re-run every
-	// playbook - see AdoptStatusAnnotation.
-	legacy := map[string]VMStatus{}
-	if ac.Status != nil {
-		for _, v := range ac.Status.VMs {
-			legacy[v.Name] = v
-		}
-	}
-
 	triggerValue := ac.Annotations[ReconcileRequestedAtAnnotation]
 
 	var mu sync.Mutex
@@ -105,7 +94,6 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 	}
 
 	matched := map[string]bool{}
-	createdThisPass := false
 
 	// The writes this pass wants, collected before any of them is
 	// issued. A generation bump across a binding matching thousands of
@@ -124,10 +112,8 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 
 		existing, ok := childByVM[name]
 		if !ok {
-			seed := legacy[name]
-			createdThisPass = true
 			writes = append(writes, func() error {
-				if cErr := createBindingChild(ctx, client, &ac, &vm, desired, seed); cErr != nil {
+				if cErr := createBindingChild(ctx, client, &ac, &vm, desired); cErr != nil {
 					if apierrors.IsAlreadyExists(cErr) {
 						// Another pass got there first, or a child exists
 						// under this name for a different binding. Either
@@ -189,54 +175,6 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 
 	summary := summarize(children, matched, ac.Generation, triggerValue)
 
-	// A legacy entry for a VM that no longer matches never gets a child -
-	// children are only created for matched VMs - so its AWX host would
-	// be cleaned up by nobody, and status.vms could never be cleared,
-	// leaving the migration permanently unfinished. These are exactly the
-	// entries the pre-split controller kept because it could not delete
-	// the host at the time (pendingCleanup), so the host is known to be
-	// outstanding rather than merely stale.
-	swept := map[string]bool{}
-	if len(legacy) > 0 {
-		var stranded []VMStatus
-		for name, entry := range legacy {
-			if matched[name] {
-				continue
-			}
-			if _, hasChild := childByVM[name]; hasChild {
-				continue
-			}
-			stranded = append(stranded, entry)
-		}
-		if len(stranded) > 0 {
-			done, sErr := cleanupLegacyHosts(ctx, client, &ac, stranded)
-			for _, name := range done {
-				swept[name] = true
-			}
-			if sErr != nil {
-				recordErr(fmt.Errorf("cleaning up pre-split AWX hosts: %w", sErr))
-			}
-		}
-	}
-
-	// status.vms is cleared only once every legacy entry has a child or
-	// has been swept, and never in the same pass that created one.
-	// Downgrading to a pre-split controller before then still finds the
-	// old state intact.
-	clearLegacy := len(legacy) > 0 && !createdThisPass
-	if clearLegacy {
-		for name := range legacy {
-			if _, ok := childByVM[name]; ok {
-				continue
-			}
-			if swept[name] {
-				continue
-			}
-			clearLegacy = false
-			break
-		}
-	}
-
 	// Orphan reaping is rare, destructive and costs an AWX request, so
 	// it runs on its own period rather than every pass - and never while
 	// writes are still outstanding, since the children that would claim
@@ -253,14 +191,14 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 		}
 	}
 
-	if !ansibleBindingDetailsCurrent(ac.Status, summary, ac.Generation, triggerValue, clearLegacy, orphanScan) {
-		if dErr := writeAnsibleBindingDetails(ctx, client, u, summary, ac.Generation, triggerValue, clearLegacy, orphanScan); dErr != nil {
+	if !ansibleBindingDetailsCurrent(ac.Status, summary, ac.Generation, triggerValue, orphanScan) {
+		if dErr := writeAnsibleBindingDetails(ctx, client, u, summary, ac.Generation, triggerValue, orphanScan); dErr != nil {
 			log.Printf("[AnsibleBinding/%s/%s] failed to persist status: %v", ac.Namespace, ac.Name, dErr)
 			recordErr(dErr)
 		}
 	}
 
-	result := Result{Object: bindingWithDetails(u, summary, ac.Generation, triggerValue, clearLegacy, orphanScan)}
+	result := Result{Object: bindingWithDetails(u, summary, ac.Generation, triggerValue, orphanScan)}
 	if deferred > 0 {
 		// Level-triggered, so the next pass simply recomputes what is
 		// still missing. Coming straight back keeps a large rollout
@@ -371,24 +309,10 @@ func childSpecFor(ac *AnsibleBinding, vmName, trigger string) AnsibleBindingVMSp
 // without the binding having to notice: the garbage collector resolves
 // owners by UID, so a VM deleted and recreated under the same name
 // collects the old child rather than handing it to the new VM.
-//
-// seed, when non-zero, is the VM's state under the pre-split binding. It
-// travels in an annotation because status is a subresource and cannot be
-// set at creation time; the child reads it on its first pass, before it
-// decides whether to launch anything.
-func createBindingChild(ctx context.Context, client *dynamic.DynamicClient, ac *AnsibleBinding, vm *unstructured.Unstructured, spec AnsibleBindingVMSpec, seed VMStatus) error {
+func createBindingChild(ctx context.Context, client *dynamic.DynamicClient, ac *AnsibleBinding, vm *unstructured.Unstructured, spec AnsibleBindingVMSpec) error {
 	specMap, err := structToMap(spec)
 	if err != nil {
 		return fmt.Errorf("encoding spec: %w", err)
-	}
-
-	annotations := map[string]interface{}{}
-	if seed.Name != "" {
-		seeded, sErr := json.Marshal(adoptStatusFrom(seed))
-		if sErr != nil {
-			return fmt.Errorf("encoding the migration seed: %w", sErr)
-		}
-		annotations[AdoptStatusAnnotation] = string(seeded)
 	}
 
 	meta := map[string]interface{}{
@@ -406,10 +330,6 @@ func createBindingChild(ctx context.Context, client *dynamic.DynamicClient, ac *
 			},
 		},
 	}
-	if len(annotations) > 0 {
-		meta["annotations"] = annotations
-	}
-
 	child := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": ansBindVMGVR.GroupVersion().String(),
 		"kind":       "AnsibleBindingVM",
@@ -421,30 +341,9 @@ func createBindingChild(ctx context.Context, client *dynamic.DynamicClient, ac *
 	return err
 }
 
-// adoptStatusFrom converts a pre-split per-VM entry into the child's
-// status. appliedGeneration and appliedTrigger are the fields that
-// matter: without them the child concludes it has never run.
-func adoptStatusFrom(v VMStatus) AnsibleBindingVMStatus {
-	return AnsibleBindingVMStatus{
-		ObservedIP:        v.ObservedIP,
-		Phase:             v.Phase,
-		AWXHostID:         v.AWXHostID,
-		AWXInventoryID:    v.AWXInventoryID,
-		AWXHostName:       v.AWXHostName,
-		AWXHostCreated:    v.AWXHostCreated,
-		LastJobID:         v.LastJobID,
-		LastJobURL:        v.LastJobURL,
-		LastJobStatus:     v.LastJobStatus,
-		AppliedGeneration: v.AppliedGeneration,
-		AppliedTrigger:    v.AppliedTrigger,
-		History:           v.History,
-	}
-}
-
 // childSpecFieldManager owns the child's spec. The parent applies the
-// spec and nothing else, so the labels, annotations and ownerReference
-// set at creation time - and the adopt-status annotation the child
-// clears for itself - are owned by another manager and left alone.
+// spec and nothing else, so the labels and ownerReference set at
+// creation time are owned by another manager and left alone.
 const childSpecFieldManager = "ansible-supervisor-binding"
 
 // applyBindingChildSpec server-side-applies the spec the binding wants
@@ -601,7 +500,7 @@ func summarize(children []AnsibleBindingVM, matched map[string]bool, wantGenerat
 // summaryNameLimit bounds how many failing VM names the rollup lists.
 const summaryNameLimit = 3
 
-func ansibleBindingDetailsCurrent(prior *AnsibleBindingStatus, summary BindingSummary, observedGeneration int64, lastTrigger string, clearLegacy bool, lastOrphanScan string) bool {
+func ansibleBindingDetailsCurrent(prior *AnsibleBindingStatus, summary BindingSummary, observedGeneration int64, lastTrigger string, lastOrphanScan string) bool {
 	if prior == nil {
 		return false
 	}
@@ -609,9 +508,6 @@ func ansibleBindingDetailsCurrent(prior *AnsibleBindingStatus, summary BindingSu
 		return false
 	}
 	if prior.LastOrphanScan != lastOrphanScan {
-		return false
-	}
-	if clearLegacy && len(prior.VMs) > 0 {
 		return false
 	}
 	if prior.Summary == nil {
@@ -622,7 +518,7 @@ func ansibleBindingDetailsCurrent(prior *AnsibleBindingStatus, summary BindingSu
 
 // ansibleBindingDetails is what this file's field manager owns in the
 // binding's status.
-func ansibleBindingDetails(summary BindingSummary, observedGeneration int64, lastTrigger string, clearLegacy bool, lastOrphanScan string) (map[string]interface{}, error) {
+func ansibleBindingDetails(summary BindingSummary, observedGeneration int64, lastTrigger string, lastOrphanScan string) (map[string]interface{}, error) {
 	summaryMap, err := structToMap(summary)
 	if err != nil {
 		return nil, fmt.Errorf("encoding the summary: %w", err)
@@ -635,16 +531,11 @@ func ansibleBindingDetails(summary BindingSummary, observedGeneration int64, las
 	if lastOrphanScan != "" {
 		statusData["lastOrphanScan"] = lastOrphanScan
 	}
-	if clearLegacy {
-		// Owned by this field manager, so applying an empty list removes
-		// the entries rather than merging with them.
-		statusData["vms"] = []interface{}{}
-	}
 	return statusData, nil
 }
 
-func writeAnsibleBindingDetails(ctx context.Context, client *dynamic.DynamicClient, obj *unstructured.Unstructured, summary BindingSummary, observedGeneration int64, lastTrigger string, clearLegacy bool, lastOrphanScan string) error {
-	statusData, err := ansibleBindingDetails(summary, observedGeneration, lastTrigger, clearLegacy, lastOrphanScan)
+func writeAnsibleBindingDetails(ctx context.Context, client *dynamic.DynamicClient, obj *unstructured.Unstructured, summary BindingSummary, observedGeneration int64, lastTrigger string, lastOrphanScan string) error {
+	statusData, err := ansibleBindingDetails(summary, observedGeneration, lastTrigger, lastOrphanScan)
 	if err != nil {
 		return err
 	}
@@ -655,9 +546,9 @@ func writeAnsibleBindingDetails(ctx context.Context, client *dynamic.DynamicClie
 // it was given, with the rollup just written merged in, so the engine
 // can derive the aggregate state from it without re-reading the object
 // it was handed a moment ago.
-func bindingWithDetails(u *unstructured.Unstructured, summary BindingSummary, observedGeneration int64, lastTrigger string, clearLegacy bool, lastOrphanScan string) *unstructured.Unstructured {
+func bindingWithDetails(u *unstructured.Unstructured, summary BindingSummary, observedGeneration int64, lastTrigger string, lastOrphanScan string) *unstructured.Unstructured {
 	out := u.DeepCopy()
-	details, err := ansibleBindingDetails(summary, observedGeneration, lastTrigger, clearLegacy, lastOrphanScan)
+	details, err := ansibleBindingDetails(summary, observedGeneration, lastTrigger, lastOrphanScan)
 	if err != nil {
 		return out
 	}
@@ -672,119 +563,6 @@ func bindingWithDetails(u *unstructured.Unstructured, summary BindingSummary, ob
 		return u.DeepCopy()
 	}
 	return out
-}
-
-// cleanupLegacyHosts deletes the AWX inventory hosts recorded in a
-// pre-split binding's status.vms[], for entries no child has taken over.
-//
-// Every other path to an AWX host now runs through a child's finalizer,
-// which is only reachable once a child exists. Two cases never get one:
-// a VM that had already stopped matching the selector when the upgrade
-// happened (the entry the pre-split controller was keeping precisely
-// because it had not managed to delete the host yet), and a binding
-// deleted before its first post-upgrade reconcile. Both would otherwise
-// leak the host silently.
-//
-// Returns the VM names it is finished with - deleted, adopted and so
-// never ours to delete, or retained on purpose - so the caller can stop
-// waiting on them. This whole path goes away with the rest of the
-// migration code, one release after the split.
-func cleanupLegacyHosts(ctx context.Context, client *dynamic.DynamicClient, ac *AnsibleBinding, entries []VMStatus) ([]string, error) {
-	var done []string
-	var needDeleting []VMStatus
-
-	retain := ac.Spec != nil && ac.Spec.CleanupPolicy == CleanupPolicyRetain
-	for _, e := range entries {
-		// Hosts that already existed and were only adopted are never
-		// deleted, and Retain leaves everything in place - in both cases
-		// there is nothing outstanding.
-		if e.AWXHostID == 0 || !e.AWXHostCreated || retain {
-			done = append(done, e.Name)
-			continue
-		}
-		needDeleting = append(needDeleting, e)
-	}
-	if len(needDeleting) == 0 {
-		return done, nil
-	}
-
-	abandon := func(reason string, err error) {
-		log.Printf("[AnsibleBinding/%s/%s] pre-split cleanup: %s, abandoning %d AWX host(s): %v",
-			ac.Namespace, ac.Name, reason, len(needDeleting), err)
-		for _, e := range needDeleting {
-			done = append(done, e.Name)
-		}
-	}
-
-	// Reached from the deletion path, which does not validate the spec -
-	// and a spec that names no connection leaves no way to reach AWX at
-	// all, so there is nothing to wait for.
-	if ac.Spec == nil || ac.Spec.AWXConnectionRef == "" {
-		abandon("the binding names no AWXConnection", nil)
-		return done, nil
-	}
-
-	awxConnObj, err := getAWXConnection(ctx, client, ac.Namespace, ac.Spec.AWXConnectionRef)
-	if err != nil {
-		if !isPermanent(err) {
-			return done, fmt.Errorf("fetching AWXConnection %q: %w", ac.Spec.AWXConnectionRef, err)
-		}
-		abandon(fmt.Sprintf("AWXConnection %q is gone", ac.Spec.AWXConnectionRef), err)
-		return done, nil
-	}
-	awxConn, err := convertAWXConnection(awxConnObj)
-	if err != nil || awxConn.Spec == nil {
-		abandon(fmt.Sprintf("AWXConnection %q is malformed", ac.Spec.AWXConnectionRef), err)
-		return done, nil
-	}
-	awxClient, _, err := awxClientForConnection(ctx, client, awxConn)
-	if err != nil {
-		if isPermanent(err) {
-			abandon("the AWX token is gone or the connection is malformed", err)
-			return done, nil
-		}
-		return done, fmt.Errorf("preparing a client for AWXConnection %q: %w", ac.Spec.AWXConnectionRef, err)
-	}
-
-	// A host ID is only meaningful on the instance that issued it, and a
-	// pre-split entry records no endpoint - the field did not exist - so
-	// there is nothing to compare a repointed connection against. Read
-	// each host back and check the ownership marker instead: it is
-	// carried by the host itself, so it answers "is the thing at this ID
-	// actually ours" on whichever instance the connection now names.
-	marker := hostOwnerMarker(ac.Namespace, ac.Name)
-	var firstErr error
-	for _, e := range needDeleting {
-		host, gErr := awxClient.GetHost(ctx, int(e.AWXHostID))
-		if gErr != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("reading pre-split AWX host %d back before deleting it: %w", e.AWXHostID, gErr)
-			}
-			continue
-		}
-		if host == nil {
-			// Already gone - by hand, or by a child that took this VM
-			// over between one pass and the next.
-			done = append(done, e.Name)
-			continue
-		}
-		if strings.TrimSpace(host.Description) != marker {
-			log.Printf("[AnsibleBinding/%s/%s] pre-split cleanup: AWX host %d is %q, owned by %q, not this binding - leaving it alone",
-				ac.Namespace, ac.Name, e.AWXHostID, host.Name, strings.TrimSpace(host.Description))
-			done = append(done, e.Name)
-			continue
-		}
-		if dErr := awxClient.DeleteHost(ctx, int(e.AWXHostID)); dErr != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("deleting pre-split AWX host %d: %w", e.AWXHostID, dErr)
-			}
-			continue
-		}
-		log.Printf("[AnsibleBinding/%s/%s] pre-split cleanup: deleted AWX host %d (%s)",
-			ac.Namespace, ac.Name, e.AWXHostID, e.Name)
-		done = append(done, e.Name)
-	}
-	return done, firstErr
 }
 
 // reapOrphanHosts deletes AWX inventory hosts this binding owns that no
@@ -936,24 +714,6 @@ func cleanupAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, o
 	}
 	if remaining > 0 {
 		return fmt.Errorf("waiting for %d AnsibleBindingVM(s) to finish cleaning up", remaining)
-	}
-
-	// Anything still recorded in the pre-split status.vms[] has no child
-	// to clean it up. Deleting a binding upgraded moments ago - or one
-	// whose VM stopped matching before the upgrade - would otherwise
-	// release the finalizer with those AWX hosts left behind, which is
-	// the leak the finalizer exists to prevent. Every child is gone by
-	// now, so a host a child already deleted is simply a 404 here.
-	if ac.Status != nil && len(ac.Status.VMs) > 0 {
-		outstanding := make([]VMStatus, 0, len(ac.Status.VMs))
-		outstanding = append(outstanding, ac.Status.VMs...)
-		done, sErr := cleanupLegacyHosts(ctx, client, &ac, outstanding)
-		if sErr != nil {
-			return fmt.Errorf("cleaning up pre-split AWX hosts: %w", sErr)
-		}
-		if len(done) < len(outstanding) {
-			return fmt.Errorf("waiting for %d pre-split AWX host(s) to be cleaned up", len(outstanding)-len(done))
-		}
 	}
 	return nil
 }

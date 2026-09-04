@@ -171,17 +171,17 @@ spec:
                   format: date-time
                 observedGeneration:
                   type: integer
-                  description: informational - the generation the controller most recently reconciled. relaunch decisions are made per VM, see vms[].appliedGeneration
+                  description: informational - the generation the controller most recently reconciled. relaunch decisions are made per VM, see each AnsibleBindingVM's status.appliedGeneration
                 lastAppliedTrigger:
                   type: string
-                  description: informational - the reconcile-requested-at annotation value the controller most recently saw. see vms[].appliedTrigger for what each VM actually ran
+                  description: informational - the reconcile-requested-at annotation value the controller most recently saw. see each AnsibleBindingVM's status.appliedTrigger for what each VM actually ran
                 lastOrphanScan:
                   type: string
                   format: date-time
                   description: when this binding last listed the AWX hosts it owns looking for ones no child claims. the scan costs an AWX request, so it runs on the controller's --host-check-period rather than every pass
                 summary:
                   type: object
-                  description: rollup of the AnsibleBindingVM children by phase. fixed size however many VMs the selector matches, which is what replaced the unbounded per-VM list below
+                  description: rollup of the AnsibleBindingVM children by phase. fixed size however many VMs the selector matches, so it stays writable at fleet scale
                   properties:
                     total:
                       type: integer
@@ -204,65 +204,6 @@ spec:
                     terminating:
                       type: integer
                       description: children being deleted, counted apart from the phases above and not included in total. a child wedged in Terminating would otherwise drop out of the rollup entirely and leave the binding reading Ready
-                vms:
-                  type: array
-                  description: deprecated - pre-split per-VM detail. nothing writes it any more; it is read once to seed the AnsibleBindingVM children and then cleared. see the ansiblebindingvms resource
-                  items:
-                    type: object
-                    properties:
-                      name:
-                        type: string
-                      observedIP:
-                        type: string
-                      phase:
-                        type: string
-                        description: Pending, Running, Succeeded, or Failed
-                      awxHostID:
-                        type: integer
-                        description: AWX inventory host ID for this VM, used to target launches and to drive cleanup
-                      awxInventoryID:
-                        type: integer
-                        description: AWX inventory the host above lives in, tracked so repointing the template at another inventory moves the host instead of leaving it behind
-                      awxHostName:
-                        type: string
-                        description: inventory host name last used for this VM, tracked so a rename retires the old host instead of orphaning it
-                      awxHostCreated:
-                        type: boolean
-                        description: whether this controller owns the AWX host. ownership is stamped into the host description in AWX so it survives this resource being deleted and recreated. hosts that already existed unmarked are adopted and never deleted
-                      pendingCleanup:
-                        type: boolean
-                        description: set when a VM no longer matches the selector but its AWX host could not be deleted yet. the entry is retained only so the deletion is retried
-                      appliedGeneration:
-                        type: integer
-                        description: spec generation this VM last launched a run for
-                      appliedTrigger:
-                        type: string
-                        description: reconcile-requested-at annotation value this VM last launched a run for
-                      lastJobID:
-                        type: integer
-                      lastJobURL:
-                        type: string
-                      lastJobStatus:
-                        type: string
-                      lastUpdated:
-                        type: string
-                        format: date-time
-                      history:
-                        type: array
-                        description: bounded log of recent runs for this VM, most recent first
-                        items:
-                          type: object
-                          properties:
-                            jobID:
-                              type: integer
-                            status:
-                              type: string
-                            startedAt:
-                              type: string
-                              format: date-time
-                            finishedAt:
-                              type: string
-                              format: date-time
       subresources:
         status: {}
       additionalPrinterColumns:

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"reflect"
@@ -12,7 +11,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 )
 
@@ -55,10 +53,7 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		return Result{}, err
 	}
 
-	prior, adopted, err := priorVMState(&child)
-	if err != nil {
-		return Result{}, err
-	}
+	prior := priorVMState(&child)
 
 	// st is what this pass will write. It starts as what the object
 	// already says, so a field this pass has no opinion about is carried
@@ -87,11 +82,6 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 			if wErr := writeAnsibleBindingVMDetails(ctx, client, u, st); wErr != nil {
 				log.Printf("[AnsibleBindingVM/%s/%s] failed to persist status: %v", child.Namespace, child.Name, wErr)
 				recordErr(wErr)
-			}
-		}
-		if adopted && firstErr == nil {
-			if cErr := clearAdoptAnnotation(ctx, client, u); cErr != nil {
-				log.Printf("[AnsibleBindingVM/%s/%s] failed to clear the adopt-status annotation: %v", child.Namespace, child.Name, cErr)
 			}
 		}
 		return Result{Object: childWithStatus(u, st), RequeueAfter: requeueAfter}, firstErr
@@ -248,8 +238,9 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 	hostName = awxConn.Spec.HostNamePrefix + hostName
 
 	// The ownership marker is keyed to the binding, not to this object,
-	// so a host provisioned before the split is adopted here unchanged
-	// rather than being seen as someone else's and refused.
+	// so a host survives its child being deleted and recreated - by a
+	// relabelled VM, say - and is adopted rather than refused as someone
+	// else's.
 	ownerMarker := hostOwnerMarker(child.Namespace, child.Spec.BindingName)
 
 	cleanupPolicy := child.Spec.CleanupPolicy
@@ -414,11 +405,9 @@ func childWithStatus(u *unstructured.Unstructured, st AnsibleBindingVMStatus) *u
 // re-run request is never consumed on behalf of a VM that did not act on
 // it - a job still in flight, or a powered-off VM.
 //
-// It is also what makes the migration safe. A child seeded from a
-// pre-split binding carries that VM's previous appliedGeneration, so
-// this returns false and the upgrade launches nothing. A child created
-// without the seed would have a zero LastJobID here and re-run every
-// playbook in the fleet at once.
+// It is also what makes a controller restart safe: the decision is made
+// from the child's own status rather than from anything the process
+// remembers, so coming back up relaunches nothing.
 func needsRun(st AnsibleBindingVMStatus, spec *AnsibleBindingVMSpec) bool {
 	return st.LastJobID == 0 ||
 		st.AppliedGeneration != spec.BindingGeneration ||
@@ -459,42 +448,12 @@ func checkTemplateLaunchFields(tmpl *AWXTemplate, name string, targetsHost, hasE
 	return nil
 }
 
-// priorVMState returns the status this pass should build on, and whether
-// it came from the migration annotation rather than from status itself.
-//
-// A child migrated from a pre-split binding is created with its prior
-// state in an annotation, because status is a subresource and cannot be
-// set at creation time. Reading it here - before any launch decision -
-// is what stops the upgrade re-running every playbook: the child has its
-// previous appliedGeneration in hand on its very first pass.
-func priorVMState(child *AnsibleBindingVM) (AnsibleBindingVMStatus, bool, error) {
-	if child.Status != nil && (child.Status.AWXHostID != 0 || child.Status.LastJobID != 0 || child.Status.Phase != "") {
-		return *child.Status, false, nil
+// priorVMState is the status this pass builds on.
+func priorVMState(child *AnsibleBindingVM) AnsibleBindingVMStatus {
+	if child.Status == nil {
+		return AnsibleBindingVMStatus{}
 	}
-	raw, ok := child.Annotations[AdoptStatusAnnotation]
-	if !ok || raw == "" {
-		if child.Status != nil {
-			return *child.Status, false, nil
-		}
-		return AnsibleBindingVMStatus{}, false, nil
-	}
-	var seeded AnsibleBindingVMStatus
-	if err := json.Unmarshal([]byte(raw), &seeded); err != nil {
-		return AnsibleBindingVMStatus{}, false, fmt.Errorf("decoding the %s annotation: %w: %w", AdoptStatusAnnotation, err, errPermanentConfig)
-	}
-	return seeded, true, nil
-}
-
-// clearAdoptAnnotation removes the migration seed once it has been
-// persisted into status, so it cannot be replayed over newer state.
-func clearAdoptAnnotation(ctx context.Context, client *dynamic.DynamicClient, obj *unstructured.Unstructured) error {
-	patch := []byte(fmt.Sprintf(`{"metadata":{"annotations":{%q:null}}}`, AdoptStatusAnnotation))
-	_, err := client.Resource(ansBindVMGVR).Namespace(obj.GetNamespace()).Patch(
-		ctx, obj.GetName(), types.MergePatchType, patch, metav1.PatchOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-	return nil
+	return *child.Status
 }
 
 // ansibleBindingVMDetailsCurrent reports whether status already says

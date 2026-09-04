@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -151,67 +150,30 @@ func TestSummarizeBoundsFailedNames(t *testing.T) {
 	}
 }
 
-// The single most dangerous bug available in this change: a child
-// created during migration without its previous appliedGeneration
-// concludes it has never run, and every VM under every binding
-// re-launches its playbook at once on upgrade.
-func TestMigratedChildDoesNotRelaunch(t *testing.T) {
-	legacy := VMStatus{
-		Name: "web-1", Phase: PhaseSucceeded,
-		AWXHostID: 55, AWXHostCreated: true, AWXHostName: "sup-web-1",
+// needsRun is what decides whether a VM launches, and it is the only
+// thing standing between a spec edit and a run that should not happen.
+func TestNeedsRunTracksTheRequestPerVM(t *testing.T) {
+	ran := AnsibleBindingVMStatus{
+		Phase: PhaseSucceeded, AWXHostID: 55, AWXHostCreated: true, AWXHostName: "sup-web-1",
 		LastJobID: 91, LastJobStatus: "successful",
 		AppliedGeneration: 4, AppliedTrigger: "t1",
 	}
 	spec := &AnsibleBindingVMSpec{BindingGeneration: 4, BindingTrigger: "t1"}
 
-	seeded := adoptStatusFrom(legacy)
-	if needsRun(seeded, spec) {
-		t.Fatal("a migrated child must not relaunch: the upgrade would re-run every playbook in the fleet")
+	if needsRun(ran, spec) {
+		t.Fatal("a VM that already ran this generation must not relaunch on every pass")
 	}
-
-	// The same child with no seed at all is exactly the failure above.
+	// A child that has never run is the one case that always launches -
+	// which is also why a child must never be created for a VM that has
+	// already been provisioned by something else.
 	if !needsRun(AnsibleBindingVMStatus{}, spec) {
-		t.Fatal("an unseeded child should look like it has never run - this guards the test above")
+		t.Fatal("a VM with no run recorded should launch - this guards the test above")
 	}
-
-	// A real change still gets through.
-	if !needsRun(seeded, &AnsibleBindingVMSpec{BindingGeneration: 5, BindingTrigger: "t1"}) {
+	if !needsRun(ran, &AnsibleBindingVMSpec{BindingGeneration: 5, BindingTrigger: "t1"}) {
 		t.Error("a new binding generation must reach the VM")
 	}
-	if !needsRun(seeded, &AnsibleBindingVMSpec{BindingGeneration: 4, BindingTrigger: "t2"}) {
+	if !needsRun(ran, &AnsibleBindingVMSpec{BindingGeneration: 4, BindingTrigger: "t2"}) {
 		t.Error("a new re-run trigger must reach the VM")
-	}
-}
-
-func TestPriorVMStateReadsTheAdoptAnnotation(t *testing.T) {
-	seed := AnsibleBindingVMStatus{LastJobID: 91, AppliedGeneration: 4, Phase: PhaseSucceeded}
-	raw, err := json.Marshal(seed)
-	if err != nil {
-		t.Fatalf("marshalling seed: %v", err)
-	}
-	child := &AnsibleBindingVM{}
-	child.Annotations = map[string]string{AdoptStatusAnnotation: string(raw)}
-
-	got, adopted, err := priorVMState(child)
-	if err != nil {
-		t.Fatalf("priorVMState: %v", err)
-	}
-	if !adopted {
-		t.Error("a child seeded from the annotation should report that it adopted")
-	}
-	if got.LastJobID != 91 || got.AppliedGeneration != 4 {
-		t.Errorf("seed not read: %+v", got)
-	}
-
-	// Real status always wins: the annotation is a one-time seed and must
-	// never be replayed over state the child has since written itself.
-	child.Status = &AnsibleBindingVMStatus{LastJobID: 92, AppliedGeneration: 5, Phase: PhaseRunning}
-	got, adopted, err = priorVMState(child)
-	if err != nil {
-		t.Fatalf("priorVMState: %v", err)
-	}
-	if adopted || got.LastJobID != 92 {
-		t.Errorf("existing status should win over the seed, got %+v (adopted=%v)", got, adopted)
 	}
 }
 
@@ -274,38 +236,25 @@ func TestAnsibleBindingDetailsCurrent(t *testing.T) {
 	summary := BindingSummary{Total: 2, Succeeded: 2}
 	prior := &AnsibleBindingStatus{ObservedGeneration: 3, LastAppliedTrigger: "t1", Summary: &summary}
 
-	if !ansibleBindingDetailsCurrent(prior, summary, 3, "t1", false, "") {
+	if !ansibleBindingDetailsCurrent(prior, summary, 3, "t1", "") {
 		t.Error("an identical rollup should be reported as current")
 	}
-	if ansibleBindingDetailsCurrent(nil, summary, 3, "t1", false, "") {
+	if ansibleBindingDetailsCurrent(nil, summary, 3, "t1", "") {
 		t.Error("a binding with no status yet is never current")
 	}
-	if ansibleBindingDetailsCurrent(prior, summary, 4, "t1", false, "") {
+	if ansibleBindingDetailsCurrent(prior, summary, 4, "t1", "") {
 		t.Error("a new generation is not current")
 	}
-	if ansibleBindingDetailsCurrent(prior, summary, 3, "t2", false, "") {
+	if ansibleBindingDetailsCurrent(prior, summary, 3, "t2", "") {
 		t.Error("a new re-run trigger is not current")
 	}
-	if ansibleBindingDetailsCurrent(prior, BindingSummary{Total: 2, Succeeded: 1, Failed: 1}, 3, "t1", false, "") {
+	if ansibleBindingDetailsCurrent(prior, BindingSummary{Total: 2, Succeeded: 1, Failed: 1}, 3, "t1", "") {
 		t.Error("a changed rollup is not current")
-	}
-
-	// Legacy entries still present and due to be cleared is itself a
-	// reason to write, or the migration never completes.
-	withLegacy := &AnsibleBindingStatus{
-		ObservedGeneration: 3, LastAppliedTrigger: "t1", Summary: &summary,
-		VMs: []VMStatus{{Name: "web-1"}},
-	}
-	if ansibleBindingDetailsCurrent(withLegacy, summary, 3, "t1", true, "") {
-		t.Error("a binding still carrying legacy vms[] is not current when they are due to be cleared")
-	}
-	if !ansibleBindingDetailsCurrent(withLegacy, summary, 3, "t1", false, "") {
-		t.Error("legacy vms[] that are not yet due to be cleared do not force a write")
 	}
 
 	// A completed orphan scan has to reach status, or the scan repeats
 	// on every pass and its AWX request stops being once per period.
-	if ansibleBindingDetailsCurrent(prior, summary, 3, "t1", false, "2026-01-01T00:00:00Z") {
+	if ansibleBindingDetailsCurrent(prior, summary, 3, "t1", "2026-01-01T00:00:00Z") {
 		t.Error("a fresh orphan scan timestamp is not current")
 	}
 }

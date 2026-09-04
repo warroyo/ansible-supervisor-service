@@ -76,7 +76,7 @@ const (
 	CleanupPolicyRetain = "Retain"
 )
 
-// Per-VM run phases, tracked in status.vms[].phase.
+// Per-VM run phases, tracked in an AnsibleBindingVM's status.phase.
 const (
 	PhasePending   = "Pending"
 	PhaseRunning   = "Running"
@@ -138,43 +138,6 @@ type VMRunHistoryEntry struct {
 // historyLimit bounds how many past runs are kept per VM.
 const historyLimit = 10
 
-// VMStatus is the per-VM run status for one VirtualMachine currently (or
-// formerly) matched by an AnsibleBinding's vmSelector.
-type VMStatus struct {
-	Name       string `json:"name"`
-	ObservedIP string `json:"observedIP,omitempty"`
-	Phase      string `json:"phase,omitempty"`
-	AWXHostID  int64  `json:"awxHostID,omitempty"`
-	// AWXInventoryID is the inventory the host above lives in. Tracked
-	// because the inventory comes from the AWX template, which can be
-	// repointed at a different one: without this the host would be left
-	// behind in the old inventory and a second one created in the new.
-	AWXInventoryID int64  `json:"awxInventoryID,omitempty"`
-	LastJobID      int64  `json:"lastJobID,omitempty"`
-	LastJobURL     string `json:"lastJobURL,omitempty"`
-	LastJobStatus  string `json:"lastJobStatus,omitempty"`
-	LastUpdated    string `json:"lastUpdated,omitempty"`
-	// AWXHostName is the inventory host name last used for this VM.
-	// Tracked so a rename (a changed hostNamePrefix or spec.hostName)
-	// can retire the old host instead of orphaning it.
-	AWXHostName string `json:"awxHostName,omitempty"`
-	// AWXHostCreated records whether this controller owns the AWX host.
-	// Ownership is stamped into the host's description in AWX, so it
-	// survives this CR being deleted and recreated. Hosts that already
-	// existed unmarked are adopted, never deleted.
-	AWXHostCreated bool `json:"awxHostCreated,omitempty"`
-	// PendingCleanup marks an entry whose VM no longer matches the
-	// selector but whose AWX host could not be deleted yet. It is kept
-	// in status purely so the deletion is retried instead of leaked.
-	PendingCleanup bool `json:"pendingCleanup,omitempty"`
-	// AppliedGeneration and AppliedTrigger record what this specific VM
-	// last launched a run for, so a spec change or re-run request made
-	// while a job was in flight isn't swallowed.
-	AppliedGeneration int64               `json:"appliedGeneration,omitempty"`
-	AppliedTrigger    string              `json:"appliedTrigger,omitempty"`
-	History           []VMRunHistoryEntry `json:"history,omitempty"`
-}
-
 type AnsibleBindingStatus struct {
 	State       string `json:"state,omitempty"`
 	Message     string `json:"message,omitempty"`
@@ -183,8 +146,8 @@ type AnsibleBindingStatus struct {
 	// ObservedGeneration and LastAppliedTrigger are informational: the
 	// generation and re-run request the controller most recently saw.
 	// The decision to (re)launch is made per VM, against the equivalent
-	// fields in VMStatus, so a request made while one VM's job is still
-	// in flight is not lost.
+	// fields in each child's status, so a request made while one VM's job
+	// is still in flight is not lost.
 	ObservedGeneration int64  `json:"observedGeneration,omitempty"`
 	LastAppliedTrigger string `json:"lastAppliedTrigger,omitempty"`
 	// Summary counts the AnsibleBindingVM children by phase. It is fixed
@@ -198,10 +161,6 @@ type AnsibleBindingStatus struct {
 	// AWX request, and a pass has to be able to work out whether one is
 	// due from the object rather than from process memory.
 	LastOrphanScan string `json:"lastOrphanScan,omitempty"`
-	// VMs is the pre-split per-VM detail. Nothing writes it any more; it
-	// is read once to seed the children during migration and then
-	// cleared. Removed a release after the split.
-	VMs []VMStatus `json:"vms,omitempty"`
 }
 
 // BindingSummary is the rollup a binding reports in place of per-VM
@@ -254,25 +213,13 @@ type AnsibleBindingVM struct {
 // selector rather than reading every child in the namespace.
 const BindingLabel = "field.vmware.com/binding"
 
-// AdoptStatusAnnotation carries a child's seed status at creation time,
-// as JSON, during migration from a pre-split AnsibleBinding.
-//
-// Status is a subresource, so a child cannot be created with one: it
-// would be created empty, and its first reconcile would see a VM that
-// has never run and launch the playbook again. Every VM under every
-// binding would re-run on upgrade. Seeding through an annotation the
-// child reads on its first pass closes that window entirely, because the
-// child has its prior appliedGeneration in hand before it decides
-// whether to launch anything. The child clears the annotation once the
-// status is persisted.
-const AdoptStatusAnnotation = "ansible.field.vmware.com/adopt-status"
-
 type AnsibleBindingVMSpec struct {
 	// VMName is the VirtualMachine in this namespace this object tracks.
 	VMName string `json:"vmName"`
 	// BindingName is the AnsibleBinding that owns this child. The AWX
-	// host ownership marker is keyed to it rather than to this object,
-	// so hosts provisioned before the split are adopted unchanged.
+	// host ownership marker is keyed to it rather than to this object, so
+	// a host outlives the child that made it and is adopted back rather
+	// than refused as another binding's.
 	BindingName string `json:"bindingName"`
 
 	// The rest is copied down from the binding at create time rather
@@ -298,12 +245,11 @@ type AnsibleBindingVMSpec struct {
 	BindingTrigger    string `json:"bindingTrigger,omitempty"`
 }
 
-// AnsibleBindingVMStatus is what VMStatus used to be, plus the generic
-// state/message/ready every CRD here carries.
+// AnsibleBindingVMStatus is one VM's inventory host and run, plus the
+// generic state/message/ready every CRD here carries.
 //
-// There is no pendingCleanup: the object itself is the record that a
-// cleanup is outstanding, since it sits in Terminating until its
-// finalizer clears.
+// Nothing marks a cleanup as outstanding: the object itself is that
+// record, since it sits in Terminating until its finalizer clears.
 type AnsibleBindingVMStatus struct {
 	State       string `json:"state,omitempty"`
 	Message     string `json:"message,omitempty"`

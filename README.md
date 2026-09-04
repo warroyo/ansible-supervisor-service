@@ -242,8 +242,6 @@ kubectl get ansiblebindingvm -n <namespace> -l field.vmware.com/binding=<binding
 
 Each child's `ownerReference` points at its `VirtualMachine`, so deleting a VM removes its child through ordinary garbage collection. That reference is also required: a child whose owner is missing, or names a different VM, is refused rather than reconciled, so a hand-written `AnsibleBindingVM` cannot launch playbooks nothing would ever clean up. A child whose VM merely stops matching the selector is deleted by the binding instead. Either way the child's own finalizer cleans up the AWX host first.
 
-Upgrading from a version before this split needs no action: the binding seeds each child from its old `status.vms[]` entry - including what that VM last ran - and clears the list once every VM has one. Nothing is re-launched.
-
 ## Uninstalling
 
 Delete your `AnsibleBinding` resources **while the controller is still running**, then remove the service. Each one carries a cleanup finalizer, so if the controller is gone first, the CRs hang in `Terminating` and deleting the CRD blocks indefinitely. (`AWXConnection` has no finalizer - it creates nothing outside Kubernetes - so it deletes whether the controller is running or not.) Recovery is to reinstall the controller and let it drain them, or to strip the finalizers by hand:

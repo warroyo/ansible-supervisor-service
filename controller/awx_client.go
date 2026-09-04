@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -235,26 +234,6 @@ func DetectAPIBasePath(ctx context.Context, baseURL string, opts TLSOptions) (st
 		trimmed, strings.Join(attempts, ", "))
 }
 
-// awxStatusError is a non-2xx response. Typed so a caller that cares
-// about one particular status - a 404 meaning "that host is gone" rather
-// than "AWX is broken" - can tell without matching on the message.
-type awxStatusError struct {
-	method string
-	path   string
-	status int
-	body   string
-}
-
-func (e *awxStatusError) Error() string {
-	return fmt.Sprintf("awx request %s %s: status %d: %s", e.method, e.path, e.status, e.body)
-}
-
-// awxStatusIs reports whether err is an AWX response with this status.
-func awxStatusIs(err error, status int) bool {
-	var e *awxStatusError
-	return errors.As(err, &e) && e.status == status
-}
-
 func (c *AWXClient) do(ctx context.Context, method, path string, body, out interface{}) error {
 	var reader io.Reader
 	if body != nil {
@@ -281,7 +260,7 @@ func (c *AWXClient) do(ctx context.Context, method, path string, body, out inter
 
 	respBody := readCappedBody(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &awxStatusError{method: method, path: path, status: resp.StatusCode, body: truncate(string(respBody), maxErrorBodyChars)}
+		return fmt.Errorf("awx request %s %s: status %d: %s", method, path, resp.StatusCode, truncate(string(respBody), maxErrorBodyChars))
 	}
 	if out != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, out); err != nil {
@@ -559,24 +538,6 @@ func (c *AWXClient) upsertHost(ctx context.Context, inventoryID int, hostname, o
 
 // DeleteHost removes a host by ID. A 404 is treated as success: the host
 // is already gone, which is the desired end state.
-// GetHost reads one host by id, returning nil if it no longer exists.
-//
-// Used before deleting a host whose id was recorded by an older version
-// of this controller: an id only means anything on the instance that
-// issued it, so the ownership marker on the host itself is what says
-// whether the thing at that id is really ours.
-func (c *AWXClient) GetHost(ctx context.Context, id int) (*hostResult, error) {
-	var h hostResult
-	err := c.do(ctx, http.MethodGet, fmt.Sprintf("%s/hosts/%d/", c.basePath, id), nil, &h)
-	if err != nil {
-		if awxStatusIs(err, http.StatusNotFound) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &h, nil
-}
-
 func (c *AWXClient) DeleteHost(ctx context.Context, id int) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, fmt.Sprintf("%s%s/hosts/%d/", c.baseURL, c.basePath, id), nil)
 	if err != nil {
