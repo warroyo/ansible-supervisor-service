@@ -14,6 +14,7 @@ Supervisor service that binds VM Service `VirtualMachine`s to AWX/Tower job and 
 - [CRD status](#crd-status)
 - [Uninstalling](#uninstalling)
 - [VCFA 9.x blueprints](VCFA-BLUEPRINTS.md) - driving this from a VCF Automation All Apps blueprint
+- [Argo CD](ARGOCD.md) - health checks, hooks and sync waves for these CRDs
 - [FAQ](FAQ.md) · [Contributing](CONTRIBUTING.md)
 
 ## How it works
