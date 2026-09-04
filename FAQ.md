@@ -92,6 +92,14 @@ spec:
 
 Host names are only inventory labels - the real address rides in `ansible_host` - so a prefix costs nothing but what `inventory_hostname` looks like inside playbooks. Changing the prefix later retires the old host entry rather than orphaning it.
 
+## Can a playbook run twice for one request?
+
+Rarely, yes: execution is at-least-once, not exactly-once.
+
+The controller launches the job in AWX and then records the job id in the `AnsibleBindingVM`'s status. If the process is killed in the window between those two - AWX has accepted the launch, the status write has not landed - the next reconcile sees a VM with no run recorded and launches again. AWX's launch endpoint takes no idempotency key, so there is nothing to make the second launch collapse into the first.
+
+The window is milliseconds wide and needs a crash inside it, but it is real, and it is the reason a provisioning playbook should be idempotent - which is the normal expectation of Ansible anyway. Nothing else in the controller re-launches on its own: a run already recorded is polled to completion, a re-run needs a generation bump or the annotation, and a VM that is powered off waits rather than retrying.
+
 ## I edited a host in the AWX UI. How long until the controller puts it back?
 
 Up to `host_check_period` (600s by default). Each VM's inventory host is reconciled against AWX itself - not against what the CR's status claims it pushed - so a host deleted, renamed or hand-edited in the AWX UI is drift like any other and is repaired. What changed is the cadence: the check runs on its own period rather than on every resync, because with one object per VM a per-pass check made the AWX request rate scale with the number of VMs rather than the number of bindings.

@@ -420,3 +420,42 @@ func TestMergeHostVariablesRefusesNonObjectVariables(t *testing.T) {
 		}
 	}
 }
+
+func TestGetHostSeparatesGoneFromBroken(t *testing.T) {
+	// The legacy cleanup path reads a host back before deleting it by an
+	// id an older controller recorded, so "no such host" has to be
+	// distinguishable from "AWX is unwell" - the second must not be read
+	// as permission to move on.
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/hosts/7/":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id": 7, "name": "web-1", "description": "ansible-supervisor:sup-a:ns/bind",
+			})
+		case "/api/v2/hosts/8/":
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+
+	host, err := c.GetHost(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("GetHost: %v", err)
+	}
+	if host == nil || host.Name != "web-1" {
+		t.Fatalf("expected the host back, got %+v", host)
+	}
+	if host.Description != "ansible-supervisor:sup-a:ns/bind" {
+		t.Errorf("the ownership marker must survive the read, got %q", host.Description)
+	}
+
+	host, err = c.GetHost(context.Background(), 8)
+	if err != nil || host != nil {
+		t.Fatalf("a deleted host is (nil, nil), got (%+v, %v)", host, err)
+	}
+
+	if _, err = c.GetHost(context.Background(), 9); err == nil {
+		t.Error("a 500 is not the same as a host that is gone, and must not be treated as one")
+	}
+}

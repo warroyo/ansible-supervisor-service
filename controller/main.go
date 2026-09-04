@@ -30,6 +30,8 @@ func main() {
 	reconcileTimeoutFlag := flag.Int("reconcile-timeout", 300, "maximum time one reconcile of one resource may take, in seconds, so a slow AWX cannot pin a worker indefinitely")
 	supervisorIDFlag := flag.String("supervisor-id", "", "identity stamped on AWX inventory hosts this supervisor owns, so one AWX instance can be shared by several supervisors (default: the kube-system namespace UID)")
 	hostCheckFlag := flag.Int("host-check-period", 600, "how often, in seconds, each VM's AWX inventory host is reconciled against AWX itself - the worst case for repairing a host deleted or edited by hand in the AWX UI, and what sets the steady-state AWX request rate")
+	apiQPSFlag := flag.Float64("api-qps", 50, "sustained requests per second this controller makes to the Kubernetes API server")
+	apiBurstFlag := flag.Int("api-burst", 100, "how far above --api-qps a burst of requests may go, e.g. creating children for a selector that suddenly matches many VMs")
 	flag.Parse()
 	resyncPeriod := time.Duration(*resync) * time.Second
 	reconcileTimeout = time.Duration(*reconcileTimeoutFlag) * time.Second
@@ -62,6 +64,18 @@ func main() {
 		config = inCluster
 		fmt.Println("using in-cluster config")
 	}
+
+	// client-go defaults to 5 QPS with a burst of 10, which is an
+	// interactive kubectl's budget rather than a controller's: one pass
+	// over a binding matching a few hundred VMs would spend minutes
+	// inside the client's own rate limiter, and the parallel child writes
+	// below would be parallel only in the sense that they wait at the
+	// same time. The API server has its own priority-and-fairness
+	// protection, so the honest thing is to ask for what the work needs
+	// and let the server shed it if it must.
+	config.QPS = float32(*apiQPSFlag)
+	config.Burst = *apiBurstFlag
+	fmt.Printf("api rate limit: %g qps, burst %d\n", config.QPS, config.Burst)
 
 	dynClient, err := dynamic.NewForConfig(config)
 	if err != nil {

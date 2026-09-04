@@ -317,6 +317,13 @@ type AnsibleBindingVMStatus struct {
 	AWXInventoryID int64  `json:"awxInventoryID,omitempty"`
 	AWXHostName    string `json:"awxHostName,omitempty"`
 	AWXHostCreated bool   `json:"awxHostCreated,omitempty"`
+	// AWXEndpoint identifies the AWX instance the ids above came from.
+	// They are only meaningful there: repoint the AWXConnection at a
+	// different instance and the same numeric id belongs to some
+	// unrelated host, which cleanup would then delete. When this stops
+	// matching, the recorded ids are dropped rather than acted on and the
+	// host is looked up again by name on the new instance.
+	AWXEndpoint string `json:"awxEndpoint,omitempty"`
 
 	LastJobID     int64  `json:"lastJobID,omitempty"`
 	LastJobURL    string `json:"lastJobURL,omitempty"`

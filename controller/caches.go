@@ -91,7 +91,7 @@ func awxClientForConnection(ctx context.Context, client *dynamic.DynamicClient, 
 	if conn.Spec == nil {
 		return nil, "", fmt.Errorf("AWXConnection %q has no spec: %w", conn.Name, errPermanentConfig)
 	}
-	cacheKey := fmt.Sprintf("%s/%s/%s", conn.Namespace, conn.Name, conn.ResourceVersion)
+	cacheKey := connectionKey(conn)
 
 	awxClientMu.Lock()
 	entry, ok := awxClientCache[cacheKey]
@@ -140,17 +140,25 @@ var (
 	templateCache = map[string]templateCacheEntry{}
 )
 
-// templateCacheKey includes the connection's NAMESPACE. AWXConnection is
-// namespaced, so a key of connection-name plus template-name collides
-// across tenants and would hand one namespace another's template ID.
-func templateCacheKey(namespace, connName string, ref TemplateRef) string {
-	return fmt.Sprintf("%s/%s/%s/%s", namespace, connName, ref.Type, ref.Name)
+// connectionKey identifies one version of one connection. The namespace
+// is in it because AWXConnection is namespaced, and a key of
+// connection-name alone collides across tenants - which for the template
+// cache would hand one namespace another's template id. The
+// resourceVersion is in it because a template id is only meaningful on
+// the instance that issued it: edit spec.url and every id cached under
+// the old key is about a different AWX.
+func connectionKey(conn AWXConnection) string {
+	return fmt.Sprintf("%s/%s/%s", conn.Namespace, conn.Name, conn.ResourceVersion)
+}
+
+func templateCacheKey(connKey string, ref TemplateRef) string {
+	return fmt.Sprintf("%s/%s/%s", connKey, ref.Type, ref.Name)
 }
 
 // resolveTemplateCached resolves a template for work that only needs its
 // inventory - the per-VM host check. Launches do not come through here.
-func resolveTemplateCached(ctx context.Context, awxClient *AWXClient, namespace, connName string, ref TemplateRef) (*AWXTemplate, error) {
-	k := templateCacheKey(namespace, connName, ref)
+func resolveTemplateCached(ctx context.Context, awxClient *AWXClient, connKey string, ref TemplateRef) (*AWXTemplate, error) {
+	k := templateCacheKey(connKey, ref)
 
 	templateMu.Lock()
 	entry, ok := templateCache[k]
@@ -174,12 +182,12 @@ func resolveTemplateCached(ctx context.Context, awxClient *AWXClient, namespace,
 // the flags it is given: a cached template would leave a window in which
 // the controller launched a run AWX would silently widen to the whole
 // inventory.
-func resolveTemplateForLaunch(ctx context.Context, awxClient *AWXClient, namespace, connName string, ref TemplateRef) (*AWXTemplate, error) {
+func resolveTemplateForLaunch(ctx context.Context, awxClient *AWXClient, connKey string, ref TemplateRef) (*AWXTemplate, error) {
 	tmpl, err := resolveTemplate(ctx, awxClient, ref)
 	if err != nil {
 		return nil, err
 	}
-	cacheTemplate(templateCacheKey(namespace, connName, ref), tmpl)
+	cacheTemplate(templateCacheKey(connKey, ref), tmpl)
 	return tmpl, nil
 }
 

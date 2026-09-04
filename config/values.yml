@@ -14,6 +14,14 @@ namespace: ""
 #! it is the worst case for repairing a host deleted or edited by hand in the AWX
 #! UI.
 host_check_period: "600"
+#! sustained requests per second, and burst above it, this controller makes to
+#! the Kubernetes API server. client-go's own defaults (5/10) are an
+#! interactive kubectl's budget, not a controller's: one pass over a binding
+#! matching hundreds of VMs would spend minutes inside the client's rate
+#! limiter. The API server's priority-and-fairness protection is what actually
+#! bounds this.
+api_qps: "50"
+api_burst: "100"
 #! identity stamped on AWX inventory hosts this supervisor owns, so one AWX
 #! instance can be shared by several supervisors without them fighting over
 #! host entries. leave empty to derive it from the kube-system namespace UID.

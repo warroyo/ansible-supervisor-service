@@ -74,30 +74,35 @@ func TestChildRefusesAnOwnerThatIsNotItsVM(t *testing.T) {
 			Spec:       &AnsibleBindingVMSpec{VMName: "web-1", BindingName: "bind"},
 		}
 	}
-	vmRef := metav1.OwnerReference{APIVersion: vmGroup + "/v1alpha2", Kind: "VirtualMachine", Name: "web-1"}
+	vmRef := metav1.OwnerReference{APIVersion: vmGroup + "/v1alpha2", Kind: "VirtualMachine", Name: "web-1", UID: "vm-uid-1"}
 
-	if err := checkOwnedByItsVM(child(vmRef)); err != nil {
+	uid, err := checkOwnedByItsVM(child(vmRef))
+	if err != nil {
 		t.Errorf("a child owned by its own VM must reconcile: %v", err)
 	}
-	if err := checkOwnedByItsVM(child()); err == nil {
+	if uid != "vm-uid-1" {
+		t.Errorf("expected the owner UID back so the VM read can be checked against it, got %q", uid)
+	}
+	if _, err := checkOwnedByItsVM(child()); err == nil {
 		t.Error("a child with no owner at all must be refused")
 	}
 	// The case a presence check would miss: a real ownerReference to a
 	// real VirtualMachine that is not this child's VM.
 	other := vmRef
 	other.Name = "web-2"
-	if err := checkOwnedByItsVM(child(other)); err == nil {
+	if _, err := checkOwnedByItsVM(child(other)); err == nil {
 		t.Error("an ownerReference naming another VM must be refused")
 	}
 	wrongGroup := vmRef
 	wrongGroup.APIVersion = "apps/v1"
-	if err := checkOwnedByItsVM(child(wrongGroup)); err == nil {
+	if _, err := checkOwnedByItsVM(child(wrongGroup)); err == nil {
 		t.Error("an ownerReference to a VirtualMachine in another API group must be refused")
 	}
-	if err := checkOwnedByItsVM(child(wrongGroup, vmRef)); err != nil {
+	if _, err := checkOwnedByItsVM(child(wrongGroup, vmRef)); err != nil {
 		t.Errorf("one valid reference among several is enough: %v", err)
 	}
-	if !isPermanent(checkOwnedByItsVM(child())) {
+	_, noOwner := checkOwnedByItsVM(child())
+	if !isPermanent(noOwner) {
 		t.Error("a hand-made child is a configuration error, not something to retry forever")
 	}
 }
@@ -119,7 +124,7 @@ func TestSummarizeCountsTerminatingChildrenSeparately(t *testing.T) {
 			Status:     &AnsibleBindingVMStatus{Phase: PhaseSucceeded},
 		},
 	}
-	s := summarize(children, map[string]bool{"web-1": true})
+	s := summarize(children, map[string]bool{"web-1": true}, 0, "")
 	if s.Total != 1 || s.Succeeded != 1 {
 		t.Errorf("expected the live child to be counted once, got %+v", s)
 	}
@@ -282,5 +287,82 @@ func TestClaimedHostNamesCoversChildrenAndMatchedVMs(t *testing.T) {
 	renamed := claimedHostNames(ac, "new-", children, map[string]bool{"web-1": true})
 	if !renamed["sup-web-1"] {
 		t.Error("the host name a child last recorded stays claimed across a rename")
+	}
+}
+
+func TestSummarizeCountsAChildOnAnOldGenerationAsPending(t *testing.T) {
+	// The parent updates child specs and then summarizes the children as
+	// they were before the update. Without this, a spec edit leaves the
+	// binding Ready - with observedGeneration already bumped - describing
+	// a run that answered the previous request.
+	children := []AnsibleBindingVM{
+		{
+			Spec:   &AnsibleBindingVMSpec{VMName: "web-1"},
+			Status: &AnsibleBindingVMStatus{Phase: PhaseSucceeded, AppliedGeneration: 3, AppliedTrigger: "t1"},
+		},
+	}
+	matched := map[string]bool{"web-1": true}
+
+	if got := summarize(children, matched, 3, "t1"); got.Succeeded != 1 || got.Pending != 0 {
+		t.Errorf("a child on the current generation counts as succeeded, got %+v", got)
+	}
+	if got := summarize(children, matched, 4, "t1"); got.Pending != 1 || got.Succeeded != 0 {
+		t.Errorf("a new generation must put the binding back to pending, got %+v", got)
+	}
+	if got := summarize(children, matched, 3, "t2"); got.Pending != 1 || got.Succeeded != 0 {
+		t.Errorf("a new re-run trigger must put the binding back to pending, got %+v", got)
+	}
+
+	// A failed run on an old generation is about to be retried, so it is
+	// pending too - but a child that could not reconcile at all is a
+	// misconfiguration blocking every generation, and stays visible.
+	failedRun := []AnsibleBindingVM{{
+		Spec:   &AnsibleBindingVMSpec{VMName: "web-1"},
+		Status: &AnsibleBindingVMStatus{Phase: PhaseFailed, AppliedGeneration: 3},
+	}}
+	if got := summarize(failedRun, matched, 4, ""); got.Pending != 1 || got.Failed != 0 {
+		t.Errorf("an old failed run is pending a retry, got %+v", got)
+	}
+	brokenConfig := []AnsibleBindingVM{{
+		Spec:   &AnsibleBindingVMSpec{VMName: "web-1"},
+		Status: &AnsibleBindingVMStatus{State: "Failed", Message: "template not found", AppliedGeneration: 3},
+	}}
+	if got := summarize(brokenConfig, matched, 4, ""); got.Failed != 1 {
+		t.Errorf("a child that cannot reconcile at all stays failed on any generation, got %+v", got)
+	}
+}
+
+func TestBindingLabelValueFitsAndStaysDistinct(t *testing.T) {
+	short := "webserver-config"
+	if bindingLabelValue(short) != short {
+		t.Errorf("a name that fits must be used as-is, got %q", bindingLabelValue(short))
+	}
+
+	// Object names go to 253 characters, label values only to 63, and the
+	// label is what children are found by - so a long binding name used to
+	// make every child it created invalid.
+	long := strings.Repeat("n", 200)
+	got := bindingLabelValue(long)
+	if len(got) > maxLabelValue {
+		t.Errorf("label value is %d characters, over the %d limit", len(got), maxLabelValue)
+	}
+	if strings.HasSuffix(got, "-") || strings.HasPrefix(got, "-") {
+		t.Errorf("label value %q is not a valid label value", got)
+	}
+	if bindingLabelValue(long+"a") == bindingLabelValue(long+"b") {
+		t.Error("two long binding names must not share one label value: each would list the other's children")
+	}
+}
+
+func TestAWXEndpointFingerprintDistinguishesInstances(t *testing.T) {
+	a := awxEndpointFingerprint("https://awx.example.com", "/api/v2")
+	if a != awxEndpointFingerprint("https://awx.example.com/", "/api/v2") {
+		t.Error("a trailing slash is the same endpoint")
+	}
+	if a == awxEndpointFingerprint("https://awx-2.example.com", "/api/v2") {
+		t.Error("a different instance must not look like the same one - its host ids mean something else")
+	}
+	if a == awxEndpointFingerprint("https://awx.example.com", "/api/controller/v2") {
+		t.Error("a different API root is a different endpoint")
 	}
 }

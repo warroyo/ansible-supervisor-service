@@ -512,12 +512,15 @@ func watchChildren(informer cache.SharedIndexInformer, parent *Controller) {
 		if err != nil {
 			return "", false
 		}
-		binding := u.GetLabels()[BindingLabel]
+		// spec.bindingName is the authority: it carries the binding's full
+		// name, where the label may be a truncated-and-hashed stand-in for
+		// one too long to be a label value. The label is the fallback for
+		// a child whose spec cannot be read - and a child whose label was
+		// edited off is exactly the case the parent most needs to hear
+		// about, since it is the one that would otherwise never be reaped.
+		binding, _, _ := unstructured.NestedString(u.Object, "spec", "bindingName")
 		if binding == "" {
-			// A child whose label was edited off is exactly the case the
-			// parent most needs to hear about - it is the one that would
-			// otherwise never be reaped.
-			binding, _, _ = unstructured.NestedString(u.Object, "spec", "bindingName")
+			binding = u.GetLabels()[BindingLabel]
 		}
 		if binding == "" {
 			return "", false

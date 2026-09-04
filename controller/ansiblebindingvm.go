@@ -50,7 +50,8 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 	if child.Spec.AWXConnectionRef == "" {
 		return Result{}, fmt.Errorf("spec.awxConnectionRef is required")
 	}
-	if err := checkOwnedByItsVM(&child); err != nil {
+	ownerUID, err := checkOwnedByItsVM(&child)
+	if err != nil {
 		return Result{}, err
 	}
 
@@ -111,6 +112,17 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		return Result{}, fmt.Errorf("fetching VirtualMachine %q: %w", child.Spec.VMName, err)
 	}
 
+	// The owner reference resolves by UID, and so must this: a VM deleted
+	// and recreated under the same name is a different object, and until
+	// the garbage collector catches up this child still exists alongside
+	// it. Acting on the name alone would point the old VM's inventory
+	// host - and its playbook run - at the new VM.
+	if uid := string(vm.GetUID()); ownerUID != "" && uid != ownerUID {
+		log.Printf("[AnsibleBindingVM/%s/%s] VirtualMachine %q is now UID %s, not the %s this child was created for: leaving it for garbage collection",
+			child.Namespace, child.Name, child.Spec.VMName, uid, ownerUID)
+		return Result{}, nil
+	}
+
 	ip, ready := vmReady(vm)
 	st.ObservedIP = ip
 
@@ -149,10 +161,23 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 	if awxConn.Spec == nil {
 		return Result{}, fmt.Errorf("AWXConnection %q has no spec", child.Spec.AWXConnectionRef)
 	}
-	awxClient, _, err := awxClientForConnection(ctx, client, awxConn)
+	awxClient, basePath, err := awxClientForConnection(ctx, client, awxConn)
 	if err != nil {
 		return Result{}, fmt.Errorf("preparing a client for AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
 	}
+
+	// Everything recorded below - host id, inventory id - is an id issued
+	// by one AWX instance. Point the connection somewhere else and those
+	// ids belong to whatever unrelated objects hold them there, so drop
+	// them rather than act on them: the host is then looked up by name on
+	// the new instance and adopted or created like any other.
+	endpoint := awxEndpointFingerprint(awxConn.Spec.URL, basePath)
+	if st.AWXEndpoint != "" && st.AWXEndpoint != endpoint {
+		log.Printf("[AnsibleBindingVM/%s/%s] AWXConnection %q now points at a different AWX instance: forgetting host %d in inventory %d rather than acting on ids from the old one",
+			child.Namespace, child.Name, child.Spec.AWXConnectionRef, st.AWXHostID, st.AWXInventoryID)
+		st.AWXHostID, st.AWXInventoryID, st.AWXHostName, st.AWXHostCreated = 0, 0, "", false
+	}
+	st.AWXEndpoint = endpoint
 
 	// Poll any in-flight job first: its outcome doesn't depend on the
 	// VM's current power state, so this must happen even if the VM has
@@ -195,10 +220,11 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 	// whole inventory, and it can be switched off in the AWX UI between
 	// one pass and the next.
 	var tmpl *AWXTemplate
+	connKey := connectionKey(awxConn)
 	if wantsRun {
-		tmpl, err = resolveTemplateForLaunch(ctx, awxClient, child.Namespace, child.Spec.AWXConnectionRef, child.Spec.Template)
+		tmpl, err = resolveTemplateForLaunch(ctx, awxClient, connKey, child.Spec.Template)
 	} else {
-		tmpl, err = resolveTemplateCached(ctx, awxClient, child.Namespace, child.Spec.AWXConnectionRef, child.Spec.Template)
+		tmpl, err = resolveTemplateCached(ctx, awxClient, connKey, child.Spec.Template)
 	}
 	if err != nil {
 		return Result{}, err
@@ -335,7 +361,7 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 // deleted VM sits in the list until the garbage collector gets to the
 // object, and a reference to some unrelated live VM would pass just as
 // easily. The reference has to name this child's own VM.
-func checkOwnedByItsVM(child *AnsibleBindingVM) error {
+func checkOwnedByItsVM(child *AnsibleBindingVM) (string, error) {
 	for _, ref := range child.OwnerReferences {
 		if ref.Kind != "VirtualMachine" || ref.Name != child.Spec.VMName {
 			continue
@@ -344,9 +370,9 @@ func checkOwnedByItsVM(child *AnsibleBindingVM) error {
 		if err != nil || gv.Group != vmGroup {
 			continue
 		}
-		return nil
+		return string(ref.UID), nil
 	}
-	return fmt.Errorf("AnsibleBindingVM %q has no ownerReference to VirtualMachine %q: "+
+	return "", fmt.Errorf("AnsibleBindingVM %q has no ownerReference to VirtualMachine %q: "+
 		"children are created by their AnsibleBinding, not written by hand: %w",
 		child.Name, child.Spec.VMName, errPermanentConfig)
 }
@@ -550,7 +576,7 @@ func cleanupAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient,
 	// difference between "this will never work" and "AWX is unreachable
 	// right now" - and the second is worth retrying rather than leaking
 	// a host over.
-	awxClient, _, err := awxClientForConnection(ctx, client, awxConn)
+	awxClient, basePath, err := awxClientForConnection(ctx, client, awxConn)
 	if err != nil {
 		if isPermanent(err) {
 			abandon("the AWX token is gone or the connection is malformed", err)
@@ -558,6 +584,14 @@ func cleanupAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient,
 		}
 		return fmt.Errorf("preparing a client to clean up AWX host %d "+
 			"(set spec.cleanupPolicy: Retain to release this object and leave it in place): %w", child.Status.AWXHostID, err)
+	}
+	// Deleting by id on an instance that did not issue that id would
+	// delete some unrelated host. There is nothing to clean up here: the
+	// host this object created is on the old instance, which the
+	// connection no longer names.
+	if endpoint := awxEndpointFingerprint(awxConn.Spec.URL, basePath); child.Status.AWXEndpoint != "" && child.Status.AWXEndpoint != endpoint {
+		abandon(fmt.Sprintf("AWXConnection %q now points at a different AWX instance", child.Spec.AWXConnectionRef), nil)
+		return nil
 	}
 	if err := awxClient.DeleteHost(ctx, int(child.Status.AWXHostID)); err != nil {
 		return fmt.Errorf("deleting AWX host %d: %w", child.Status.AWXHostID, err)

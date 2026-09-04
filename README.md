@@ -70,6 +70,7 @@ imgpkg copy -b <bundle-ref-from-ansible-supervisor.yml> --to-repo your-repo.exam
 |-----------------|---------|-------------|
 | `resync_period` | `"60"`  | Periodic reconcile interval in seconds |
 | `reconcile_timeout` | `"300"` | Maximum seconds one reconcile of one resource may take. Bounds how long a binding matching many VMs can hold a worker against a slow AWX |
+| `api_qps` / `api_burst` | `"50"` / `"100"` | Kubernetes API request budget. client-go's defaults (5/10) are an interactive kubectl's, not a controller's - a binding matching hundreds of VMs would spend minutes inside the client's own rate limiter |
 | `host_check_period` | `"600"` | How often, in seconds, each VM's AWX inventory host is reconciled against AWX itself. Everything else in an idle pass is served from the controller's own caches, so this is what sets the steady-state AWX request rate - and it is the worst case for repairing a host deleted or edited by hand in the AWX UI. Lower it if hand edits in AWX are common; raise it if AWX is the bottleneck |
 | `namespace`     | `""`    | Namespace to deploy into (filled by the supervisor, do not edit) |
 | `supervisor_id` | `""`    | Identity stamped on AWX hosts this supervisor owns. Empty derives it from the `kube-system` namespace UID - set something readable (e.g. `sup-lab-01`) if you share one AWX between supervisors and want its inventory legible |
@@ -235,6 +236,7 @@ kubectl get ansiblebindingvm -n <namespace> -l field.vmware.com/binding=<binding
 | `awxHostID`, `awxHostName`, `awxInventoryID`, `awxHostCreated` | The AWX inventory host, the name and inventory it lives under, and whether this controller owns it (adopted hosts are never deleted) |
 | `lastJobID`, `lastJobURL`, `lastJobStatus` | The most recent run and a link to its output in AWX |
 | `appliedGeneration`, `appliedTrigger` | What this VM last launched a run for - how re-run requests are tracked per VM |
+| `awxEndpoint` | Fingerprint of the AWX instance the ids above came from. Repoint the `AWXConnection` at a different instance and those ids belong to unrelated objects there, so the child forgets them and looks its host up by name again rather than acting on them |
 | `lastHostCheck` | When the inventory host was last reconciled against AWX. The next check is due `host_check_period` after it; passes in between cost no AWX requests at all |
 | `history` | Bounded log of recent runs (one entry per run) |
 

@@ -170,6 +170,16 @@ func convertAnsibleBindingVM(u *unstructured.Unstructured) (AnsibleBindingVM, er
 	return c, err
 }
 
+// awxEndpointFingerprint identifies which AWX instance a recorded host
+// id came from. AWX ids are only meaningful on the instance that issued
+// them, so a connection repointed at a different AWX would otherwise
+// leave a child deleting or rewriting whatever host happens to hold that
+// id on the new one. Short because it is only ever compared, never read.
+func awxEndpointFingerprint(url, basePath string) string {
+	sum := sha256.Sum256([]byte(strings.TrimRight(url, "/") + "|" + basePath))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
 // hostCheckPeriod is how often each child reconciles its AWX inventory
 // host against AWX itself. It is the worst case for repairing a host
 // deleted or edited by hand in the AWX UI, and - since everything else
@@ -217,6 +227,26 @@ const (
 	childNameHalfLimit = 110
 	childNameHashLen   = 10
 )
+
+// maxLabelValue is the Kubernetes limit on a label value. Object names
+// go up to 253 characters, so a binding name is not necessarily a legal
+// label value - and the label is how children are found.
+const maxLabelValue = 63
+
+// bindingLabelValue is what goes in the BindingLabel on a child.
+//
+// The full name is kept in spec.bindingName, which has no such limit and
+// is what ownership is actually decided on; this only has to be a stable
+// handle to list by. A binding name over 63 characters would otherwise
+// make every child it creates invalid - the API server rejects the label
+// - while childName goes to some trouble to support long names.
+func bindingLabelValue(name string) string {
+	if len(name) <= maxLabelValue {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	return clipNameSegment(name[:maxLabelValue-childNameHashLen-1]) + "-" + hex.EncodeToString(sum[:])[:childNameHashLen]
+}
 
 // childName is the deterministic name of the AnsibleBindingVM a binding
 // creates for one VM. Deterministic so the parent can create it blind

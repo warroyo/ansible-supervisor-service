@@ -395,6 +395,9 @@ spec:
                 awxHostCreated:
                   type: boolean
                   description: whether this controller owns the AWX host. ownership is stamped into the host description in AWX so it survives this resource being deleted and recreated. hosts that already existed unmarked are adopted and never deleted
+                awxEndpoint:
+                  type: string
+                  description: fingerprint of the AWX instance the ids above came from. they are only meaningful there, so when the AWXConnection is repointed at another instance they are dropped rather than acted on
                 lastHostCheck:
                   type: string
                   format: date-time
