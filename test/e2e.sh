@@ -977,4 +977,84 @@ log "legacy per-VM status cleared"
 kubectl delete ansiblebinding e2e-migrate -n "$TEST_NS" --timeout=60s >/dev/null
 log "migrated binding deleted cleanly"
 
+# --- a pre-split entry with no VM and no child must still be cleaned ---
+# The migration seeds children from status.vms[], but only for VMs the
+# selector still matches. An entry for a VM that had already stopped
+# matching when the upgrade happened - which the pre-split controller
+# kept precisely because it had not managed to delete that host yet -
+# gets no child, so nothing would ever clean up its AWX host, and
+# status.vms[] could never be cleared either.
+log "checking a pre-split entry whose VM is gone is swept, not stranded"
+
+SUP_ID=$(grep -m1 'supervisor id:' "$WORK_DIR/controller.log" | awk '{print $3}')
+[[ -n "$SUP_ID" ]] || { echo "could not read the supervisor id from the controller log"; exit 1; }
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: vmoperator.vmware.com/v1alpha2
+kind: VirtualMachine
+metadata:
+  name: web-8
+  namespace: ${TEST_NS}
+  labels:
+    app: sweep
+spec: {}
+status:
+  powerState: PoweredOn
+  network:
+    primaryIP4: "10.0.0.88"
+---
+apiVersion: field.vmware.com/v1
+kind: AnsibleBinding
+metadata:
+  name: e2e-sweep
+  namespace: ${TEST_NS}
+spec:
+  vmSelector:
+    app: sweep
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+EOF
+
+wait_for "the sweep binding provisions its own VM" 60 bash -c \
+  "[[ -n \$(vm_field e2e-sweep web-8 awxHostID) ]]"
+LIVE_HOST=$(vm_field e2e-sweep web-8 awxHostID)
+
+# A host this binding owns, for a VM that no longer exists: exactly what
+# a pre-split entry left behind points at.
+GHOST_ID=$(curl -sf -X POST -H 'Content-Type: application/json' \
+  -d "{\"inventory\":1,\"name\":\"ghost-9\",\"description\":\"ansible-supervisor:${SUP_ID}:${TEST_NS}/e2e-sweep\"}" \
+  "http://${AWX_ADDR}/_test/hosts" | grep -o '"id":[0-9]*' | cut -d: -f2)
+
+# A second host with the same shape but owned by somebody else. Reading
+# the marker back before deleting is what keeps this one alive.
+FOREIGN_GHOST=$(curl -sf -X POST -H 'Content-Type: application/json' \
+  -d '{"inventory":1,"name":"ghost-10","description":"ansible-supervisor:other-supervisor:other-ns/other-binding"}' \
+  "http://${AWX_ADDR}/_test/hosts" | grep -o '"id":[0-9]*' | cut -d: -f2)
+
+kubectl patch ansiblebinding e2e-sweep -n "$TEST_NS" --subresource=status --type=merge \
+  -p "{\"status\":{\"vms\":[
+    {\"name\":\"ghost-9\",\"phase\":\"Succeeded\",\"awxHostID\":${GHOST_ID},\"awxHostName\":\"ghost-9\",\"awxHostCreated\":true},
+    {\"name\":\"ghost-10\",\"phase\":\"Succeeded\",\"awxHostID\":${FOREIGN_GHOST},\"awxHostName\":\"ghost-10\",\"awxHostCreated\":true}]}}" >/dev/null
+log "staged pre-split entries for ghost-9 (host $GHOST_ID, ours) and ghost-10 (host $FOREIGN_GHOST, another supervisor's)"
+
+wait_for "the stranded host is deleted" 60 host_deleted "$AWX_ADDR" "$GHOST_ID"
+wait_for "the stranded entries are cleared from status.vms" 60 bash -c \
+  "v=\$(kubectl get ansiblebinding e2e-sweep -n ${TEST_NS} -o jsonpath='{.status.vms}'); [[ -z \$v || \$v == '[]' ]]"
+
+if host_deleted "$AWX_ADDR" "$FOREIGN_GHOST"; then
+  echo "the sweep deleted host $FOREIGN_GHOST, which carries another supervisor's marker"
+  exit 1
+fi
+if host_deleted "$AWX_ADDR" "$LIVE_HOST"; then
+  echo "the sweep deleted the live host $LIVE_HOST"
+  exit 1
+fi
+log "stranded host cleaned up, another supervisor's left alone, live host untouched"
+
+kubectl delete ansiblebinding e2e-sweep -n "$TEST_NS" --timeout=60s >/dev/null
+wait_for "the sweep binding's own host is cleaned up" 30 host_deleted "$AWX_ADDR" "$LIVE_HOST"
+log "sweep binding deleted cleanly"
+
 log "ALL CHECKS PASSED"

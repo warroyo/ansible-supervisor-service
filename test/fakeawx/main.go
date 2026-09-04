@@ -208,6 +208,16 @@ func (s *server) handleHost(w http.ResponseWriter, r *http.Request, id int) {
 
 	h, ok := s.hosts[id]
 	switch r.Method {
+	case http.MethodGet:
+		// Real AWX serves the host detail here. The controller reads a
+		// host back before deleting it by an id an older version of
+		// itself recorded, to check the ownership marker on the host
+		// rather than trusting the id.
+		if !ok || h.Deleted {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writeJSON(w, 200, h)
 	case http.MethodPatch:
 		if !ok || h.Deleted {
 			w.WriteHeader(http.StatusNotFound)
