@@ -36,6 +36,10 @@ The e2e suite runs the controller authenticated as its own service account (`ans
 - refusing a host owned by another supervisor (nothing written, no job launched), and `hostNamePrefix` resolving that collision
 - `cleanupPolicy: Retain` → delete → recreate reclaiming ownership of the retained host, which is then deletable again
 - per-VM AWX host cleanup when a VM drops out of `vmSelector`, and finalizer-driven cleanup on delete
+- an idle child making **no** AWX requests at all between host checks, sampled over a window - the assertion that keeps the per-VM split from costing one AWX round trip per VM per resync
+- the binding's `status.summary` agreeing with the children it is a rollup of
+- refusing a hand-written `AnsibleBindingVM` whose `ownerReference` does not name its own VM (and asserting **no** job was started)
+- a controller restart relaunching nothing: the decision comes from each child's own status, not from anything the process remembered
 
 Debugging: `test/e2e.sh --keep` leaves the kind cluster, controller, and fake AWX server running on failure, and prints both logs on any failed assertion.
 

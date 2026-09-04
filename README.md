@@ -25,7 +25,7 @@ Two CRDs, both namespace-scoped (this is a multi-tenant environment: each tenant
 
 **AWXConnection**: points at an AWX/Tower instance and a `Secret` holding its API token. A namespace can define more than one (e.g. dev/prod AWX instances).
 
-**AnsibleBinding**: a persistent binding from a `vmSelector` (matchLabels against `VirtualMachine`s in the same namespace) to an AWX job or workflow template. Re-runnable: bump the `ansible.field.vmware.com/reconcile-requested-at` annotation, or edit the spec, and the controller launches a fresh run against every currently-matched VM. One CR fans out to every VM the selector matches, with a per-VM status entry and bounded run history for each.
+**AnsibleBinding**: a persistent binding from a `vmSelector` (matchLabels against `VirtualMachine`s in the same namespace) to an AWX job or workflow template. Re-runnable: bump the `ansible.field.vmware.com/reconcile-requested-at` annotation, or edit the spec, and the controller launches a fresh run against every currently-matched VM. One CR fans out to every VM the selector matches, each with its own `AnsibleBindingVM` carrying that VM's phase, job URL and bounded run history.
 
 For each matched, powered-on VM with a reported IP, the controller upserts an AWX inventory host (into whatever inventory the target template is already configured with) and launches the template scoped to that host via `--limit`. VMs that drop out of the selector - deleted, relabeled - have their AWX host cleaned up on the very next reconcile, not left stale (a stale host's IP can get reassigned to an unrelated VM later); set `cleanupPolicy: Retain` to opt out if you manage AWX inventory by hand.
 
@@ -34,7 +34,8 @@ A few guardrails worth knowing about:
 - **`vmSelector` may not be empty.** An empty selector would match every VM in the namespace, so it's rejected by the CRD schema and by the controller.
 - **Pre-existing AWX hosts are adopted, never hijacked.** If a host with the target name already exists in the inventory, the controller merges its variables in rather than overwriting them, records that it did not create the host (`awxHostCreated: false` on that VM's `AnsibleBindingVM`), and never deletes it during cleanup. If that host's existing variables aren't a JSON object it can safely merge into, it refuses rather than destroying them.
 - **Hosts owned by another supervisor are refused outright.** See [Can several supervisors share one AWX instance?](FAQ.md#can-several-supervisors-share-one-awx-instance)
-- **The inventory host is reconciled against AWX, not against status.** Every pass reads the host back from AWX, so one deleted or hand-edited in the AWX UI is recreated or repaired. Trusting the controller's own record instead would leave a deleted host undetected, and every later run failing with `--limit does not match any hosts` with nothing to repair it. Variables the controller doesn't manage are left untouched; a steady state writes nothing.
+- **The inventory host is reconciled against AWX, not against status.** Every `host_check_period` (600s by default) the host is read back from AWX, so one deleted or hand-edited in the AWX UI is recreated or repaired. Trusting the controller's own record instead would leave a deleted host undetected, and every later run failing with `--limit does not match any hosts` with nothing to repair it. Variables the controller doesn't manage are left untouched; a steady state writes nothing, and between checks an idle VM costs AWX nothing at all. A spec change or a re-run request is not on that timer - both take effect on the next pass.
+- **Hosts nothing accounts for are reaped.** Less often (four host-check periods), each binding lists the AWX hosts carrying its own ownership marker and deletes any that no VM and no child accounts for - what a controller killed mid-cleanup leaves behind. Only hosts this supervisor created for that binding are ever considered, and `cleanupPolicy: Retain` disables it.
 - **In-flight runs are tracked independently of the VM.** A VM powering off mid-run doesn't lose the job, and re-run requests made during downtime aren't swallowed. See [the FAQ](FAQ.md#what-happens-to-in-flight-runs-when-a-vm-powers-off).
 
 ## Prerequisites
@@ -241,6 +242,12 @@ kubectl get ansiblebindingvm -n <namespace> -l field.vmware.com/binding=<binding
 | `history` | Bounded log of recent runs (one entry per run) |
 
 Each child's `ownerReference` points at its `VirtualMachine`, so deleting a VM removes its child through ordinary garbage collection. That reference is also required: a child whose owner is missing, or names a different VM, is refused rather than reconciled, so a hand-written `AnsibleBindingVM` cannot launch playbooks nothing would ever clean up. A child whose VM merely stops matching the selector is deleted by the binding instead. Either way the child's own finalizer cleans up the AWX host first.
+
+## Upgrading from 1.0.x
+
+1.1.0 moves the per-VM detail out of the binding's status and onto one `AnsibleBindingVM` per matched VM. The upgrade needs no action, with one thing worth knowing: **each matched VM re-runs its playbook once.** A child starts with no record of what that VM last ran, so it launches. Ansible playbooks are expected to be idempotent, which is what makes that survivable - but if a run is expensive or disruptive, expect it, or set `cleanupPolicy: Retain` and recreate the bindings when you are ready for the runs.
+
+Inventory hosts are **not** affected. Ownership lives in the AWX host's description, keyed to the namespace and binding, so each child adopts the host 1.0.x created rather than creating a second one, and a host whose VM had already stopped matching is picked up by the reaper described above. The old `status.vms[]` on existing bindings is pruned by the API server on the first status write.
 
 ## Uninstalling
 

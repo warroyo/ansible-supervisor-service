@@ -21,7 +21,7 @@ This service puts the same capability on the Supervisor, as CRDs. Nothing here r
 | How a host is targeted | vRA hands the provisioned machine to the integration | Label selector (`vmSelector`); the controller creates the inventory host and scopes the run with `--limit` |
 | What can be targeted | Exactly the one machine being provisioned | Every VM the selector matches, now and later |
 | When it runs | Once, at provisioning time | At provisioning time and on demand afterwards - bump the `reconcile-requested-at` annotation or edit the spec |
-| Drift in AWX | Not tracked | The inventory host is reconciled against AWX every pass; one deleted or hand-edited in the UI is repaired |
+| Drift in AWX | Not tracked | The inventory host is reconciled against AWX itself on a timer (`host_check_period`, 600s); one deleted or hand-edited in the UI is repaired |
 | Teardown | Deprovisioning removes the host | The binding's finalizer removes the AWX hosts it created (`cleanupPolicy: Retain` opts out) |
 | AAP 2.5+ | [Broken](#which-awxtoweraap-versions-are-supported) - KB 394498 says stay on 2.4 | Detected and supported |
 
