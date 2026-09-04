@@ -8,7 +8,7 @@
 | `controller/manifests/crd.yml` | both CRDs; copied into `config/` at release time |
 | `config/` | ytt templates for the deployed service: `Deployment`, `ServiceAccount`, RBAC, values schema |
 | `examples/` | the three manifests a user applies |
-| `test/` | the e2e suite and its fake AWX server |
+| `test/` | the e2e suite and its fake AWX server, plus `verify-supervisor.sh` - the live pre-release gate |
 
 ## Testing
 
@@ -18,6 +18,8 @@ You don't need a supervisor or a real AWX/Tower instance. The controller's outpu
 make test-unit   # go vet + unit tests
 make test-e2e    # full kind-based suite (requires kind, kubectl, ytt, go)
 ```
+
+Before cutting a release there is one more gate that *does* need both, because it validates the packaged artifact rather than the code: [Pre-release validation](#pre-release-validation).
 
 The e2e suite runs the controller authenticated as its own service account (`ansible-supervisor`) with a minted token - every API call is authorized against the real `ClusterRole` from `config/deploy.yml`, so a missing RBAC rule fails the suite with `Forbidden` just like it would in a real deployment. It covers:
 
@@ -39,18 +41,58 @@ Debugging: `test/e2e.sh --keep` leaves the kind cluster, controller, and fake AW
 
 ### What the suite can't cover
 
-`test/fixtures/vm-crd.yml` is a simplified stand-in rather than the real `vmoperator.vmware.com` CRD, and `test/fakeawx` stands in for a real AWX. Both leave gaps that only a live environment closes, so these were checked by hand against a real supervisor and a real AWX:
+`test/fixtures/vm-crd.yml` is a simplified stand-in rather than the real `vmoperator.vmware.com` CRD, and `test/fakeawx` stands in for a real AWX. The suite also runs the controller as a host binary rather than the built image, so nothing it does exercises the Dockerfile, the Carvel package, the pinned digest, or the real `ClusterRole`.
 
-- `status.network.primaryIP4` read through `v1alpha2` against a live VM whose CRD stores `v1alpha5`
+Those gaps only a live environment closes, and `make verify-supervisor` closes them - see [Pre-release validation](#pre-release-validation). It covers:
+
+- `status.network.primaryIP4` read through the negotiated API version against a live VM
 - a real AWX token and Machine credential SSHing into a VM Service VM, with `--limit` honored
 - the in-cluster startup path under the service's own `ClusterRole`
 - one binding fanning out to several VMs, each with its own inventory host and run
 
-Re-check these by hand after you change VM lookup, the AWX client, or RBAC.
+Run it after you change VM lookup, the AWX client, RBAC, or the packaging.
+
+## Pre-release validation
+
+CI proves the code works. It cannot prove the *release* works: a hosted runner has no route to a Supervisor or to an AWX instance, so the built image, the packaging, the digest pinning and the in-cluster RBAC all reach users unexercised. This is the gate that covers them, run by hand before every tag.
+
+Nothing here is wired into a workflow. `make test-unit` and `make test-e2e` remain the whole of what GitHub Actions runs.
+
+**1. Cut a dev release.** An ordinary release under a pre-release version, so it goes through the real build, the real digest pinning and the real package assembly rather than a parallel path that could drift from them:
+
+```bash
+make dev-release DEV_VERSION=1.0.1-rc1
+```
+
+**2. Install it.** Upload the generated `ansible-supervisor.yml` in vCenter under **Workload Management → Services**, or upgrade the existing service to this version.
+
+**3. Validate against the live environment.**
+
+```bash
+export KUBECONFIG=/path/to/supervisor.kubeconfig
+make verify-supervisor DEV_VERSION=1.0.1-rc1 \
+  SUPERVISOR_NS=my-namespace \
+  AWX_URL=https://awx.example.com \
+  AWX_TOKEN=... \
+  AWX_TEMPLATE="Configure Webserver" \
+  VM_LABEL=app=webserver
+```
+
+`AWX_TEMPLATE` must have Prompt on Launch enabled for Limit and must have an inventory; `VM_LABEL` must match at least one powered-on VM that already reports an IP. Both are checked in a preflight pass before anything is created, so a misconfigured run fails in seconds rather than after an install.
+
+What it asserts, in order:
+
+1. **The build under test is what is installed.** Exactly one controller Deployment, Available, running the digest `dev-release` just pushed - so a run cannot silently validate last week's install. The image must be pinned by digest, not a tag: a tag sends kapp-controller back to the registry on every deploy, which unpins it and breaks air-gapped installs.
+2. **It starts clean in-cluster.** CRDs Established, `controller started successfully` in the log, and no `Forbidden` anywhere in it - a missing `ClusterRole` rule shows up here and nowhere else.
+3. **A real run completes.** `AWXConnection` goes Ready with the API base path the harness independently detected, every matched VM reaches `Succeeded`, the binding's fan-out matches the selector, and the inventory host is read back *out of AWX* to confirm its `ansible_host` is the IP the live VM reports.
+4. **An idle binding costs nothing.** `metadata.resourceVersion` and the AWX host's `modified` timestamp must both be unchanged across three or more resync passes. This is the assertion that would have caught the per-pass status write fixed in 1.0.1, and it is cheap to keep honest.
+5. **Teardown removes what it created.** The finalizer releases, a host the controller created is gone from AWX, and a host it merely adopted is still there.
+
+It always removes its own `AnsibleBinding`, `AWXConnection` and `Secret`, including on failure - it runs in a real tenant namespace, and a leaked binding keeps launching jobs. `--keep` (via `test/verify-supervisor.sh --keep`) leaves them for debugging, and any failure dumps the controller log and the binding's status first.
 
 ## Releasing
 
-Push a `v*` tag and GitHub Actions does the rest.
+Validate first ([above](#pre-release-validation)), then push a `v*` tag and GitHub Actions does the rest.
 
 ```bash
 git tag v1.0.0

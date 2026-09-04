@@ -5,6 +5,41 @@ test-unit:
 test-e2e:
 	test/e2e.sh
 
+# Pre-release gate. Neither target runs in CI and neither is wired into
+# any workflow: dev-release pushes to the registry, and verify-supervisor
+# needs a Supervisor and an AWX instance on the same network, which a
+# hosted runner cannot reach. `make test-unit` and `make test-e2e` remain
+# the whole of what GitHub Actions runs.
+#
+# The loop before cutting a tag:
+#
+#   make dev-release DEV_VERSION=1.0.1-rc1     # build, push, package
+#   # upload ansible-supervisor.yml in vCenter (Workload Management ->
+#   # Services), or upgrade the existing service to this version
+#   make verify-supervisor DEV_VERSION=1.0.1-rc1 \
+#     SUPERVISOR_NS=my-ns AWX_URL=... AWX_TOKEN=... \
+#     AWX_TEMPLATE="Configure Webserver" VM_LABEL=app=webserver
+#
+# A dev release is an ordinary release cut under a pre-release version,
+# so it exercises the real build, the real digest pinning and the real
+# package assembly rather than a parallel path that could drift from it.
+dev-release:
+	@test -n "$(DEV_VERSION)" || { echo "set DEV_VERSION, e.g. make dev-release DEV_VERSION=1.0.1-rc1"; exit 1; }
+	$(MAKE) build-controller VERSION=$(DEV_VERSION)
+	$(MAKE) release-controller VERSION=$(DEV_VERSION)
+	$(MAKE) release VERSION=$(DEV_VERSION)
+	@echo
+	@echo "ansible-supervisor.yml is built for $(DEV_VERSION)."
+	@echo "Install or upgrade the Supervisor service with it, then run: make verify-supervisor DEV_VERSION=$(DEV_VERSION) ..."
+
+# EXPECT_IMAGE is resolved here rather than in the script so the check is
+# against the digest actually in the registry for this version - which is
+# what catches a run validating a stale install.
+verify-supervisor:
+	@test -n "$(DEV_VERSION)" || { echo "set DEV_VERSION to the version you installed, e.g. make verify-supervisor DEV_VERSION=1.0.1-rc1"; exit 1; }
+	EXPECT_IMAGE="$(CONTROLLER_IMAGE)@$$(docker buildx imagetools inspect $(CONTROLLER_IMAGE):$(DEV_VERSION) --format '{{.Manifest.Digest}}')" \
+		test/verify-supervisor.sh
+
 # Build/Release package configuration
 #
 # `release` expects the controller image for this VERSION to already be in
