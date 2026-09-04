@@ -112,15 +112,35 @@ if [[ -n "${DEV_VERSION:-}" && "$DEV_VERSION" != "$PKG_VERSION" ]]; then
 fi
 log "service $SVC version $PKG_VERSION"
 
+TIER2="/api/vcenter/namespace-management/${SURFACE}/${VC_CLUSTER}/supervisor-services"
+INSTALLED="$(vc GET "${TIER2}/${SVC}" >/dev/null; echo "$VC_CODE")"
+
 if [[ -n "${SERVICE_VALUES:-}" ]]; then
   [[ -r "$SERVICE_VALUES" ]] || fail "cannot read SERVICE_VALUES=$SERVICE_VALUES"
   cp "$SERVICE_VALUES" "$WORK_DIR/values.yml"
+  log "using values from $SERVICE_VALUES"
+elif [[ "$INSTALLED" == "200" ]]; then
+  # An upgrade must carry the config the service is already running with.
+  # Re-deriving it from config/values.yml would silently reset whatever
+  # the operator configured at install time - and supervisor_id is
+  # stamped into every AWX host ownership marker, so resetting it makes
+  # the controller stop recognising hosts it owns.
+  vc GET "${TIER2}/${SVC}" \
+    | jqp "d.get('yaml_service_config','')" \
+    | base64 -d > "$WORK_DIR/values.yml" 2>/dev/null || true
+  if [[ -s "$WORK_DIR/values.yml" ]]; then
+    log "preserving the config this service is already installed with"
+  else
+    log "WARNING: the installed service reports no config; falling back to repo defaults"
+    grep -v '^#@\|^#!\|^---\|^namespace:' config/values.yml | grep -v '^[[:space:]]*$' > "$WORK_DIR/values.yml"
+  fi
 else
-  # config/values.yml minus the ytt schema header and `namespace`, which
-  # the Supervisor fills in itself and rejects being told.
-  grep -v '^#@\|^---\|^namespace:' config/values.yml | grep -v '^\s*$' > "$WORK_DIR/values.yml"
+  # First install: config/values.yml minus the ytt schema header, ytt
+  # comments, and `namespace` - the Supervisor fills that in itself.
+  grep -v '^#@\|^#!\|^---\|^namespace:' config/values.yml | grep -v '^[[:space:]]*$' > "$WORK_DIR/values.yml"
+  log "first install, using repo defaults"
 fi
-log "installing with values:"
+log "values:"
 sed 's/^/         /' "$WORK_DIR/values.yml"
 
 # --- tier 1: the vCenter-wide service catalog -------------------------
@@ -163,9 +183,6 @@ log "catalog has $PKG_VERSION"
 
 # --- tier 2: install or upgrade on the supervisor ---------------------
 
-TIER2="/api/vcenter/namespace-management/${SURFACE}/${VC_CLUSTER}/supervisor-services"
-INSTALLED="$(vc GET "${TIER2}/${SVC}" >/dev/null; echo "$VC_CODE")"
-
 python3 -c "
 import json,sys
 print(json.dumps({'version':sys.argv[1],'yaml_service_config':sys.argv[2]}))
@@ -200,17 +217,21 @@ log "vCenter reports CONFIGURED at $CURRENT"
 # current_version reflects the PackageInstall, not the Deployment behind
 # it. Polling for it and then reading pod age has shown a 12-minute-old
 # pod still on the previous image. Only the pod itself settles this.
-if [[ -n "${KUBECONFIG:-}" ]] && command -v kubectl >/dev/null 2>&1; then
+if command -v kubectl >/dev/null 2>&1 && kubectl version -o json >/dev/null 2>&1; then
   log "waiting for the controller Deployment to actually roll"
-  CTRL_NS="$(kubectl get deployment -A -l app=ansible-supervisor \
+  # By name, not by label: config/deploy.yml carries app=ansible-supervisor
+  # on the pod template only, so the Deployment object itself has no
+  # labels to select on.
+  CTRL_NS="$(kubectl get deployment -A \
+    --field-selector metadata.name=ansible-supervisor-controller \
     -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || true)"
-  [[ -n "$CTRL_NS" ]] || fail "vCenter says CONFIGURED but no Deployment labelled app=ansible-supervisor exists"
+  [[ -n "$CTRL_NS" ]] || fail "vCenter says CONFIGURED but no ansible-supervisor-controller Deployment exists"
   kubectl rollout status deployment/ansible-supervisor-controller -n "$CTRL_NS" --timeout=300s \
     || fail "the controller Deployment did not roll out"
   log "rolled out in $CTRL_NS, image $(kubectl get deployment ansible-supervisor-controller -n "$CTRL_NS" \
     -o jsonpath='{.spec.template.spec.containers[0].image}')"
 else
-  log "KUBECONFIG not set: skipping the rollout check."
+  log "no working kubectl: skipping the rollout check."
   log "vCenter reporting CONFIGURED does NOT mean the new pod is running - verify-supervisor asserts the digest."
 fi
 

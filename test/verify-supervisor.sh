@@ -192,9 +192,14 @@ log "$VM_COUNT VM(s) match $VM_LABEL; first is $VM_NAME at $VM_IP"
 # --- phase 1: the installed service is the build under test -----------
 
 log "phase 1: checking the installed service"
-CTRL_NS="$(kubectl get deployment -A -l app=ansible-supervisor -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || true)"
-[[ -n "$CTRL_NS" ]] || fail "no Deployment labelled app=ansible-supervisor found - is the service installed?"
-DEPLOY_COUNT="$(kubectl get deployment -A -l app=ansible-supervisor -o json | jqp "len(d['items'])")"
+# Located by name rather than by label: config/deploy.yml carries
+# app=ansible-supervisor on the pod template only, so the Deployment
+# object itself has nothing to select on. Pods do have the label, which
+# is what the log reads below use.
+CTRL_SEL=(--field-selector metadata.name=ansible-supervisor-controller)
+CTRL_NS="$(kubectl get deployment -A "${CTRL_SEL[@]}" -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || true)"
+[[ -n "$CTRL_NS" ]] || fail "no ansible-supervisor-controller Deployment found - is the service installed?"
+DEPLOY_COUNT="$(kubectl get deployment -A "${CTRL_SEL[@]}" -o json | jqp "len(d['items'])")"
 [[ "$DEPLOY_COUNT" == "1" ]] || fail "found $DEPLOY_COUNT controller Deployments, expected exactly 1"
 log "controller installed in namespace $CTRL_NS"
 
