@@ -13,7 +13,10 @@
 # path to. Run it by hand before cutting a tag. CI still runs only
 # `make test-unit` and `make test-e2e`, both unchanged.
 #
-# Usage:
+# Usage: fill in .env at the repo root (see .env.example) and run
+# `make verify-supervisor`. Everything below can equally be exported by
+# hand, and an exported value overrides .env:
+#
 #   export KUBECONFIG=/path/to/supervisor.kubeconfig
 #   export SUPERVISOR_NS=my-namespace
 #   export AWX_URL=https://awx.example.com
@@ -28,6 +31,10 @@
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Settings come from .env at the repo root when it exists; the
+# environment still wins over it. See .env.example.
+source "$HARNESS_DIR/lib/dotenv.sh"
+load_dotenv
 WORK_DIR="$(mktemp -d)"
 KEEP=0
 for arg in "$@"; do

@@ -6,3 +6,7 @@ config/crd.yml
 config/config-release.yml
 # Built by test/e2e.sh, and by anyone running `go build` in there.
 /test/fakeawx/fakeawx
+
+# The live gate's settings, including an AWX token and a vCenter
+# password. .env.example is the committed template.
+.env

@@ -11,12 +11,18 @@
 # not a fallback. The vCenter service-install path is the only way the
 # CRDs land, which makes this the inner dev loop for the project.
 #
-# Usage:
+# Usage: fill in .env at the repo root (see .env.example) and run
+# `make install-supervisor-service`. Or export it all by hand - an
+# exported value overrides .env:
+#
 #   read -rs "P?vCenter password: " && printf '%s' "$P" > /tmp/vc_pw && unset P
 #   export VC_HOST=vc01.example.lab
 #   export VC_USER=administrator@vsphere.local
 #   export VC_PASSWORD_FILE=/tmp/vc_pw
 #   make install-supervisor-service DEV_VERSION=1.0.1-rc1
+#
+# VC_PASSWORD works in place of VC_PASSWORD_FILE; it is spooled to a
+# 0600 file for the run so it never reaches the process list.
 #
 # Optional:
 #   VC_CLUSTER        cluster id (e.g. domain-c9). Auto-discovered if there
@@ -31,16 +37,31 @@
 #                     you (see "current_version flips early" below).
 set -euo pipefail
 
+# Settings come from .env at the repo root when it exists; the
+# environment still wins over it. See .env.example.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/dotenv.sh"
+load_dotenv
+
 : "${VC_HOST:?set VC_HOST to the vCenter FQDN}"
 : "${VC_USER:?set VC_USER, e.g. administrator@vsphere.local}"
-: "${VC_PASSWORD_FILE:?set VC_PASSWORD_FILE to a file holding the vCenter password}"
-[[ -r "$VC_PASSWORD_FILE" ]] || { echo "cannot read $VC_PASSWORD_FILE" >&2; exit 1; }
 
 SERVICE_YAML="${SERVICE_YAML:-ansible-supervisor.yml}"
 [[ -r "$SERVICE_YAML" ]] || { echo "$SERVICE_YAML not found - run 'make dev-release DEV_VERSION=...' first" >&2; exit 1; }
 
 WORK_DIR="$(mktemp -d)"
+chmod 700 "$WORK_DIR"
 trap 'rm -rf "$WORK_DIR"' EXIT
+
+# The password reaches curl as a file either way. VC_PASSWORD (from .env,
+# say) is spooled into the work dir for the length of the run rather than
+# passed inline, so it stays out of the process list exactly as a
+# VC_PASSWORD_FILE the caller supplied does.
+if [[ -z "${VC_PASSWORD_FILE:-}" ]]; then
+  [[ -n "${VC_PASSWORD:-}" ]] || { echo "set VC_PASSWORD_FILE to a file holding the vCenter password, or VC_PASSWORD to the password itself" >&2; exit 1; }
+  VC_PASSWORD_FILE="$WORK_DIR/vc_pw"
+  (umask 077; printf '%s' "$VC_PASSWORD" > "$VC_PASSWORD_FILE")
+fi
+[[ -r "$VC_PASSWORD_FILE" ]] || { echo "cannot read $VC_PASSWORD_FILE" >&2; exit 1; }
 
 log()  { echo "[install] $*"; }
 fail() { echo "[install] FAILED: $*" >&2; exit 1; }

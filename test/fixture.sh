@@ -30,6 +30,13 @@
 #   VM_IMAGE, VM_CLASS, VM_STORAGE_CLASS, FIXTURE_NAME, FIXTURE_LABEL
 set -euo pipefail
 
+# Settings come from .env at the repo root when it exists; the
+# environment still wins over it. See .env.example. Sourced here too
+# because fixture.sh is runnable on its own (`make test-fixture-up`),
+# not only through verify-supervisor.sh.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/dotenv.sh"
+load_dotenv
+
 : "${SUPERVISOR_NS:?set SUPERVISOR_NS}"
 
 FIXTURE_NAME="${FIXTURE_NAME:-ansible-verify-fixture}"

@@ -8,7 +8,7 @@
 | `controller/manifests/crd.yml` | both CRDs; copied into `config/` at release time |
 | `config/` | ytt templates for the deployed service: `Deployment`, `ServiceAccount`, RBAC, values schema |
 | `examples/` | the three manifests a user applies |
-| `test/` | the e2e suite and its fake AWX server, plus the live pre-release gate: `install-supervisor-service.sh`, `fixture.sh`, `verify-supervisor.sh` |
+| `test/` | the e2e suite and its fake AWX server, plus the live pre-release gate: `install-supervisor-service.sh`, `fixture.sh`, `verify-supervisor.sh`, and `lib/dotenv.sh`, which loads `.env` for all three |
 
 ## Testing
 
@@ -62,6 +62,23 @@ CI proves the code works. It cannot prove the *release* works: a hosted runner h
 
 Nothing here is wired into a workflow. `make test-unit` and `make test-e2e` remain the whole of what GitHub Actions runs.
 
+**Put the settings in `.env` first.** The gate takes a dozen values - a Supervisor, an AWX, a template, a key - and none are derivable from the repo, so they live in a gitignored `.env` at the root rather than in your shell history:
+
+```bash
+cp .env.example .env && chmod 600 .env
+$EDITOR .env
+```
+
+It holds an AWX token and a vCenter password, hence the `chmod`.
+
+`.env.example` documents every variable the three steps read. It is sourced as bash by the harness scripts, so quote what has spaces (`AWX_TEMPLATE="Configure Webserver"`) and `#` starts a comment. **Anything already exported wins over the file**, so a one-off stays a one-off:
+
+```bash
+AWX_TEMPLATE="Some Other Template" make verify-supervisor
+```
+
+With it filled in, the whole loop is `make dev-release`, `make install-supervisor-service`, `make verify-supervisor`. The commands below spell the values out instead, which is equally valid and what to do if you would rather not keep an AWX token on disk.
+
 **1. Cut a dev release.** An ordinary release under a pre-release version, so it goes through the real build, the real digest pinning and the real package assembly rather than a parallel path that could drift from them:
 
 ```bash
@@ -76,6 +93,8 @@ export VC_HOST=vc01.example.lab VC_USER=administrator@vsphere.local VC_PASSWORD_
 export KUBECONFIG=/path/to/supervisor.kubeconfig    # optional, enables the rollout check
 make install-supervisor-service DEV_VERSION=1.0.1-rc1
 ```
+
+`VC_PASSWORD` in `.env` is the simplest way to give it the password, and `VC_PASSWORD_FILE` points at a file instead if you would rather not keep it there. Either way it is spooled to a `0600` file for the length of the run and handed to curl through a config file, never the command line.
 
 It probes whether this vCenter serves `/namespace-management/clusters` or `/supervisors` rather than assuming (the widely-circulated PowerShell example uses the latter, which 404s on some vCenters), registers the service if it is new or adds the version if it is not, then installs or upgrades in place. `refName` and version are read out of the generated package, so it cannot install a version the file does not contain. The password goes to curl through a config file on stdin, not `-u`, so it never appears in the process list.
 
