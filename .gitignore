@@ -10,3 +10,6 @@ config/config-release.yml
 # The live gate's settings, including an AWX token and a vCenter
 # password. .env.example is the committed template.
 .env
+
+# Extracted from CHANGELOG.md by `make release-notes` in the release workflow.
+/release-notes.md

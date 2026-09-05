@@ -14,6 +14,7 @@ Supervisor service that binds VM Service `VirtualMachine`s to AWX/Tower job and 
 - [CRD status](#crd-status)
 - [Uninstalling](#uninstalling)
 - [VCFA 9.x blueprints](VCFA-BLUEPRINTS.md) - driving this from a VCF Automation All Apps blueprint
+- [Changelog](CHANGELOG.md) - what changed in each release
 - [FAQ](FAQ.md) · [Contributing](CONTRIBUTING.md)
 
 ## How it works

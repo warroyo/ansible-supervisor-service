@@ -95,3 +95,18 @@ build-controller:
 	docker build -f controller/Dockerfile -t ${CONTROLLER_IMAGE}:${VERSION} controller/.
 release-controller:
 	docker push ${CONTROLLER_IMAGE}:${VERSION}
+
+# The GitHub release body for a tag. Kept in CHANGELOG.md rather than
+# generated from the log: this repo pushes straight to main, so
+# `generate_release_notes` had no PRs to list and every release shipped
+# with an empty body.
+#
+# It fails on a missing section rather than falling back to nothing,
+# and the workflow runs it before it builds, so a tag cut without notes
+# stops there instead of publishing a release nobody can read.
+release-notes:
+	@test -n "$(VERSION)" || { echo "set VERSION, e.g. make release-notes VERSION=1.1.0"; exit 1; }
+	@notes="$$(awk -v v="$(VERSION)" '/^## /{ if (seen) exit; if (index($$0, "## [" v "]") == 1) { seen = 1; next } } /^\[[^]]*\]:/{ if (seen) exit } seen' CHANGELOG.md)"; \
+	test -n "$$(printf '%s' "$$notes" | tr -d '[:space:]')" || { \
+		echo "CHANGELOG.md has no '## [$(VERSION)]' section - add one before tagging." >&2; exit 1; }; \
+	printf '%s\n' "$$notes"

@@ -140,19 +140,21 @@ It always removes its own `AnsibleBinding`, `AWXConnection` and `Secret`, includ
 
 ## Releasing
 
-Validate first ([above](#pre-release-validation)), then push a `v*` tag and GitHub Actions does the rest.
+Validate first ([above](#pre-release-validation)), rename the `Unreleased` heading in [CHANGELOG.md](CHANGELOG.md) to the version you are cutting, then push a `v*` tag and GitHub Actions does the rest.
 
 ```bash
+make release-notes VERSION=1.0.0   # what the release body will say
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
 The pipeline:
 
-1. Builds and pushes the controller image to `ghcr.io/warroyo/ansible-supervisor-service/controller:<version>`
-2. Runs `kctrl package release` to build the Carvel package
-3. Assembles `ansible-supervisor.yml` from the generated package metadata and spec
-4. Creates a GitHub Release with `ansible-supervisor.yml` attached and auto-generated release notes
+1. Reads the tag's section out of `CHANGELOG.md`. A tag with no section fails here, before anything is built or pushed
+2. Builds and pushes the controller image to `ghcr.io/warroyo/ansible-supervisor-service/controller:<version>`
+3. Runs `kctrl package release` to build the Carvel package
+4. Assembles `ansible-supervisor.yml` from the generated package metadata and spec
+5. Creates a GitHub Release with `ansible-supervisor.yml` attached, the changelog section as its body and GitHub's generated notes appended below it
 
 `ansible-supervisor.yml` is what you upload as a supervisor service. Release steps only run on tag pushes; `workflow_dispatch` builds but doesn't push or publish.
 
