@@ -449,3 +449,48 @@ func TestLaunchReadsWhicheverFieldCarriesTheJobID(t *testing.T) {
 		t.Error("a launch with no id anywhere must be an error, not an untracked run")
 	}
 }
+
+func TestOnlyTheHostCheckPathReadsTheTemplateCache(t *testing.T) {
+	// The cache TTL is long now, which is only safe because a launch
+	// never reads it: ask_limit_on_launch is what keeps a run off the
+	// whole inventory, and it can be switched off in the AWX UI between
+	// one pass and the next. If a launch is ever wired through the cached
+	// path, that safety property dies silently - so assert the split
+	// rather than trusting the comment.
+	var requests int
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"count": 1, "results": []interface{}{map[string]interface{}{
+			"id": 1, "name": "setup", "inventory": 1, "ask_limit_on_launch": true, "ask_variables_on_launch": true,
+		}}})
+	}))
+	ref := TemplateRef{Name: "setup", Type: TemplateTypeJob}
+	connKey := "ns/awx/" + t.Name()
+
+	for i := 0; i < 3; i++ {
+		if _, err := resolveTemplateCached(context.Background(), c, connKey, ref); err != nil {
+			t.Fatalf("resolveTemplateCached: %v", err)
+		}
+	}
+	if requests != 1 {
+		t.Errorf("the host check path should resolve once and reuse it, made %d requests", requests)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := resolveTemplateForLaunch(context.Background(), c, connKey, ref); err != nil {
+			t.Fatalf("resolveTemplateForLaunch: %v", err)
+		}
+	}
+	if requests != 4 {
+		t.Errorf("every launch must re-read the template, total requests = %d, want 4", requests)
+	}
+
+	// And a launch refreshes what the host check path then sees, rather
+	// than leaving two views of the same template in play.
+	if _, err := resolveTemplateCached(context.Background(), c, connKey, ref); err != nil {
+		t.Fatalf("resolveTemplateCached after launch: %v", err)
+	}
+	if requests != 4 {
+		t.Errorf("a launch should have refreshed the cache, total requests = %d, want 4", requests)
+	}
+}

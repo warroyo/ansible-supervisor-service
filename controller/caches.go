@@ -124,11 +124,22 @@ func awxClientForConnection(ctx context.Context, client *dynamic.DynamicClient, 
 	return awxClient, basePath, nil
 }
 
-// templateCacheTTL is deliberately short. A cached template carries
-// ask_limit_on_launch with it, and that flag is the whole of what stops
-// a run going against an entire inventory instead of one host - see
-// resolveTemplateForLaunch, which never reads this cache at all.
-const templateCacheTTL = 30 * time.Second
+// templateCacheTTL bounds how long a resolved template is reused.
+//
+// It was seconds when a cached template could still be used for a
+// launch: the flags it carries - ask_limit_on_launch above all - are the
+// whole of what stops a run going against an entire inventory instead of
+// one host. That is no longer how launches work. resolveTemplateForLaunch
+// re-reads the template from AWX every time and never consults this
+// cache, so the only consumer left is the periodic host check, which
+// wants the template's inventory id.
+//
+// Five minutes is chosen against that consumer. An inventory repointed in
+// AWX takes effect on the next host check either way - a period of its
+// own, ten minutes by default - so a shorter TTL here bought nothing but
+// a second AWX request per VM per check, doubling the steady-state rate
+// for any deployment whose bindings do not share one template.
+const templateCacheTTL = 5 * time.Minute
 
 type templateCacheEntry struct {
 	tmpl    AWXTemplate
