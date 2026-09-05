@@ -5,6 +5,7 @@
 Supervisor service that binds VM Service `VirtualMachine`s to AWX/Tower job and workflow templates - the day-2 "run a playbook against this VM" experience Aria Automation's Ansible Automation Platform integration provides for classic vRA deployments, reproduced for Supervisor-native VMs.
 
 - [Quickstart](QUICKSTART.md) - shortest path to a first working run
+- [Scenarios](SCENARIOS.md) - what the controller does on a create, an update and a delete
 - [How it works](#how-it-works)
 - [Prerequisites](#prerequisites)
 - [Install](#install)
@@ -37,6 +38,8 @@ A few guardrails worth knowing about:
 - **The inventory host is reconciled against AWX, not against status.** Every `host_check_period` (600s by default) the host is read back from AWX, so one deleted or hand-edited in the AWX UI is recreated or repaired. Trusting the controller's own record instead would leave a deleted host undetected, and every later run failing with `--limit does not match any hosts` with nothing to repair it. Variables the controller doesn't manage are left untouched; a steady state writes nothing, and between checks an idle VM costs AWX nothing at all. A spec change or a re-run request is not on that timer - both take effect on the next pass.
 - **Hosts nothing accounts for are reaped.** Less often (four host-check periods), each binding lists the AWX hosts carrying its own ownership marker and deletes any that no VM and no child accounts for - what a controller killed mid-cleanup leaves behind. Only hosts this supervisor created for that binding are ever considered, and `cleanupPolicy: Retain` disables it.
 - **In-flight runs are tracked independently of the VM.** A VM powering off mid-run doesn't lose the job, and re-run requests made during downtime aren't swallowed. See [the FAQ](FAQ.md#what-happens-to-in-flight-runs-when-a-vm-powers-off).
+
+Step by step, for each of these - a binding created, a VM relabelled in or out, a spec edited, a host hand-deleted in AWX, a binding torn down - see [Scenarios](SCENARIOS.md).
 
 ## Prerequisites
 

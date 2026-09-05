@@ -8,6 +8,8 @@
 - [What's different about Workflow Templates?](#whats-different-about-workflow-templates)
 - [What happens to in-flight runs when a VM powers off?](#what-happens-to-in-flight-runs-when-a-vm-powers-off)
 
+For a walkthrough of what the controller does on a create, an update or a delete, see [Scenarios](SCENARIOS.md).
+
 ## I used the AAP integration in classic Aria Automation. What maps to what?
 
 Classic Aria Automation (vRA) had a built-in Ansible Automation Platform integration: you registered an AAP endpoint org-wide, dropped a `Cloud.Ansible.Tower` resource into a cloud template, and the machine being provisioned was handed to it. It only ever applies to VMs vRA provisions that way, so it cannot touch Supervisor-native VMs - and in a **VCF Automation 9.x All Apps** organization the `Cloud.Ansible.Tower` resource type is not available at all.
