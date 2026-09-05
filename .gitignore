@@ -4,3 +4,5 @@ ansible-supervisor.yml
 config/crd.yml
 /controller/ansible-supervisor-service
 config/config-release.yml
+# Built by test/e2e.sh, and by anyone running `go build` in there.
+/test/fakeawx/fakeawx

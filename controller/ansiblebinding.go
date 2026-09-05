@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"reflect"
@@ -14,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 )
 
@@ -83,17 +85,15 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 
 	triggerValue := ac.Annotations[ReconcileRequestedAtAnnotation]
 
-	var mu sync.Mutex
 	var firstErr error
 	recordErr := func(e error) {
-		mu.Lock()
-		defer mu.Unlock()
 		if firstErr == nil {
 			firstErr = e
 		}
 	}
 
 	matched := map[string]bool{}
+	vmUIDs := map[string]types.UID{}
 
 	// The writes this pass wants, collected before any of them is
 	// issued. A generation bump across a binding matching thousands of
@@ -101,12 +101,13 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 	// - the exact shape the split existed to remove, reappearing one
 	// level up. Collecting them first is what lets the burst be bounded
 	// and the rest carried to the next pass.
-	var writes []func() error
+	var writes, deletions []func() error
 
 	for i := range vms {
 		vm := vms[i]
 		name := vm.GetName()
 		matched[name] = true
+		vmUIDs[name] = vm.GetUID()
 
 		desired := childSpecFor(&ac, name, triggerValue)
 
@@ -136,44 +137,53 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 				existing.Name, existing.Spec.BindingName, ac.Name))
 			continue
 		}
+		if !existing.DeletionTimestamp.IsZero() || !bindingChildMatchesVM(&existing, vm.GetUID()) {
+			continue
+		}
 		if reflect.DeepEqual(*existing.Spec, desired) {
 			continue
 		}
-		childNamespace, childObjName := existing.Namespace, existing.Name
 		writes = append(writes, func() error {
-			if uErr := applyBindingChildSpec(ctx, client, childNamespace, childObjName, desired); uErr != nil {
+			if uErr := updateBindingChildSpec(ctx, client, &existing, desired); uErr != nil {
 				return fmt.Errorf("updating the AnsibleBindingVM for VM %q: %w", name, uErr)
 			}
 			return nil
 		})
 	}
 
-	// A child whose VM no longer matches is deleted. Its own finalizer
-	// then cleans up the AWX host, so nothing is leaked by removing it
-	// here.
+	// Delete obsolete children independently of creation failures. In
+	// particular, exhausted object quota must not block the deletes that
+	// free it. A replacement VM must finish retiring its old child first.
+	var summaryChildren []AnsibleBindingVM
 	for _, c := range children {
-		if c.Spec == nil || matched[c.Spec.VMName] || c.Spec.BindingName != ac.Name {
+		if c.Spec == nil || c.Spec.BindingName != ac.Name {
 			continue
 		}
-		if !c.DeletionTimestamp.IsZero() {
+		currentVM := matched[c.Spec.VMName] && bindingChildMatchesVM(&c, vmUIDs[c.Spec.VMName])
+		if currentVM || !c.DeletionTimestamp.IsZero() {
+			summaryChildren = append(summaryChildren, c)
+		}
+		if currentVM {
 			continue
 		}
 		child := c
-		writes = append(writes, func() error {
-			if dErr := client.Resource(ansBindVMGVR).Namespace(child.Namespace).Delete(ctx, child.Name, metav1.DeleteOptions{}); dErr != nil && !apierrors.IsNotFound(dErr) {
-				return fmt.Errorf("deleting the AnsibleBindingVM for VM %q: %w", child.Spec.VMName, dErr)
-			}
-			return nil
+		deletions = append(deletions, func() error {
+			return deleteBindingChild(ctx, client, &child, ac.Spec.CleanupPolicy)
 		})
 	}
 
+	deleted, dErr := issueChildWrites(deletions)
+	if dErr != nil {
+		recordErr(dErr)
+	}
 	issued, wErr := issueChildWrites(writes)
 	if wErr != nil {
 		recordErr(wErr)
 	}
-	deferred := len(writes) - issued
+	deferred := len(writes) - issued + len(deletions) - deleted
+	issued += deleted
 
-	summary := summarize(children, matched, ac.Generation, triggerValue)
+	summary := summarize(summaryChildren, matched, ac.Generation, triggerValue)
 
 	// Orphan reaping is rare, destructive and costs an AWX request, so
 	// it runs on its own period rather than every pass - and never while
@@ -341,32 +351,79 @@ func createBindingChild(ctx context.Context, client *dynamic.DynamicClient, ac *
 	return err
 }
 
-// childSpecFieldManager owns the child's spec. The parent applies the
-// spec and nothing else, so the labels and ownerReference set at
-// creation time are owned by another manager and left alone.
-const childSpecFieldManager = "ansible-supervisor-binding"
-
-// applyBindingChildSpec server-side-applies the spec the binding wants
-// on one child. The GET-then-Update it replaces was two round trips to
-// write one field set, per child, on every generation bump.
-func applyBindingChildSpec(ctx context.Context, client *dynamic.DynamicClient, namespace, name string, spec AnsibleBindingVMSpec) error {
-	specMap, err := structToMap(spec)
+// updateBindingChildSpec replaces the entire parent-owned spec in one
+// request. Unlike apply after Create, this removes omitted optional fields.
+// Preconditions prevent stale informer data from updating a replacement;
+// JSON Patch also cannot recreate a child that has been deleted.
+func updateBindingChildSpec(ctx context.Context, client *dynamic.DynamicClient, child *AnsibleBindingVM, spec AnsibleBindingVMSpec) error {
+	patch, err := childSpecPatch(child, spec)
 	if err != nil {
-		return fmt.Errorf("encoding spec: %w", err)
+		return err
 	}
-	child := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": ansBindVMGVR.GroupVersion().String(),
-		"kind":       "AnsibleBindingVM",
-		"metadata": map[string]interface{}{
-			"name":      name,
-			"namespace": namespace,
-		},
-		"spec": specMap,
-	}}
-	_, err = client.Resource(ansBindVMGVR).Namespace(namespace).Apply(
-		ctx, name, child, metav1.ApplyOptions{FieldManager: childSpecFieldManager, Force: true},
-	)
+	_, err = client.Resource(ansBindVMGVR).Namespace(child.Namespace).Patch(ctx, child.Name, types.JSONPatchType, patch, metav1.PatchOptions{})
 	return err
+}
+
+// childSpecPatch replaces the whole spec, guarded on the child still
+// being the object that was read.
+//
+// Replacing rather than merging is the point: an omitted optional field
+// has to disappear, so that clearing spec.hostName clears it on the
+// child, and useDefaultLimit going true to false actually narrows the
+// run. Server-side apply after a Create does not do that - the creating
+// field manager still owns the fields the apply leaves out, so they
+// survive - which is how an unset useDefaultLimit stayed true and kept a
+// run scoped to the whole inventory.
+func childSpecPatch(child *AnsibleBindingVM, spec AnsibleBindingVMSpec) ([]byte, error) {
+	patch, err := json.Marshal([]map[string]interface{}{
+		{"op": "test", "path": "/metadata/uid", "value": string(child.UID)},
+		{"op": "test", "path": "/metadata/resourceVersion", "value": child.ResourceVersion},
+		{"op": "replace", "path": "/spec", "value": spec},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encoding child spec patch: %w", err)
+	}
+	return patch, nil
+}
+
+func bindingChildMatchesVM(child *AnsibleBindingVM, uid types.UID) bool {
+	ownerUID, err := checkOwnedByItsVM(child)
+	return err == nil && ownerUID != "" && ownerUID == string(uid)
+}
+
+// deleteBindingChild deletes one child, first copying the policy in force
+// down to it.
+//
+// Policy changes have to remain effective during finalization, when the
+// normal parent reconcile no longer runs and so no longer copies its spec
+// down - otherwise setting cleanupPolicy: Retain on a binding already
+// stuck on an unreachable AWX changes nothing, which is the one thing the
+// docs promise it does.
+//
+// An empty policy means "leave whatever the child already carries": the
+// parent's spec is gone, so there is nothing to copy down and guessing
+// would risk turning a Retain into a Delete.
+func deleteBindingChild(ctx context.Context, client *dynamic.DynamicClient, child *AnsibleBindingVM, policy string) error {
+	if policy != "" && child.Spec != nil && child.Spec.CleanupPolicy != policy {
+		spec := *child.Spec
+		spec.CleanupPolicy = policy
+		if err := updateBindingChildSpec(ctx, client, child, spec); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("updating cleanup policy on AnsibleBindingVM %q: %w", child.Name, err)
+		}
+	}
+	if !child.DeletionTimestamp.IsZero() {
+		return nil
+	}
+	err := client.Resource(ansBindVMGVR).Namespace(child.Namespace).Delete(ctx, child.Name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &child.UID},
+	})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("deleting AnsibleBindingVM %q: %w", child.Name, err)
+	}
+	return nil
 }
 
 // listBindingChildrenCached lists a binding's children out of the
@@ -431,7 +488,8 @@ func listBindingChildren(ctx context.Context, client *dynamic.DynamicClient, nam
 // window between the request and the first child acting on it. Anything
 // waiting on the binding would take that as "the new playbook has run".
 func summarize(children []AnsibleBindingVM, matched map[string]bool, wantGeneration int64, wantTrigger string) BindingSummary {
-	var s BindingSummary
+	s := BindingSummary{Total: len(matched), Pending: len(matched)}
+	seen := map[string]bool{}
 	for _, c := range children {
 		if c.Spec == nil {
 			continue
@@ -446,10 +504,11 @@ func summarize(children []AnsibleBindingVM, matched map[string]bool, wantGenerat
 			s.Terminating++
 			continue
 		}
-		if !matched[c.Spec.VMName] {
+		if !matched[c.Spec.VMName] || seen[c.Spec.VMName] {
 			continue
 		}
-		s.Total++
+		seen[c.Spec.VMName] = true
+		s.Pending--
 		var phase, state, message string
 		stale := true
 		if c.Status != nil {
@@ -705,11 +764,12 @@ func cleanupAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, o
 			continue
 		}
 		remaining++
-		if !c.DeletionTimestamp.IsZero() {
-			continue
+		policy := ""
+		if ac.Spec != nil {
+			policy = ac.Spec.CleanupPolicy
 		}
-		if dErr := client.Resource(ansBindVMGVR).Namespace(c.Namespace).Delete(ctx, c.Name, metav1.DeleteOptions{}); dErr != nil && !apierrors.IsNotFound(dErr) {
-			return fmt.Errorf("deleting AnsibleBindingVM %q: %w", c.Name, dErr)
+		if err := deleteBindingChild(ctx, client, &c, policy); err != nil {
+			return err
 		}
 	}
 	if remaining > 0 {

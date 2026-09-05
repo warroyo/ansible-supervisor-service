@@ -355,6 +355,33 @@ spec:
                   type: string
                 lastJobStatus:
                   type: string
+                lastJobType:
+                  type: string
+                  enum: [JobTemplate, WorkflowTemplate]
+                  description: template type used to launch lastJobID, unaffected by subsequent spec changes
+                lastJobConnection:
+                  type: object
+                  description: connection settings used at launch, including the resolved API path and Secret references but never Secret contents
+                  properties:
+                    url:
+                      type: string
+                    secretRef:
+                      type: string
+                    apiBasePath:
+                      type: string
+                    insecureSkipVerify:
+                      type: boolean
+                    caBundleSecretRef:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        key:
+                          type: string
+                      required: [name]
+                    hostNamePrefix:
+                      type: string
+                  required: [url, secretRef, apiBasePath]
                 history:
                   type: array
                   description: bounded log of recent runs for this VM, most recent first

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -60,6 +61,11 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 	// forward rather than blanked.
 	st := prior
 	st.History = append([]VMRunHistoryEntry(nil), prior.History...)
+	// Run outcome and reconciliation errors are separate: repairing a
+	// host must not permanently turn a successful job into a failed one.
+	if st.LastJobID != 0 {
+		st.Phase = mapAWXStatus(st.LastJobStatus)
+	}
 
 	var firstErr error
 	recordErr := func(e error) {
@@ -140,40 +146,11 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		return finish()
 	}
 
-	awxConnObj, err := getAWXConnection(ctx, client, child.Namespace, child.Spec.AWXConnectionRef)
-	if err != nil {
-		return Result{}, fmt.Errorf("fetching AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
-	}
-	awxConn, err := convertAWXConnection(awxConnObj)
-	if err != nil {
-		return Result{}, fmt.Errorf("decoding AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
-	}
-	if awxConn.Spec == nil {
-		return Result{}, fmt.Errorf("AWXConnection %q has no spec", child.Spec.AWXConnectionRef)
-	}
-	awxClient, basePath, err := awxClientForConnection(ctx, client, awxConn)
-	if err != nil {
-		return Result{}, fmt.Errorf("preparing a client for AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
-	}
-
-	// Everything recorded below - host id, inventory id - is an id issued
-	// by one AWX instance. Point the connection somewhere else and those
-	// ids belong to whatever unrelated objects hold them there, so drop
-	// them rather than act on them: the host is then looked up by name on
-	// the new instance and adopted or created like any other.
-	endpoint := awxEndpointFingerprint(awxConn.Spec.URL, basePath)
-	if st.AWXEndpoint != "" && st.AWXEndpoint != endpoint {
-		log.Printf("[AnsibleBindingVM/%s/%s] AWXConnection %q now points at a different AWX instance: forgetting host %d in inventory %d rather than acting on ids from the old one",
-			child.Namespace, child.Name, child.Spec.AWXConnectionRef, st.AWXHostID, st.AWXInventoryID)
-		st.AWXHostID, st.AWXInventoryID, st.AWXHostName, st.AWXHostCreated = 0, 0, "", false
-	}
-	st.AWXEndpoint = endpoint
-
 	// Poll any in-flight job first: its outcome doesn't depend on the
 	// VM's current power state, so this must happen even if the VM has
 	// since powered off - and it needs no template lookup.
 	if inFlight {
-		status, sErr := pollJobStatus(ctx, awxClient, child.Spec.Template.Type, prior.LastJobID)
+		status, sErr := pollRecordedJob(ctx, client, &child, prior)
 		if sErr != nil {
 			st.Phase = PhaseRunning
 			recordErr(fmt.Errorf("polling job %d: %w", prior.LastJobID, sErr))
@@ -205,6 +182,39 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		return finish()
 	}
 
+	awxConnObj, err := getAWXConnection(ctx, client, child.Namespace, child.Spec.AWXConnectionRef)
+	if err != nil {
+		recordErr(fmt.Errorf("fetching AWXConnection %q: %w", child.Spec.AWXConnectionRef, err))
+		return finish()
+	}
+	awxConn, err := convertAWXConnection(awxConnObj)
+	if err != nil {
+		recordErr(fmt.Errorf("decoding AWXConnection %q: %w", child.Spec.AWXConnectionRef, err))
+		return finish()
+	}
+	if awxConn.Spec == nil {
+		recordErr(fmt.Errorf("AWXConnection %q has no spec", child.Spec.AWXConnectionRef))
+		return finish()
+	}
+	awxClient, basePath, err := awxClientForConnection(ctx, client, awxConn)
+	if err != nil {
+		recordErr(fmt.Errorf("preparing a client for AWXConnection %q: %w", child.Spec.AWXConnectionRef, err))
+		return finish()
+	}
+
+	// Everything recorded below - host id, inventory id - is an id issued
+	// by one AWX instance. Point the connection somewhere else and those
+	// ids belong to whatever unrelated objects hold them there, so drop
+	// them rather than act on them: the host is then looked up by name on
+	// the new instance and adopted or created like any other.
+	endpoint := awxEndpointFingerprint(awxConn.Spec.URL, basePath)
+	if st.AWXEndpoint != "" && st.AWXEndpoint != endpoint {
+		log.Printf("[AnsibleBindingVM/%s/%s] AWXConnection %q now points at a different AWX instance: forgetting host %d in inventory %d rather than acting on ids from the old one",
+			child.Namespace, child.Name, child.Spec.AWXConnectionRef, st.AWXHostID, st.AWXInventoryID)
+		st.AWXHostID, st.AWXInventoryID, st.AWXHostName, st.AWXHostCreated = 0, 0, "", false
+	}
+	st.AWXEndpoint = endpoint
+
 	// A launch resolves the template from AWX every time, never from the
 	// cache: ask_limit_on_launch is what stops a run going against the
 	// whole inventory, and it can be switched off in the AWX UI between
@@ -217,7 +227,8 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		tmpl, err = resolveTemplateCached(ctx, awxClient, connKey, child.Spec.Template)
 	}
 	if err != nil {
-		return Result{}, err
+		recordErr(err)
+		return finish()
 	}
 
 	targetsHost := !child.Spec.UseDefaultLimit && tmpl.Inventory != nil
@@ -228,7 +239,8 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 	// AWX between the parent's pass and this one must not quietly widen
 	// the run to the whole inventory.
 	if err := checkTemplateLaunchFields(tmpl, child.Spec.Template.Name, targetsHost, len(child.Spec.ExtraVars) > 0); err != nil {
-		return Result{}, err
+		recordErr(err)
+		return finish()
 	}
 
 	hostName := child.Spec.VMName
@@ -257,6 +269,20 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		// inventory - while a second one appears alongside it.
 		renamed := st.AWXHostName != "" && st.AWXHostName != hostName
 		moved := st.AWXInventoryID != 0 && st.AWXInventoryID != inventoryID
+		// A previous upsert may have reached AWX before its ID reached
+		// status. Recover it before moving to a different name/inventory.
+		if st.AWXInventoryID != 0 && st.AWXHostName != "" && (renamed || moved) {
+			host, err := awxClient.FindHost(ctx, int(st.AWXInventoryID), st.AWXHostName)
+			if err != nil {
+				recordErr(fmt.Errorf("recovering previous AWX host: %w", err))
+				return finish()
+			}
+			st.AWXHostID, st.AWXHostCreated = 0, false
+			if host != nil {
+				st.AWXHostID = int64(host.ID)
+				st.AWXHostCreated = strings.TrimSpace(host.Description) == ownerMarker
+			}
+		}
 		if st.AWXHostID != 0 && (renamed || moved) {
 			if st.AWXHostCreated && cleanupPolicy == CleanupPolicyDelete {
 				if dErr := awxClient.DeleteHost(ctx, int(st.AWXHostID)); dErr != nil {
@@ -282,9 +308,25 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		// status cannot see it: the run would then fail forever with
 		// "--limit does not match any hosts", or quietly run against
 		// hand-edited variables, and nothing would ever repair it.
+		if st.AWXHostID == 0 {
+			// Persist the lookup coordinates BEFORE creating anything in
+			// AWX. Finalization can recover a created host even if the
+			// process dies before saving the returned host ID.
+			st.AWXHostName, st.AWXInventoryID = hostName, inventoryID
+			st.AWXHostCreated = false
+			// Only when it says something new. A child whose host cannot
+			// be created - AWX down - reaches here on every host check,
+			// and rewriting the same intent each time would put back a
+			// per-pass round trip.
+			if !ansibleBindingVMDetailsCurrent(child.Status, st) {
+				if err := writeAnsibleBindingVMDetails(ctx, client, u, st); err != nil {
+					recordErr(fmt.Errorf("recording AWX host intent: %w", err))
+					return finish()
+				}
+			}
+		}
 		hostID, owned, hErr := awxClient.UpsertHost(ctx, *tmpl.Inventory, hostName, ownerMarker, hostVars)
 		if hErr != nil {
-			st.Phase = PhaseFailed
 			recordErr(fmt.Errorf("upserting AWX host: %w", hErr))
 			return finish()
 		}
@@ -322,6 +364,10 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 		st.LastJobID = int64(jobID)
 		st.LastJobURL = awxClient.JobURL(jobID, child.Spec.Template.Type == TemplateTypeWorkflow)
 		st.LastJobStatus = "pending"
+		st.LastJobType = child.Spec.Template.Type
+		connection := *awxConn.Spec
+		connection.APIBasePath = basePath
+		st.LastJobConnection = &connection
 		st.Phase = PhaseRunning
 		st.History = upsertHistory(st.History, VMRunHistoryEntry{JobID: int64(jobID), Status: "pending", StartedAt: nowRFC3339()})
 		st.AppliedGeneration = child.Spec.BindingGeneration
@@ -335,6 +381,57 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 	}
 	requeueAfter = hostCheckPeriod
 	return finish()
+}
+
+// pollRecordedJob uses the immutable launch settings, not the next run's
+// desired spec. Only Secret references are recorded; token/CA contents are
+// read afresh so credential rotation still works during a long-running job.
+func pollRecordedJob(ctx context.Context, client *dynamic.DynamicClient, child *AnsibleBindingVM, st AnsibleBindingVMStatus) (string, error) {
+	// A job launched before this controller recorded launch identity has
+	// neither field, and a non-terminal job is never abandoned - so
+	// refusing to poll it would wedge that child forever, and an upgrade
+	// while any job was in flight would wedge one per running job. Poll
+	// it the way the controller that launched it would have: with the
+	// connection and template type the spec names now.
+	if !hasRecordedLaunchIdentity(st) {
+		log.Printf("[AnsibleBindingVM/%s/%s] job %d predates recorded launch identity: polling it with the current connection and template type",
+			child.Namespace, child.Name, st.LastJobID)
+		awxConnObj, err := getAWXConnection(ctx, client, child.Namespace, child.Spec.AWXConnectionRef)
+		if err != nil {
+			return "", fmt.Errorf("fetching AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
+		}
+		awxConn, err := convertAWXConnection(awxConnObj)
+		if err != nil || awxConn.Spec == nil {
+			return "", fmt.Errorf("decoding AWXConnection %q: %w", child.Spec.AWXConnectionRef, err)
+		}
+		awxClient, _, err := awxClientForConnection(ctx, client, awxConn)
+		if err != nil {
+			return "", err
+		}
+		return pollJobStatus(ctx, awxClient, child.Spec.Template.Type, st.LastJobID)
+	}
+	conn := AWXConnection{ObjectMeta: metav1.ObjectMeta{Namespace: child.Namespace, Name: child.Spec.AWXConnectionRef}, Spec: st.LastJobConnection}
+	token, err := getSecretValue(ctx, client, child.Namespace, conn.Spec.SecretRef, "token")
+	if err != nil {
+		return "", fmt.Errorf("reading recorded job credential: %w", err)
+	}
+	awxClient, _, err := awxClientFor(ctx, client, conn, token)
+	if err != nil {
+		return "", err
+	}
+	return pollJobStatus(ctx, awxClient, st.LastJobType, st.LastJobID)
+}
+
+// hasRecordedLaunchIdentity reports whether a job's status says which AWX
+// instance and which kind of template it was launched against. Without
+// both, the id alone is not enough to poll it: the same number is a
+// different job on a different instance, and /jobs/42/ and
+// /workflow_jobs/42/ are different objects on the same one.
+func hasRecordedLaunchIdentity(st AnsibleBindingVMStatus) bool {
+	if st.LastJobConnection == nil || st.LastJobConnection.URL == "" || st.LastJobConnection.SecretRef == "" {
+		return false
+	}
+	return st.LastJobType == TemplateTypeJob || st.LastJobType == TemplateTypeWorkflow
 }
 
 // checkOwnedByItsVM refuses to reconcile a child that is not owned by
@@ -503,25 +600,23 @@ func cleanupAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient,
 		return nil
 	}
 	child, err := convertAnsibleBindingVM(u)
-	if err != nil || child.Spec == nil || child.Status == nil {
+	if err != nil || child.Spec == nil {
 		return nil
 	}
 	if child.Spec.CleanupPolicy == CleanupPolicyRetain {
 		return nil
 	}
-	if child.Status.AWXHostID == 0 || !child.Status.AWXHostCreated {
-		return nil
-	}
+	st := priorVMState(&child)
 
 	abandon := func(reason string, err error) {
 		log.Printf("[AnsibleBindingVM/%s/%s] cleanup: %s, abandoning AWX host %d: %v",
-			child.Namespace, child.Name, reason, child.Status.AWXHostID, err)
+			child.Namespace, child.Name, reason, st.AWXHostID, err)
 	}
 
 	awxConnObj, err := getAWXConnection(ctx, client, child.Namespace, child.Spec.AWXConnectionRef)
 	if err != nil {
 		if !isPermanent(err) {
-			return fmt.Errorf("fetching AWXConnection %q to clean up AWX host %d: %w", child.Spec.AWXConnectionRef, child.Status.AWXHostID, err)
+			return fmt.Errorf("fetching AWXConnection %q to clean up AWX host %d: %w", child.Spec.AWXConnectionRef, st.AWXHostID, err)
 		}
 		abandon(fmt.Sprintf("AWXConnection %q is gone", child.Spec.AWXConnectionRef), err)
 		return nil
@@ -542,18 +637,55 @@ func cleanupAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient,
 			return nil
 		}
 		return fmt.Errorf("preparing a client to clean up AWX host %d "+
-			"(set spec.cleanupPolicy: Retain to release this object and leave it in place): %w", child.Status.AWXHostID, err)
+			"(set spec.cleanupPolicy: Retain to release this object and leave it in place): %w", st.AWXHostID, err)
 	}
 	// Deleting by id on an instance that did not issue that id would
 	// delete some unrelated host. There is nothing to clean up here: the
 	// host this object created is on the old instance, which the
 	// connection no longer names.
-	if endpoint := awxEndpointFingerprint(awxConn.Spec.URL, basePath); child.Status.AWXEndpoint != "" && child.Status.AWXEndpoint != endpoint {
+	if endpoint := awxEndpointFingerprint(awxConn.Spec.URL, basePath); st.AWXEndpoint != "" && st.AWXEndpoint != endpoint {
 		abandon(fmt.Sprintf("AWXConnection %q now points at a different AWX instance", child.Spec.AWXConnectionRef), nil)
 		return nil
 	}
-	if err := awxClient.DeleteHost(ctx, int(child.Status.AWXHostID)); err != nil {
-		return fmt.Errorf("deleting AWX host %d: %w", child.Status.AWXHostID, err)
+	// Resolve by name and verify ownership even with a saved ID: an AWX
+	// host deleted out of band may have been recreated just before a crash.
+	{
+		inventory, name := st.AWXInventoryID, st.AWXHostName
+		if inventory == 0 || name == "" {
+			// Also handle a child with no status. Never assume a missing
+			// ID alone proves there is no external host to clean up.
+			tmpl, err := resolveTemplate(ctx, awxClient, child.Spec.Template)
+			if err != nil {
+				if isPermanent(err) {
+					// The template is gone or ambiguous, so there is no
+					// way left to work out which inventory to look in.
+					// Blocking the delete forever would not find it.
+					abandon("the template names no resolvable inventory", err)
+					return nil
+				}
+				return fmt.Errorf("resolving inventory for host cleanup: %w", err)
+			}
+			if tmpl.Inventory == nil {
+				return nil
+			}
+			inventory = int64(*tmpl.Inventory)
+			name = child.Spec.HostName
+			if name == "" {
+				name = child.Spec.VMName
+			}
+			name = awxConn.Spec.HostNamePrefix + name
+		}
+		host, err := awxClient.FindHost(ctx, int(inventory), name)
+		if err != nil {
+			return fmt.Errorf("rediscovering AWX host for cleanup: %w", err)
+		}
+		if host == nil || strings.TrimSpace(host.Description) != hostOwnerMarker(child.Namespace, child.Spec.BindingName) {
+			return nil
+		}
+		st.AWXHostID = int64(host.ID)
+	}
+	if err := awxClient.DeleteHost(ctx, int(st.AWXHostID)); err != nil {
+		return fmt.Errorf("deleting AWX host %d: %w", st.AWXHostID, err)
 	}
 	return nil
 }

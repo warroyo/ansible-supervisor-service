@@ -274,6 +274,10 @@ type AnsibleBindingVMStatus struct {
 	LastJobID     int64  `json:"lastJobID,omitempty"`
 	LastJobURL    string `json:"lastJobURL,omitempty"`
 	LastJobStatus string `json:"lastJobStatus,omitempty"`
+	// Launch identity is independent of the current desired template and
+	// connection. Secrets themselves are never copied into status.
+	LastJobType       string             `json:"lastJobType,omitempty"`
+	LastJobConnection *AWXConnectionSpec `json:"lastJobConnection,omitempty"`
 
 	// LastHostCheck is when this VM's inventory host was last reconciled
 	// against AWX itself. It lives in status rather than in memory so the

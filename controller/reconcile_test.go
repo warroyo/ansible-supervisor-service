@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -364,5 +365,113 @@ func TestAWXEndpointFingerprintDistinguishesInstances(t *testing.T) {
 	}
 	if a == awxEndpointFingerprint("https://awx.example.com", "/api/controller/v2") {
 		t.Error("a different API root is a different endpoint")
+	}
+}
+
+func TestChildSpecPatchReplacesRatherThanMerges(t *testing.T) {
+	// The bug this replaced: the child is created under one field manager
+	// and was then updated by server-side apply under another, so fields
+	// the apply omitted stayed owned by the creating manager and survived.
+	// useDefaultLimit true -> false is omitempty, so it vanished from the
+	// applied config and the child kept running against the whole
+	// inventory.
+	child := &AnsibleBindingVM{ObjectMeta: metav1.ObjectMeta{
+		Name: "bind-web-1-abc", Namespace: "ns", UID: "child-uid", ResourceVersion: "42",
+	}}
+	spec := AnsibleBindingVMSpec{
+		VMName: "web-1", BindingName: "bind", AWXConnectionRef: "awx",
+		Template: TemplateRef{Name: "Configure Webserver", Type: TemplateTypeJob},
+	}
+
+	raw, err := childSpecPatch(child, spec)
+	if err != nil {
+		t.Fatalf("childSpecPatch: %v", err)
+	}
+	var ops []map[string]interface{}
+	if err := json.Unmarshal(raw, &ops); err != nil {
+		t.Fatalf("patch is not valid JSON Patch: %v", err)
+	}
+	if len(ops) != 3 {
+		t.Fatalf("expected uid test, resourceVersion test and a spec replace, got %d ops", len(ops))
+	}
+	if ops[0]["op"] != "test" || ops[0]["path"] != "/metadata/uid" || ops[0]["value"] != "child-uid" {
+		t.Errorf("first op should pin the object identity, got %v", ops[0])
+	}
+	if ops[1]["op"] != "test" || ops[1]["path"] != "/metadata/resourceVersion" || ops[1]["value"] != "42" {
+		t.Errorf("second op should pin the version read, got %v", ops[1])
+	}
+	if ops[2]["op"] != "replace" || ops[2]["path"] != "/spec" {
+		t.Fatalf("third op should replace the whole spec, got %v", ops[2])
+	}
+
+	// The value carries no useDefaultLimit and no hostName at all - which
+	// is the point: replacing the whole spec makes the API server apply
+	// the CRD default rather than leaving the previous value in place.
+	value := ops[2]["value"].(map[string]interface{})
+	for _, absent := range []string{"useDefaultLimit", "hostName"} {
+		if _, found := value[absent]; found {
+			t.Errorf("%q should be absent from a spec that does not set it, got %v", absent, value[absent])
+		}
+	}
+	if value["vmName"] != "web-1" {
+		t.Errorf("the spec that is set must survive, got %v", value["vmName"])
+	}
+}
+
+func TestSummarizeCountsAMatchedVMWithNoChildYet(t *testing.T) {
+	// The child is created during the pass, so it is not in the snapshot
+	// this pass summarized. Counting only the children present reported
+	// 1 of 1 succeeded - Ready - while a matched VM had never run.
+	children := []AnsibleBindingVM{{
+		Spec:   &AnsibleBindingVMSpec{VMName: "web-1"},
+		Status: &AnsibleBindingVMStatus{Phase: PhaseSucceeded, AppliedGeneration: 2, AppliedTrigger: "t1"},
+	}}
+	matched := map[string]bool{"web-1": true, "web-2": true}
+
+	got := summarize(children, matched, 2, "t1")
+	if got.Total != 2 {
+		t.Errorf("total should count every matched VM, got %d", got.Total)
+	}
+	if got.Succeeded != 1 || got.Pending != 1 {
+		t.Errorf("the VM with no child yet is pending, got %+v", got)
+	}
+
+	obj := &unstructured.Unstructured{Object: map[string]interface{}{
+		"status": map[string]interface{}{"summary": map[string]interface{}{
+			"total": int64(got.Total), "succeeded": int64(got.Succeeded), "pending": int64(got.Pending),
+		}},
+	}}
+	if status := updateAnsibleBindingStatus(obj, true, nil); status["ready"] != false {
+		t.Errorf("a binding with a VM that has never run must not be ready: %v", status)
+	}
+}
+
+func TestHasRecordedLaunchIdentity(t *testing.T) {
+	full := AnsibleBindingVMStatus{
+		LastJobID:         42,
+		LastJobType:       TemplateTypeJob,
+		LastJobConnection: &AWXConnectionSpec{URL: "https://awx.example.com", SecretRef: "awx-token", APIBasePath: "/api/v2"},
+	}
+	if !hasRecordedLaunchIdentity(full) {
+		t.Error("a job launched with its identity recorded should be polled with it")
+	}
+	// A job launched before this was recorded has to stay pollable, or an
+	// upgrade wedges one child per job in flight - a non-terminal job is
+	// never abandoned, so it would never resolve.
+	noIdentity := full
+	noIdentity.LastJobConnection = nil
+	noIdentity.LastJobType = ""
+	if hasRecordedLaunchIdentity(noIdentity) {
+		t.Error("a job with no recorded identity must fall back rather than claim one")
+	}
+	noType := full
+	noType.LastJobType = ""
+	if hasRecordedLaunchIdentity(noType) {
+		t.Error("a connection without a template type cannot say which endpoint to poll")
+	}
+	noURL := full
+	noURL.LastJobConnection = &AWXConnectionSpec{SecretRef: "awx-token"}
+	if hasRecordedLaunchIdentity(noURL) {
+		t.Error("a connection with no URL cannot be rebuilt")
 	}
 }

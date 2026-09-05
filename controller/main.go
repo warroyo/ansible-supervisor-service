@@ -33,6 +33,28 @@ func main() {
 	apiQPSFlag := flag.Float64("api-qps", 50, "sustained requests per second this controller makes to the Kubernetes API server")
 	apiBurstFlag := flag.Int("api-burst", 100, "how far above --api-qps a burst of requests may go, e.g. creating children for a selector that suddenly matches many VMs")
 	flag.Parse()
+
+	// Nonsense here is quiet and expensive rather than loud: a zero
+	// reconcile timeout fails every pass before it starts, a zero API
+	// burst blocks every request behind the rate limiter, and a zero host
+	// check period puts the AWX traffic back to once per VM per resync.
+	// Refuse at startup instead, where it is one line in the log.
+	for _, check := range []struct {
+		name string
+		ok   bool
+	}{
+		{"--resync-period must be a positive number of seconds", *resync > 0},
+		{"--reconcile-timeout must be a positive number of seconds", *reconcileTimeoutFlag > 0},
+		{"--host-check-period must be a positive number of seconds", *hostCheckFlag > 0},
+		{"--api-qps must be greater than zero", *apiQPSFlag > 0},
+		{"--api-burst must be at least --api-qps", float64(*apiBurstFlag) >= *apiQPSFlag},
+	} {
+		if !check.ok {
+			fmt.Fprintln(os.Stderr, check.name)
+			os.Exit(2)
+		}
+	}
+
 	resyncPeriod := time.Duration(*resync) * time.Second
 	reconcileTimeout = time.Duration(*reconcileTimeoutFlag) * time.Second
 	hostCheckPeriod = time.Duration(*hostCheckFlag) * time.Second

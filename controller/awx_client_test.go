@@ -372,37 +372,24 @@ func TestListOwnedHostsRechecksTheMarkerItFilteredOn(t *testing.T) {
 	}
 }
 
-func TestUpsertKnownHostSkipsTheLookupButStillRepairsDrift(t *testing.T) {
-	store := newHostStore()
-	c := testClient(t, store.handler())
-	marker := "ansible-supervisor:sup-1:ns/binding"
-	vars := map[string]string{"ansible_host": "10.0.0.5"}
-
-	id := store.seed("web-1", marker, `{"ansible_host":"10.0.0.5"}`)
-	known := hostResult{ID: id, Name: "web-1", Description: marker, Variables: `{"ansible_host":"10.0.0.5"}`}
-
-	gotID, owned, err := c.UpsertKnownHost(context.Background(), 1, "web-1", marker, vars, known)
-	if err != nil || gotID != id || !owned {
-		t.Fatalf("UpsertKnownHost: id=%d owned=%v err=%v", gotID, owned, err)
-	}
-	if store.gets != 0 {
-		t.Errorf("made %d per-host lookups, want 0 - the host was already known", store.gets)
-	}
-	if store.patched != 0 {
-		t.Errorf("patched %d times with nothing to change, want 0", store.patched)
-	}
-
-	// The IP moved: the variables differ from what AWX holds, so this
-	// still has to be repaired without a lookup.
-	drifted := hostResult{ID: id, Name: "web-1", Description: marker, Variables: `{"ansible_host":"10.0.0.9"}`}
-	if _, _, err := c.UpsertKnownHost(context.Background(), 1, "web-1", marker, vars, drifted); err != nil {
-		t.Fatalf("UpsertKnownHost after drift: %v", err)
-	}
-	if store.patched != 1 {
-		t.Errorf("patched %d times, want 1", store.patched)
-	}
-	if store.gets != 0 {
-		t.Errorf("made %d per-host lookups, want 0", store.gets)
+func TestMergeHostVariablesHandlesAnEmptyDocument(t *testing.T) {
+	// AWX stores host variables as a YAML/JSON string, and an empty YAML
+	// document round-trips as the JSON literal null. That decodes without
+	// error into a nil map, and writing to a nil map panics - which, in a
+	// worker with no recover, takes the whole controller down for every
+	// namespace over one host somebody edited.
+	for _, existing := range []string{"null", " null ", "{}", "", "---"} {
+		got, err := mergeHostVariables(existing, map[string]string{"ansible_host": "10.0.0.5"})
+		if err != nil {
+			t.Fatalf("mergeHostVariables(%q): %v", existing, err)
+		}
+		var out map[string]string
+		if err := json.Unmarshal([]byte(got), &out); err != nil {
+			t.Fatalf("mergeHostVariables(%q) produced %q: %v", existing, got, err)
+		}
+		if out["ansible_host"] != "10.0.0.5" {
+			t.Errorf("mergeHostVariables(%q) = %q, want ansible_host merged in", existing, got)
+		}
 	}
 }
 
@@ -410,7 +397,7 @@ func TestMergeHostVariablesRefusesNonObjectVariables(t *testing.T) {
 	if _, err := mergeHostVariables("- a\n- b\n", map[string]string{"x": "y"}); err == nil {
 		t.Fatal("expected a refusal rather than destroying the existing variables")
 	}
-	for _, empty := range []string{"", "---", "{}"} {
+	for _, empty := range []string{"", "---", "{}", "null", " null\n"} {
 		got, err := mergeHostVariables(empty, map[string]string{"x": "y"})
 		if err != nil {
 			t.Fatalf("mergeHostVariables(%q): %v", empty, err)
@@ -418,5 +405,47 @@ func TestMergeHostVariablesRefusesNonObjectVariables(t *testing.T) {
 		if got != `{"x":"y"}` {
 			t.Errorf("mergeHostVariables(%q) = %s", empty, got)
 		}
+	}
+}
+
+func TestLaunchReadsWhicheverFieldCarriesTheJobID(t *testing.T) {
+	// A launch AWX accepted but whose id was not recorded is relaunched on
+	// the next pass, and the one after that - so an unrecognised response
+	// shape has to be an error rather than a silent zero.
+	launch := func(t *testing.T, body string, workflow bool) (int, error) {
+		t.Helper()
+		c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		if workflow {
+			return c.LaunchWorkflowJobTemplate(context.Background(), 1, "web-1", nil)
+		}
+		return c.LaunchJobTemplate(context.Background(), 1, "web-1", nil)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		body     string
+		workflow bool
+		want     int
+	}{
+		{"job template answering with job", `{"job": 7, "id": 7}`, false, 7},
+		{"job template answering with id alone", `{"id": 7}`, false, 7},
+		{"workflow answering with workflow_job", `{"workflow_job": 8, "id": 8}`, true, 8},
+		{"workflow answering with id alone", `{"id": 8}`, true, 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := launch(t, tc.body, tc.workflow)
+			if err != nil {
+				t.Fatalf("launch: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("job id = %d, want %d", got, tc.want)
+			}
+		})
+	}
+
+	if _, err := launch(t, `{"detail": "queued"}`, false); err == nil {
+		t.Error("a launch with no id anywhere must be an error, not an untracked run")
 	}
 }

@@ -201,10 +201,11 @@ Both CRDs track reconciliation state in `.status`:
 
 | State     | Description |
 |-----------|-------------|
-| `Pending` | Not yet able to run: provisioning hasn't run, no VM matches `vmSelector`, or a matched VM is powered off / has no reported IP |
+| `Pending` | Not yet able to run, or not yet done: provisioning hasn't run, no VM matches `vmSelector`, a matched VM is powered off / has no reported IP, or a matched VM has not yet completed the run this generation asked for |
 | `Running` | At least one VM's run is still in flight in AWX |
 | `Ready`   | Every currently-matched VM completed the requested run successfully |
 | `Failed`  | A reconciliation error, or a run that AWX reported as failed. See `message`, and `status.summary.failedVMs` for which specific VM(s) |
+| `Terminating` | Every matched VM is gone, but a child is still being cleaned up - typically an AWX host that will not delete. `status.summary.terminating` counts them |
 
 An `AnsibleBinding`'s state is aggregated from its children's outcomes, not just from whether the last reconcile threw an error - a job that AWX ran and failed is not a controller error, but it is not `Ready` either.
 
@@ -236,6 +237,7 @@ kubectl get ansiblebindingvm -n <namespace> -l field.vmware.com/binding=<binding
 | `phase` | `Pending` (never ran, waiting on the VM) / `Running` / `Succeeded` / `Failed` |
 | `awxHostID`, `awxHostName`, `awxInventoryID`, `awxHostCreated` | The AWX inventory host, the name and inventory it lives under, and whether this controller owns it (adopted hosts are never deleted) |
 | `lastJobID`, `lastJobURL`, `lastJobStatus` | The most recent run and a link to its output in AWX |
+| `lastJobType`, `lastJobConnection` | Which template kind and which AWX instance that run was launched against, so it is still polled correctly if the binding is repointed while it is in flight. Secret *references* only - no token or CA contents are ever copied into status |
 | `appliedGeneration`, `appliedTrigger` | What this VM last launched a run for - how re-run requests are tracked per VM |
 | `awxEndpoint` | Fingerprint of the AWX instance the ids above came from. Repoint the `AWXConnection` at a different instance and those ids belong to unrelated objects there, so the child forgets them and looks its host up by name again rather than acting on them |
 | `lastHostCheck` | When the inventory host was last reconciled against AWX. The next check is due `host_check_period` after it; passes in between cost no AWX requests at all |
