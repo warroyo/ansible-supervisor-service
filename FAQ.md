@@ -4,9 +4,13 @@
 - [Which AWX/Tower/AAP versions are supported?](#which-awxtoweraap-versions-are-supported)
 - [Why does my template need Prompt on Launch for Limit?](#why-does-my-template-need-prompt-on-launch-for-limit)
 - [Can several supervisors share one AWX instance?](#can-several-supervisors-share-one-awx-instance)
+- [Can a playbook run twice for one request?](#can-a-playbook-run-twice-for-one-request)
+- [I edited a host in the AWX UI. How long until the controller puts it back?](#i-edited-a-host-in-the-awx-ui-how-long-until-the-controller-puts-it-back)
 - [How do I find AWX hosts a supervisor left behind?](#how-do-i-find-awx-hosts-a-supervisor-left-behind)
 - [What's different about Workflow Templates?](#whats-different-about-workflow-templates)
 - [What happens to in-flight runs when a VM powers off?](#what-happens-to-in-flight-runs-when-a-vm-powers-off)
+- [Can two bindings target the same VM?](#can-two-bindings-target-the-same-vm)
+- [Can I run a playbook when a VM is deleted?](#can-i-run-a-playbook-when-a-vm-is-deleted)
 
 For a walkthrough of what the controller does on a create, an update or a delete, see [Scenarios](SCENARIOS.md).
 
@@ -24,7 +28,7 @@ This service puts the same capability on the Supervisor, as CRDs. Nothing here r
 | What can be targeted | Exactly the one machine being provisioned | Every VM the selector matches, now and later |
 | When it runs | Once, at provisioning time | At provisioning time and on demand afterwards - bump the `reconcile-requested-at` annotation or edit the spec |
 | Drift in AWX | Not tracked | The inventory host is reconciled against AWX itself on a timer (`host_check_period`, 600s); one deleted or hand-edited in the UI is repaired |
-| Teardown | Deprovisioning removes the host | The binding's finalizer removes the AWX hosts it created (`cleanupPolicy: Retain` opts out) |
+| Teardown | `templates.de-provision[]` runs, then the host is removed | `spec.onDeleted` runs when a VM is deleted, then the host is removed (`cleanupPolicy: Retain` opts out) - see [Can I run a playbook when a VM is deleted?](#can-i-run-a-playbook-when-a-vm-is-deleted) |
 | AAP 2.5+ | [Broken](#which-awxtoweraap-versions-are-supported) - KB 394498 says stay on 2.4 | Detected and supported |
 
 Two differences are worth internalizing rather than skimming:
@@ -124,8 +128,42 @@ GET /api/v2/hosts/?inventory=<id>&description__startswith=ansible-supervisor:<su
 
 Workflow templates commonly have no inventory of their own, since each node can carry one. When that's the case there's no inventory for the controller to create a host in and nothing to scope a `--limit` against, so the binding effectively behaves like `useDefaultLimit: true` for that template regardless of what the spec says.
 
+For `onDeleted` the same situation is a refusal rather than a silent widening, because a teardown that ran unscoped would decommission the whole inventory. Set `onDeleted.targeting: Template` to launch such a workflow deliberately: the controller then supplies neither inventory nor limit and the workflow runs against what it is configured for. Either way the controller never walks a workflow's nodes - what each node targets is AWX's business.
+
 ## What happens to in-flight runs when a VM powers off?
 
 The run is tracked independently of the VM, so nothing is lost. A job already running is still polled to completion, and the VM keeps its last run's phase rather than reverting to `Pending`.
 
 Re-run requests made during downtime aren't swallowed either. Whether a run is needed is decided per VM (each `AnsibleBindingVM`'s `status.appliedGeneration` / `appliedTrigger` against the `bindingGeneration` / `bindingTrigger` its binding copied down), so a spec change or annotation bump made while one VM's job is still running - or while a VM is powered off - is honored as soon as that VM can act on it.
+
+## Can two bindings target the same VM?
+
+They can select it, but only one can own it. A VM's lifecycle - its provisioning run, its AWX inventory host, and its `onDeleted` hook - belongs to a single `AnsibleBinding`, whichever one claimed it first. Another binding matching the same VM reports `Conflict`, names the owner in `status.summary.conflictedVMs`, and does nothing to that VM: no child, no job, no host changes. Its other VMs are unaffected.
+
+That is a deliberate limit rather than a missing feature. Two bindings on one machine means two AWX runs against it with no ordering between them, two claims on the same inventory host, and two teardown playbooks when it is deleted.
+
+To run several playbooks for one VM, put them in one AWX workflow and point one binding at it. A workflow's nodes can use different inventories, run in sequence or in parallel, and act on more than that VM - none of which the controller inspects or restricts.
+
+Ownership is released when the owner stops selecting the VM or is deleted, once its child has finished cleaning up; a waiting binding takes over within about half a minute. One thing does not transfer automatically: under `cleanupPolicy: Retain` the AWX host keeps the old binding's ownership marker, so the new owner refuses to touch it until you retire that host or give the new binding its own `hostNamePrefix`.
+
+## Can I run a playbook when a VM is deleted?
+
+Yes - `spec.onDeleted` on the binding. It launches when a matched `VirtualMachine` is **deleted**, before that VM's AWX inventory host is removed, and the finalizer holds the object until the job reaches a terminal state. See [onDeleted](README.md#ansiblebinding) in the CRD reference for the field, and [Deletes](SCENARIOS.md#deletes) for the step-by-step.
+
+Three questions come up every time.
+
+**Can it talk to the guest?** No, and this is not a limitation that can be engineered around. vm-operator destroys the virtual machine during its own finalization, so by the time anything of ours runs there is no machine to reach. Both routes to an earlier hook are closed to this service: the `delete.check.vmoperator.vmware.com` annotation is gated on vm-operator's `PRIVILEGED_USERS`, which VCF bakes into the manager Deployment, and a finalizer on the `VirtualMachine` itself is not something a Carvel package can add. So `onDeleted` is for the **external record** - DNS, IPAM, CMDB, monitoring, licences - and the controller sets `ansible_connection: local` on the host before launching to keep a forgetful playbook from trying anyway.
+
+If you need work done *inside* the guest before it goes, do it before the delete: drain continuously, or remove the VM from the binding's selector while it is still alive and run a decommission playbook against it then.
+
+**What if the playbook fails?** The host is deleted and the object finishes deleting anyway. Blocking would mean one broken deregistration playbook can wedge a VM, its binding and any namespace being deleted above it, which is the worse failure by a distance. The outcome is recorded in the controller log with the AWX job URL and as an Event on the `AnsibleBinding`:
+
+```bash
+kubectl get events -n my-namespace --field-selector involvedObject.name=my-binding
+```
+
+The child object carries `status.deprovision` while it exists, so `kubectl get ansiblebindingvm -o yaml` shows a hook mid-flight. It goes when the child does; the Event is what remains.
+
+**What if the records are not on the machine?** Set `onDeleted.targeting: Template` and the controller supplies no inventory and no limit, leaving the aiming to the template - a workflow that retires a DNS record, an IPAM lease and a CMDB entry in three different inventories, or a `hosts: localhost` playbook that calls an API. The hook then runs whether or not this VM's inventory host still exists, and the controller neither pins nor edits that host. The default, `ManagedHost`, is unchanged: the run is scoped to this VM's host with a `--limit`.
+
+**Does it fire when I relabel a VM out of the selector?** No. That VM is still running, and a decommission playbook against a live machine is damage, not cleanup. Its inventory host is still cleaned up. The same applies to a VM deleted and recreated under the same name: the hook fires for the UID that went away, not for its replacement.
