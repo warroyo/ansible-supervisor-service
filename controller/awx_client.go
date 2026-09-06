@@ -542,6 +542,103 @@ func (c *AWXClient) UpsertHost(ctx context.Context, inventoryID int, hostname, o
 	return createdHost.ID, true, nil
 }
 
+// SetHostVariables merges vars into an existing host's variables,
+// leaving the rest of them - and the ownership marker in the description
+// - alone. Nothing is created: a host that is not there is not an error
+// worth failing a teardown over.
+//
+// This is what pins a deprovision playbook to the control node.
+// ansible_connection: local makes the run execute where AWX is rather
+// than over SSH, and by the time a deprovision hook fires the guest is
+// destroyed and its address may already have been re-leased by IPAM to
+// somebody else's machine. A playbook that forgets delegate_to would
+// otherwise connect to whatever now answers on that address.
+func (c *AWXClient) SetHostVariables(ctx context.Context, host *hostResult, vars map[string]string) error {
+	if host == nil || len(vars) == 0 {
+		return nil
+	}
+	merged, err := mergeHostVariables(host.Variables, vars)
+	if err != nil {
+		return fmt.Errorf("updating variables on host %q: %w", host.Name, err)
+	}
+	if merged == strings.TrimSpace(host.Variables) {
+		return nil
+	}
+	body := map[string]interface{}{"variables": merged}
+	if err := c.do(ctx, http.MethodPatch, fmt.Sprintf("%s/hosts/%d/", c.basePath, host.ID), body, nil); err != nil {
+		return fmt.Errorf("updating variables on host %q: %w", host.Name, err)
+	}
+	host.Variables = merged
+	return nil
+}
+
+// HostVariable reads one variable off a host, reporting whether it was
+// set at all. An unparseable variables document is treated as unset:
+// nothing here is worth failing a teardown over, and SetHostVariables
+// refuses that document separately.
+func hostVariable(host *hostResult, key string) (string, bool) {
+	if host == nil {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(host.Variables)
+	if trimmed == "" || trimmed == "---" {
+		return "", false
+	}
+	var current map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &current); err != nil {
+		return "", false
+	}
+	v, ok := current[key]
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(string)
+	return s, ok
+}
+
+// RestoreHostVariable puts one variable back to what it was: prior nil
+// removes it, a prior value sets it.
+//
+// A merge cannot express removal, which is the whole reason this exists
+// - a deprovision hook pins ansible_connection on a host that may
+// outlive it, and leaving that pin behind would send the next
+// provisioning run to the AWX control node instead of the machine.
+func (c *AWXClient) RestoreHostVariable(ctx context.Context, host *hostResult, key string, prior *string) error {
+	if host == nil {
+		return nil
+	}
+	current := map[string]interface{}{}
+	if trimmed := strings.TrimSpace(host.Variables); trimmed != "" && trimmed != "---" {
+		if err := json.Unmarshal([]byte(trimmed), &current); err != nil {
+			return fmt.Errorf("restoring %s on host %q: existing variables are not a JSON object: %w", key, host.Name, err)
+		}
+		if current == nil {
+			current = map[string]interface{}{}
+		}
+	}
+	if prior == nil {
+		if _, present := current[key]; !present {
+			return nil
+		}
+		delete(current, key)
+	} else {
+		if existing, ok := current[key].(string); ok && existing == *prior {
+			return nil
+		}
+		current[key] = *prior
+	}
+	b, err := json.Marshal(current)
+	if err != nil {
+		return fmt.Errorf("restoring %s on host %q: %w", key, host.Name, err)
+	}
+	body := map[string]interface{}{"variables": string(b)}
+	if err := c.do(ctx, http.MethodPatch, fmt.Sprintf("%s/hosts/%d/", c.basePath, host.ID), body, nil); err != nil {
+		return fmt.Errorf("restoring %s on host %q: %w", key, host.Name, err)
+	}
+	host.Variables = string(b)
+	return nil
+}
+
 // DeleteHost removes a host by ID. A 404 is treated as success: the host
 // is already gone, which is the desired end state.
 func (c *AWXClient) DeleteHost(ctx context.Context, id int) error {

@@ -13,19 +13,18 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-func TestChildNameIsUnambiguousBoundedAndStable(t *testing.T) {
-	// The collision plain concatenation allowed: one binding would sit
-	// permanently failing on a VM it could not adopt.
-	if childName("a-b", "c") == childName("a", "b-c") {
-		t.Error("binding a-b + VM c must not produce the same child name as binding a + VM b-c")
+func TestChildNameIsCanonicalPerVMBoundedAndStable(t *testing.T) {
+	// The claim only works because every binding computes the same name
+	// for one VM: two bindings selecting web-1 must collide on create.
+	if childName("web-1") != childName("web-1") {
+		t.Error("child names must be deterministic: the create is the arbitration")
 	}
-
-	if childName("bind", "web-1") != childName("bind", "web-1") {
-		t.Error("child names must be deterministic: the parent creates blind and relies on AlreadyExists")
+	if childName("web-1") == childName("web-2") {
+		t.Error("different VMs must get different children")
 	}
 
 	long := strings.Repeat("n", 300)
-	name := childName(long, long)
+	name := childName(long)
 	if len(name) > 253 {
 		t.Errorf("child name must fit a DNS subdomain, got %d characters", len(name))
 	}
@@ -33,14 +32,14 @@ func TestChildNameIsUnambiguousBoundedAndStable(t *testing.T) {
 		t.Errorf("truncation left a name that is not a valid DNS subdomain: %q", name)
 	}
 
-	// Truncation must not merge two distinct pairs into one name.
-	if childName(long, long+"x") == childName(long, long+"y") {
+	// Truncation must not merge two VMs into one claim.
+	if childName(long+"x") == childName(long+"y") {
 		t.Error("two VMs whose names differ past the truncation point must still get distinct children")
 	}
 
 	// The readable half is still readable.
-	if !strings.HasPrefix(childName("bind", "web-1"), "bind-web-1-") {
-		t.Errorf("expected the binding and VM names to stay legible, got %q", childName("bind", "web-1"))
+	if !strings.HasPrefix(childName("web-1"), "vm-web-1-") {
+		t.Errorf("expected the VM name to stay legible, got %q", childName("web-1"))
 	}
 }
 
@@ -125,7 +124,7 @@ func TestSummarizeCountsTerminatingChildrenSeparately(t *testing.T) {
 			Status:     &AnsibleBindingVMStatus{Phase: PhaseSucceeded},
 		},
 	}
-	s := summarize(children, map[string]bool{"web-1": true}, 0, "")
+	s := summarize(children, map[string]bool{"web-1": true}, nil, 0, "")
 	if s.Total != 1 || s.Succeeded != 1 {
 		t.Errorf("expected the live child to be counted once, got %+v", s)
 	}
@@ -304,13 +303,13 @@ func TestSummarizeCountsAChildOnAnOldGenerationAsPending(t *testing.T) {
 	}
 	matched := map[string]bool{"web-1": true}
 
-	if got := summarize(children, matched, 3, "t1"); got.Succeeded != 1 || got.Pending != 0 {
+	if got := summarize(children, matched, nil, 3, "t1"); got.Succeeded != 1 || got.Pending != 0 {
 		t.Errorf("a child on the current generation counts as succeeded, got %+v", got)
 	}
-	if got := summarize(children, matched, 4, "t1"); got.Pending != 1 || got.Succeeded != 0 {
+	if got := summarize(children, matched, nil, 4, "t1"); got.Pending != 1 || got.Succeeded != 0 {
 		t.Errorf("a new generation must put the binding back to pending, got %+v", got)
 	}
-	if got := summarize(children, matched, 3, "t2"); got.Pending != 1 || got.Succeeded != 0 {
+	if got := summarize(children, matched, nil, 3, "t2"); got.Pending != 1 || got.Succeeded != 0 {
 		t.Errorf("a new re-run trigger must put the binding back to pending, got %+v", got)
 	}
 
@@ -321,14 +320,14 @@ func TestSummarizeCountsAChildOnAnOldGenerationAsPending(t *testing.T) {
 		Spec:   &AnsibleBindingVMSpec{VMName: "web-1"},
 		Status: &AnsibleBindingVMStatus{Phase: PhaseFailed, AppliedGeneration: 3},
 	}}
-	if got := summarize(failedRun, matched, 4, ""); got.Pending != 1 || got.Failed != 0 {
+	if got := summarize(failedRun, matched, nil, 4, ""); got.Pending != 1 || got.Failed != 0 {
 		t.Errorf("an old failed run is pending a retry, got %+v", got)
 	}
 	brokenConfig := []AnsibleBindingVM{{
 		Spec:   &AnsibleBindingVMSpec{VMName: "web-1"},
 		Status: &AnsibleBindingVMStatus{State: "Failed", Message: "template not found", AppliedGeneration: 3},
 	}}
-	if got := summarize(brokenConfig, matched, 4, ""); got.Failed != 1 {
+	if got := summarize(brokenConfig, matched, nil, 4, ""); got.Failed != 1 {
 		t.Errorf("a child that cannot reconcile at all stays failed on any generation, got %+v", got)
 	}
 }
@@ -428,7 +427,7 @@ func TestSummarizeCountsAMatchedVMWithNoChildYet(t *testing.T) {
 	}}
 	matched := map[string]bool{"web-1": true, "web-2": true}
 
-	got := summarize(children, matched, 2, "t1")
+	got := summarize(children, matched, nil, 2, "t1")
 	if got.Total != 2 {
 		t.Errorf("total should count every matched VM, got %d", got.Total)
 	}

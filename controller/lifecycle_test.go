@@ -36,6 +36,36 @@ type reconcileFixture struct {
 	failHostSync   bool
 	jobStatus      string
 	launches       int
+
+	// Deprovision-hook plumbing: which flags the hook template reports,
+	// what each launch actually asked AWX for, per-job statuses, the
+	// events the controller recorded, and the parent binding when a test
+	// wants one to exist.
+	hookAskLimit     bool
+	hookAskVars      bool
+	hookInventory    int
+	hookTemplateFail bool
+	// ignoreLimit makes AWX answer a launch with a job id AND an
+	// ignored_fields list, the way it does when the template was not
+	// configured to accept what was asked for.
+	ignoreLimit   bool
+	launched      []launchRecord
+	jobStatusByID map[int]string
+	events        []map[string]interface{}
+	parent        *unstructured.Unstructured
+}
+
+// launchRecord is one AWX launch as the fixture saw it, so a test can
+// assert what a hook actually asked for rather than only that it fired.
+type launchRecord struct {
+	templateID int
+	workflow   bool
+	limit      string
+	// sentInventory records whether the launch carried an inventory
+	// override at all. Template targeting must send neither it nor a
+	// limit: an empty field and an absent one are not the same request.
+	sentInventory bool
+	extraVars     map[string]interface{}
 }
 
 func fixtureObject(t *testing.T, value interface{}, kind string) *unstructured.Unstructured {
@@ -59,14 +89,15 @@ func fixtureVM(name, uid string) unstructured.Unstructured {
 
 func newReconcileFixture(t *testing.T) *reconcileFixture {
 	t.Helper()
-	f := &reconcileFixture{children: map[string]*unstructured.Unstructured{}, hosts: newHostStore(), jobStatus: "running"}
+	f := &reconcileFixture{children: map[string]*unstructured.Unstructured{}, hosts: newHostStore(), jobStatus: "running",
+		hookAskLimit: true, hookAskVars: true, hookInventory: 1, jobStatusByID: map[int]string{}}
 	f.vms = []unstructured.Unstructured{fixtureVM("web-1", "vm-1")}
 	awx := httptest.NewServer(http.HandlerFunc(f.serveAWX))
 	t.Cleanup(awx.Close)
 	f.conn = AWXConnection{
 		// t.Name() carries the subtest path, and "/" is not legal in a
 		// resource name.
-		ObjectMeta: metav1.ObjectMeta{Name: childName(strings.ReplaceAll(t.Name(), "/", "-"), "connection"), Namespace: "ns", ResourceVersion: "1"},
+		ObjectMeta: metav1.ObjectMeta{Name: childName(strings.ReplaceAll(t.Name(), "/", "-") + "-connection"), Namespace: "ns", ResourceVersion: "1"},
 		Spec:       &AWXConnectionSpec{URL: awx.URL, APIBasePath: APIBasePathLegacy, SecretRef: "token"},
 	}
 	kube := httptest.NewServer(http.HandlerFunc(f.serveKube))
@@ -81,7 +112,7 @@ func newReconcileFixture(t *testing.T) *reconcileFixture {
 
 func (f *reconcileFixture) binding(t *testing.T, policy string) *unstructured.Unstructured {
 	return fixtureObject(t, AnsibleBinding{
-		ObjectMeta: metav1.ObjectMeta{Name: "bind", Namespace: "ns", Generation: 1},
+		ObjectMeta: metav1.ObjectMeta{Name: "bind", Namespace: "ns", UID: "bind-uid", Generation: 1},
 		Spec: &AnsibleBindingSpec{VMSelector: map[string]string{"app": "web"}, AWXConnectionRef: f.conn.Name,
 			Template: TemplateRef{Name: "setup", Type: TemplateTypeJob}, CleanupPolicy: policy},
 		Status: &AnsibleBindingStatus{LastOrphanScan: nowRFC3339()},
@@ -99,7 +130,7 @@ func (f *reconcileFixture) addChild(t *testing.T, vmName string, st *AnsibleBind
 	}
 	spec := childSpecFor(&ac, vmName, "")
 	u := fixtureObject(t, AnsibleBindingVM{
-		ObjectMeta: metav1.ObjectMeta{Name: childName("bind", vmName), Namespace: "ns", UID: types.UID("child-" + vmName), ResourceVersion: "1",
+		ObjectMeta: metav1.ObjectMeta{Name: childName(vmName), Namespace: "ns", UID: types.UID("child-" + vmName), ResourceVersion: "1",
 			Labels:          map[string]string{BindingLabel: bindingLabelValue("bind")},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: vmGVR.GroupVersion().String(), Kind: "VirtualMachine", Name: vmName, UID: vmUID}}},
 		Spec: &spec, Status: st,
@@ -117,14 +148,60 @@ func (f *reconcileFixture) serveAWX(w http.ResponseWriter, r *http.Request) {
 	case strings.Contains(r.URL.Path, "/inventories/") && f.failHostSync:
 		http.Error(w, "temporary host-sync failure", http.StatusServiceUnavailable)
 	case strings.HasSuffix(r.URL.Path, "/job_templates/") || strings.HasSuffix(r.URL.Path, "/workflow_job_templates/"):
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"count": 1, "results": []interface{}{map[string]interface{}{
-			"id": 1, "name": "setup", "inventory": 1, "ask_limit_on_launch": true, "ask_variables_on_launch": true,
-		}}})
+		// Echo whichever template was asked for: the client refuses a
+		// result whose name does not match, and a hook names a different
+		// template from the provisioning run.
+		name := r.URL.Query().Get("name")
+		id, askLimit, askVars, inventory := 1, true, true, 1
+		if name != "setup" {
+			if f.hookTemplateFail {
+				http.Error(w, "temporary template-lookup failure", http.StatusServiceUnavailable)
+				return
+			}
+			id, askLimit, askVars, inventory = 2, f.hookAskLimit, f.hookAskVars, f.hookInventory
+		}
+		result := map[string]interface{}{
+			"id": id, "name": name, "inventory": inventory, "ask_limit_on_launch": askLimit, "ask_variables_on_launch": askVars,
+		}
+		// A negative inventory stands for a template with none of its
+		// own, which is ordinary on a workflow template.
+		if inventory < 0 {
+			delete(result, "inventory")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"count": 1, "results": []interface{}{result}})
 	case strings.HasSuffix(r.URL.Path, "/launch/"):
+		rec := launchRecord{workflow: strings.Contains(r.URL.Path, "/workflow_job_templates/")}
+		prefix := APIBasePathLegacy + "/job_templates/"
+		if rec.workflow {
+			prefix = APIBasePathLegacy + "/workflow_job_templates/"
+		}
+		_, _ = fmt.Sscanf(strings.TrimPrefix(r.URL.Path, prefix), "%d/launch/", &rec.templateID)
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		rec.limit, _ = body["limit"].(string)
+		_, rec.sentInventory = body["inventory"]
+		// AWX takes extra_vars as a JSON document in a string field, not
+		// as an object, so decode it the way AWX would.
+		if raw, ok := body["extra_vars"].(string); ok && raw != "" {
+			_ = json.Unmarshal([]byte(raw), &rec.extraVars)
+		}
+		id := 42 + f.launches
 		f.launches++
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"id": 42})
+		f.launched = append(f.launched, rec)
+		response := map[string]interface{}{"id": id}
+		if f.ignoreLimit {
+			response["ignored_fields"] = map[string]interface{}{"limit": rec.limit}
+		}
+		_ = json.NewEncoder(w).Encode(response)
 	case strings.Contains(r.URL.Path, "/jobs/") || strings.Contains(r.URL.Path, "/workflow_jobs/"):
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": f.jobStatus})
+		var id int
+		trimmed := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, APIBasePathLegacy), "/workflow")
+		_, _ = fmt.Sscanf(trimmed, "/jobs/%d/", &id)
+		status := f.jobStatus
+		if byID, ok := f.jobStatusByID[id]; ok {
+			status = byID
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": status})
 	case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/hosts/"):
 		var id int
 		_, _ = fmt.Sscanf(strings.TrimPrefix(r.URL.Path, APIBasePathLegacy), "/hosts/%d/", &id)
@@ -169,6 +246,21 @@ func (f *reconcileFixture) serveKube(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			fail(404, "NotFound")
+		case strings.Contains(r.URL.Path, "/ansiblebindings/"):
+			// Only when a test wants the parent to still exist - an event
+			// recorded during finalization hangs off it when it does.
+			if f.parent == nil {
+				fail(404, "NotFound")
+				return
+			}
+			reply(f.parent.Object)
+		case strings.Contains(r.URL.Path, "/ansiblebindingvms/"):
+			name := strings.TrimPrefix(r.URL.Path[strings.Index(r.URL.Path, "/ansiblebindingvms/"):], "/ansiblebindingvms/")
+			if child := f.children[name]; child != nil {
+				reply(child.Object)
+				return
+			}
+			fail(404, "NotFound")
 		case strings.HasSuffix(r.URL.Path, "/ansiblebindingvms"):
 			items := []unstructured.Unstructured{}
 			for _, child := range f.children {
@@ -184,6 +276,13 @@ func (f *reconcileFixture) serveKube(w http.ResponseWriter, r *http.Request) {
 		var body map[string]interface{}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		reply(body)
+		return
+	}
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/events") {
+		var event map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&event)
+		f.events = append(f.events, event)
+		reply(event)
 		return
 	}
 	if r.Method == http.MethodPost {
@@ -365,7 +464,11 @@ func TestRetainPropagatesDuringParentFinalization(t *testing.T) {
 				now := metav1.Now()
 				f.children[u.GetName()].SetDeletionTimestamp(&now)
 			}
-			if err := cleanupAnsibleBinding(context.Background(), f.client, f.binding(t, CleanupPolicyRetain)); err == nil {
+			res, err := cleanupAnsibleBinding(context.Background(), f.client, f.binding(t, CleanupPolicyRetain))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Done {
 				t.Fatal("parent must wait for children")
 			}
 			got := f.children[u.GetName()]
@@ -373,7 +476,7 @@ func TestRetainPropagatesDuringParentFinalization(t *testing.T) {
 			if policy != CleanupPolicyRetain || got.GetDeletionTimestamp() == nil {
 				t.Fatalf("policy/deletion not propagated: %v", got.Object)
 			}
-			if err := cleanupAnsibleBindingVM(context.Background(), f.client, got); err != nil {
+			if _, err := cleanupAnsibleBindingVM(context.Background(), f.client, got); err != nil {
 				t.Fatal(err)
 			}
 			if len(f.awxRequests) != 0 {
@@ -466,7 +569,7 @@ func TestHostIntentSurvivesLostResultAndProtectsAdoptedHosts(t *testing.T) {
 			if child.Status == nil || child.Status.AWXHostID != 0 || child.Status.AWXInventoryID != 1 || child.Status.AWXHostName != "web-1" {
 				t.Fatalf("missing durable intent: %+v", child.Status)
 			}
-			if err := cleanupAnsibleBindingVM(context.Background(), f.client, saved); err != nil {
+			if _, err := cleanupAnsibleBindingVM(context.Background(), f.client, saved); err != nil {
 				t.Fatal(err)
 			}
 			if f.hosts.deleted[1] == adopted {
@@ -494,7 +597,7 @@ func TestCleanupWithoutStatusDiscoversOnlyOwnedHost(t *testing.T) {
 			f := newReconcileFixture(t)
 			f.hosts.seed("web-1", marker, "{}")
 			u := f.addChild(t, "web-1", nil)
-			if err := cleanupAnsibleBindingVM(context.Background(), f.client, u); err != nil {
+			if _, err := cleanupAnsibleBindingVM(context.Background(), f.client, u); err != nil {
 				t.Fatal(err)
 			}
 			if f.hosts.deleted[1] != (marker == hostOwnerMarker("ns", "bind")) {

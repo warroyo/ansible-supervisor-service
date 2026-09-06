@@ -100,7 +100,7 @@ func TestSummarizeCountsOnlyMatchedChildren(t *testing.T) {
 	}
 	matched := map[string]bool{"web-1": true, "web-2": true, "web-3": true, "web-4": true}
 
-	got := summarize(children, matched, 0, "")
+	got := summarize(children, matched, nil, 0, "")
 	want := BindingSummary{
 		Total: 4, Succeeded: 1, Failed: 1, Running: 1, Pending: 1,
 		FailedVMs: []string{"web-2"}, FirstFailure: "Job 91 failed.",
@@ -121,7 +121,7 @@ func TestSummarizeCountsReconcileFailures(t *testing.T) {
 			Message: `Reconciliation failed: template "Nope" does not accept a limit at launch time`,
 		},
 	}}
-	got := summarize(children, map[string]bool{"web-1": true}, 0, "")
+	got := summarize(children, map[string]bool{"web-1": true}, nil, 0, "")
 	if got.Failed != 1 || got.Pending != 0 {
 		t.Fatalf("a child that failed to reconcile should count as failed, got %+v", got)
 	}
@@ -141,7 +141,7 @@ func TestSummarizeBoundsFailedNames(t *testing.T) {
 			Status: &AnsibleBindingVMStatus{Phase: PhaseFailed},
 		})
 	}
-	got := summarize(children, matched, 0, "")
+	got := summarize(children, matched, nil, 0, "")
 	if got.Failed != 20 {
 		t.Errorf("failed count = %d, want 20", got.Failed)
 	}
