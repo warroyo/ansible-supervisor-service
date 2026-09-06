@@ -107,9 +107,9 @@ else:
 }
 
 child_name() {    # child_name <binding> <vm> -> prints the AnsibleBindingVM's name
-  # Child names carry a hash of the binding/VM pair, so they are no
-  # longer <binding>-<vm> and are not worth reconstructing here. The
-  # binding label plus spec.vmName is how the controller finds them too.
+  # A child is named after its VM alone, with a hash, so its name is not
+  # worth reconstructing here. The binding label plus spec.vmName is how
+  # the controller finds its own children too.
   kubectl get ansiblebindingvm -n "$TEST_NS" -l "field.vmware.com/binding=$1" \
     -o jsonpath="{.items[?(@.spec.vmName=='$2')].metadata.name}" 2>/dev/null
 }
@@ -120,6 +120,25 @@ vm_field() {      # vm_field <binding> <vm> <status field> -> prints the value
   name=$(child_name "$1" "$2")
   [[ -n "$name" ]] || return 0
   kubectl get ansiblebindingvm "$name" -n "$TEST_NS" -o jsonpath="{.status.$3}" 2>/dev/null
+}
+
+# Launches recorded by one fake AWX, filtered to a template id. The
+# deprovision hook is asserted through these rather than through the log:
+# what matters is the limit it carried, since a hook launched without one
+# would run against every host in the inventory.
+hook_launches() { # hook_launches <addr> <template id> -> prints a count
+  curl -sf "http://$1/_test/launches" \
+    | python3 -c "import json,sys; t=int(sys.argv[1]); print(sum(1 for l in json.load(sys.stdin) if l['templateID']==t))" "$2"
+}
+
+hook_launch_field() { # hook_launch_field <addr> <template id> <limit|extraVars> -> prints the last one's value
+  curl -sf "http://$1/_test/launches" \
+    | python3 -c "
+import json, sys
+t, field = int(sys.argv[1]), sys.argv[2]
+matches = [l for l in json.load(sys.stdin) if l['templateID'] == t]
+print(matches[-1][field] if matches else '')
+" "$2" "$3"
 }
 
 # Host and template requests the controller has made to one fake AWX.
@@ -133,7 +152,7 @@ awx_work_requests() {  # awx_work_requests <addr> -> prints a count
 # wait_for runs its command with "$@", which for a `bash -c "..."` check is
 # a brand new shell: without exporting these, a helper used inside one is
 # "command not found" and the check passes or fails for the wrong reason.
-export -f host_deleted host_field vm_field child_name awx_work_requests
+export -f host_deleted host_field vm_field child_name awx_work_requests hook_launches hook_launch_field
 export TEST_NS
 
 log "creating kind cluster $CLUSTER_NAME"
@@ -196,7 +215,11 @@ log "starting fakeawx"
 ( cd "$ROOT_DIR/test/fakeawx" && go build -o "$WORK_DIR/fakeawx" . )
 ( cd "$ROOT_DIR/controller" && go build -o "$WORK_DIR/controller" . )
 
-"$WORK_DIR/fakeawx" --addr="$AWX_ADDR" > "$WORK_DIR/fakeawx.log" 2>&1 &
+# --hold-template=4 keeps deprovision-hook jobs running until the suite
+# releases them: a job that goes terminal on its second poll would finish
+# before anything could look at the window that matters, when the
+# playbook is running and the host it targets must still exist.
+"$WORK_DIR/fakeawx" --addr="$AWX_ADDR" --hold-template=4 > "$WORK_DIR/fakeawx.log" 2>&1 &
 FAKEAWX_PID=$!
 wait_for "fakeawx listening" 15 curl -sf "http://${AWX_ADDR}/api/v2/me/"
 
@@ -841,8 +864,10 @@ log "unrelated host survived cleanup"
 # with no binding label, but it would otherwise reconcile happily:
 # creating AWX hosts, launching jobs, and - because spec.bindingName keys
 # the AWX ownership marker - able to point itself at another binding's
-# hosts.
-log "checking a hand-made AnsibleBindingVM with no VirtualMachine owner is refused"
+# hosts. It is also not the claim on the VM it names: children are named
+# after the VM alone, so an object under any other name is by definition
+# not the one binding that owns that VM's lifecycle.
+log "checking a hand-made AnsibleBindingVM that is not a VM's claim is refused"
 JOBS_BEFORE_HANDMADE=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
 
 cat <<EOF | kubectl apply -f - >/dev/null
@@ -861,7 +886,7 @@ spec:
 EOF
 
 wait_for "hand-made child is refused" 30 bash -c \
-  "kubectl get ansiblebindingvm e2e-handmade -n ${TEST_NS} -o jsonpath='{.status.message}' | grep -q ownerReference"
+  "kubectl get ansiblebindingvm e2e-handmade -n ${TEST_NS} -o jsonpath='{.status.message}' | grep -q 'not the claim'"
 
 sleep 4   # a couple of resyncs to relaunch on, if it were going to
 JOBS_AFTER_HANDMADE=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
@@ -947,5 +972,447 @@ log "restart kept host $RESTART_HOST and job $RESTART_JOB with zero new launches
 kubectl delete ansiblebinding e2e-restart -n "$TEST_NS" --timeout=60s >/dev/null
 wait_for "the AWX host is cleaned up" 30 host_deleted "$AWX_ADDR" "$RESTART_HOST"
 log "restart binding deleted cleanly"
+
+# --- deleting a VM must run its onDeleted hook before the host goes ---
+# The whole point of the hook: a VM that is deleted gets a deregistration
+# playbook run against its inventory host, and the host survives until
+# that job is terminal. The child is deleted by the garbage collector
+# when its owning VirtualMachine goes, so this exercises the real path -
+# no kubectl delete on the child itself.
+log "checking the onDeleted hook runs when a VirtualMachine is deleted"
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: vmoperator.vmware.com/v1alpha2
+kind: VirtualMachine
+metadata:
+  name: web-8
+  namespace: ${TEST_NS}
+  labels:
+    app: deprovision
+spec: {}
+status:
+  powerState: PoweredOn
+  network:
+    primaryIP4: "10.0.0.88"
+---
+apiVersion: field.vmware.com/v1
+kind: AnsibleBinding
+metadata:
+  name: e2e-deprovision
+  namespace: ${TEST_NS}
+spec:
+  vmSelector:
+    app: deprovision
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  onDeleted:
+    template:
+      name: "Deregister Host"
+      type: JobTemplate
+    timeoutSeconds: 120
+EOF
+
+wait_for "the deprovision binding runs once" 60 bash -c \
+  "[[ \$(vm_field e2e-deprovision web-8 phase) == Succeeded ]]"
+
+DEPROV_HOST=$(vm_field e2e-deprovision web-8 awxHostID)
+DEPROV_HOST_NAME=$(vm_field e2e-deprovision web-8 awxHostName)
+DEPROV_CHILD=$(child_name e2e-deprovision web-8)
+log "provisioned: host=$DEPROV_HOST ($DEPROV_HOST_NAME) child=$DEPROV_CHILD"
+
+if [[ "$(hook_launches "$AWX_ADDR" 4)" != "0" ]]; then
+  echo "the deprovision hook ran before anything was deleted"
+  exit 1
+fi
+
+log "deleting the VirtualMachine"
+kubectl delete virtualmachine web-8 -n "$TEST_NS" --wait=false >/dev/null
+
+wait_for "the hook launches" 60 bash -c \
+  "[[ \$(hook_launches ${AWX_ADDR} 4) == 1 ]]"
+
+# The host must still be there while the job runs against it: deleting it
+# first would leave the playbook with a --limit matching nothing.
+if host_deleted "$AWX_ADDR" "$DEPROV_HOST"; then
+  echo "the inventory host was deleted out from under the running hook"
+  exit 1
+fi
+
+HOOK_LIMIT=$(hook_launch_field "$AWX_ADDR" 4 limit)
+if [[ "$HOOK_LIMIT" != "$DEPROV_HOST_NAME" ]]; then
+  echo "the hook was not scoped to its own host: limit=$HOOK_LIMIT want=$DEPROV_HOST_NAME"
+  exit 1
+fi
+
+HOOK_VARS=$(hook_launch_field "$AWX_ADDR" 4 extraVars)
+for want in '"asb_hook": "onDeleted"' '"asb_vm_name": "web-8"' '"asb_binding": "e2e-deprovision"' '"asb_last_known_ip": "10.0.0.88"'; do
+  echo "$HOOK_VARS" | python3 -c "
+import json, sys
+key, value = sys.argv[1].split(': ', 1)
+vars = json.loads(sys.stdin.read() or '{}')
+sys.exit(0 if vars.get(json.loads(key)) == json.loads(value) else 1)
+" "$want" || { echo "the hook did not carry $want: $HOOK_VARS"; exit 1; }
+done
+
+# The guest is destroyed by now and its address may already be re-leased,
+# so the run has to be pinned to the control node.
+HOOK_HOST_VARS=$(host_field "$AWX_ADDR" "$DEPROV_HOST_NAME" variables)
+if ! echo "$HOOK_HOST_VARS" | grep -q '"ansible_connection":"local"'; then
+  echo "the host was not pinned to the control node before the hook ran: $HOOK_HOST_VARS"
+  exit 1
+fi
+log "hook launched with limit=$HOOK_LIMIT, pinned to the control node, host still present"
+
+# The hook's own state has to be on the object, not in the process, or
+# the next pass would start again from the beginning.
+wait_for "the hook's progress is recorded on the child" 30 bash -c \
+  "[[ \$(kubectl get ansiblebindingvm ${DEPROV_CHILD} -n ${TEST_NS} -o jsonpath='{.status.deprovision.phase}') == Running ]]"
+
+HOOK_JOB=$(hook_launch_field "$AWX_ADDR" 4 jobID)
+log "releasing held hook job $HOOK_JOB"
+curl -sf -X POST "http://${AWX_ADDR}/_test/finish-job?id=${HOOK_JOB}" >/dev/null
+
+wait_for "the host is removed once the hook is terminal" 90 host_deleted "$AWX_ADDR" "$DEPROV_HOST"
+wait_for "the child finishes finalizing" 60 bash -c \
+  "[[ -z \$(kubectl get ansiblebindingvm ${DEPROV_CHILD} -n ${TEST_NS} --ignore-not-found -o name) ]]"
+
+# The child took its status with it, so the record of what the teardown
+# did has to be somewhere that outlives it.
+wait_for "the outcome is recorded on the binding" 30 bash -c \
+  "kubectl get events -n ${TEST_NS} --field-selector involvedObject.name=e2e-deprovision -o jsonpath='{.items[*].reason}' | grep -q DeprovisionHook"
+log "hook completed, host removed, outcome recorded on the binding"
+
+# --- a VM that merely stops matching must NOT get the hook ---
+# Same object, same finalizer, entirely different intent: the VM is alive
+# and running, and a decommission playbook against it would be damage
+# rather than cleanup.
+log "checking a live VM that leaves the binding does not get the hook"
+HOOK_LAUNCHES_BEFORE_DETACH=$(hook_launches "$AWX_ADDR" 4)
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: vmoperator.vmware.com/v1alpha2
+kind: VirtualMachine
+metadata:
+  name: web-9
+  namespace: ${TEST_NS}
+  labels:
+    app: deprovision
+spec: {}
+status:
+  powerState: PoweredOn
+  network:
+    primaryIP4: "10.0.0.99"
+EOF
+
+wait_for "the second VM runs" 60 bash -c \
+  "[[ \$(vm_field e2e-deprovision web-9 phase) == Succeeded ]]"
+DETACH_HOST=$(vm_field e2e-deprovision web-9 awxHostID)
+
+log "relabelling it out of the selector"
+kubectl label virtualmachine web-9 -n "$TEST_NS" app=somewhere-else --overwrite >/dev/null
+
+wait_for "its host is cleaned up" 60 host_deleted "$AWX_ADDR" "$DETACH_HOST"
+if [[ "$(hook_launches "$AWX_ADDR" 4)" != "$HOOK_LAUNCHES_BEFORE_DETACH" ]]; then
+  echo "the hook fired for a VM that is still running"
+  exit 1
+fi
+log "relabelled VM kept its guest and got no deprovision playbook"
+
+kubectl delete virtualmachine web-9 -n "$TEST_NS" --timeout=60s >/dev/null
+kubectl delete ansiblebinding e2e-deprovision -n "$TEST_NS" --timeout=90s >/dev/null
+log "deprovision binding deleted cleanly"
+
+# --- switching to Retain while the hook runs must undo the pin --------
+# The hook pins ansible_connection: local so a playbook that forgets
+# delegate_to cannot reach an address the VM no longer owns. Under Delete
+# the host goes anyway, so the pin never matters. Change the policy while
+# the job is in flight - which the parent deliberately propagates into a
+# terminating child - and the host now survives carrying an override that
+# would send the next provisioning run to the AWX control node instead of
+# the machine. It has to come back off.
+log "checking a mid-hook switch to Retain hands the host back unpinned"
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: vmoperator.vmware.com/v1alpha2
+kind: VirtualMachine
+metadata:
+  name: web-10
+  namespace: ${TEST_NS}
+  labels:
+    app: retain-hook
+spec: {}
+status:
+  powerState: PoweredOn
+  network:
+    primaryIP4: "10.0.0.90"
+---
+apiVersion: field.vmware.com/v1
+kind: AnsibleBinding
+metadata:
+  name: e2e-retain-hook
+  namespace: ${TEST_NS}
+spec:
+  vmSelector:
+    app: retain-hook
+  awxConnectionRef: e2e-awx
+  cleanupPolicy: Delete
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  onDeleted:
+    template:
+      name: "Deregister Host"
+      type: JobTemplate
+    timeoutSeconds: 120
+EOF
+
+wait_for "the retain-hook binding runs once" 60 bash -c \
+  "[[ \$(vm_field e2e-retain-hook web-10 phase) == Succeeded ]]"
+
+RETAIN_HOOK_HOST=$(vm_field e2e-retain-hook web-10 awxHostID)
+RETAIN_HOOK_NAME=$(vm_field e2e-retain-hook web-10 awxHostName)
+RETAIN_HOOK_CHILD=$(child_name e2e-retain-hook web-10)
+RETAIN_HOOK_LAUNCHES=$(hook_launches "$AWX_ADDR" 4)
+
+# The host the controller created has no ansible_connection of its own,
+# so the pin is the only thing that can put one there and an absent value
+# is what "restored" has to mean.
+RETAIN_VARS_BEFORE=$(host_field "$AWX_ADDR" "$RETAIN_HOOK_NAME" variables)
+if echo "$RETAIN_VARS_BEFORE" | grep -q ansible_connection; then
+  echo "host $RETAIN_HOOK_NAME already had an ansible_connection: $RETAIN_VARS_BEFORE"
+  exit 1
+fi
+
+kubectl delete virtualmachine web-10 -n "$TEST_NS" --wait=false >/dev/null
+
+wait_for "the retain-hook hook launches" 60 bash -c \
+  "[[ \$(hook_launches ${AWX_ADDR} 4) == $((RETAIN_HOOK_LAUNCHES + 1)) ]]"
+wait_for "the hook is recorded as running on the child" 30 bash -c \
+  "[[ \$(kubectl get ansiblebindingvm ${RETAIN_HOOK_CHILD} -n ${TEST_NS} -o jsonpath='{.status.deprovision.phase}') == Running ]]"
+
+RETAIN_HOOK_VARS=$(host_field "$AWX_ADDR" "$RETAIN_HOOK_NAME" variables)
+if ! echo "$RETAIN_HOOK_VARS" | grep -q '"ansible_connection":"local"'; then
+  echo "the host was not pinned before the hook ran: $RETAIN_HOOK_VARS"
+  exit 1
+fi
+
+# Mid-flight, with the job still held: at launch time this host was not
+# expected to survive at all.
+log "switching e2e-retain-hook to cleanupPolicy: Retain with the hook still running"
+kubectl patch ansiblebinding e2e-retain-hook -n "$TEST_NS" --type=merge \
+  -p '{"spec":{"cleanupPolicy":"Retain"}}' >/dev/null
+
+RETAIN_HOOK_JOB=$(hook_launch_field "$AWX_ADDR" 4 jobID)
+curl -sf -X POST "http://${AWX_ADDR}/_test/finish-job?id=${RETAIN_HOOK_JOB}" >/dev/null
+
+wait_for "the child finishes finalizing" 60 bash -c \
+  "[[ -z \$(kubectl get ansiblebindingvm ${RETAIN_HOOK_CHILD} -n ${TEST_NS} --ignore-not-found -o name) ]]"
+
+if host_deleted "$AWX_ADDR" "$RETAIN_HOOK_HOST"; then
+  echo "the policy change to Retain did not take effect: host $RETAIN_HOOK_HOST was deleted"
+  exit 1
+fi
+
+RETAIN_VARS_AFTER=$(host_field "$AWX_ADDR" "$RETAIN_HOOK_NAME" variables)
+if echo "$RETAIN_VARS_AFTER" | grep -q ansible_connection; then
+  echo "the hook's pin outlived a hook that ended under Retain: $RETAIN_VARS_AFTER"
+  exit 1
+fi
+if [[ "$RETAIN_VARS_AFTER" != "$RETAIN_VARS_BEFORE" ]]; then
+  echo "the retained host was not handed back as it was found: before=$RETAIN_VARS_BEFORE after=$RETAIN_VARS_AFTER"
+  exit 1
+fi
+log "policy changed mid-hook: host kept, pin removed, variables back to what they were"
+
+kubectl delete ansiblebinding e2e-retain-hook -n "$TEST_NS" --timeout=90s >/dev/null
+if host_deleted "$AWX_ADDR" "$RETAIN_HOOK_HOST"; then
+  echo "deleting the binding removed host $RETAIN_HOOK_HOST, which Retain says to keep"
+  exit 1
+fi
+log "retain-hook binding deleted cleanly, host kept"
+
+# --- one binding per VM ---
+# Two bindings may select the same VM, but only one may own its
+# lifecycle: the child's name is derived from the VM alone, so the create
+# that wins is the arbitration. The loser must say so rather than run a
+# second playbook at the same machine.
+log "checking a second binding selecting the same VM is refused, not given a claim of its own"
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: vmoperator.vmware.com/v1alpha2
+kind: VirtualMachine
+metadata:
+  name: web-11
+  namespace: ${TEST_NS}
+  labels:
+    app: claimed
+spec: {}
+status:
+  powerState: PoweredOn
+  network:
+    primaryIP4: "10.0.0.111"
+---
+apiVersion: field.vmware.com/v1
+kind: AnsibleBinding
+metadata:
+  name: e2e-claim-a
+  namespace: ${TEST_NS}
+spec:
+  vmSelector:
+    app: claimed
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+EOF
+
+wait_for "the first binding claims web-11" 60 bash -c \
+  "[[ \$(vm_field e2e-claim-a web-11 phase) == Succeeded ]]"
+CLAIM_CHILD=$(child_name e2e-claim-a web-11)
+CLAIM_JOBS_BEFORE=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleBinding
+metadata:
+  name: e2e-claim-b
+  namespace: ${TEST_NS}
+spec:
+  vmSelector:
+    app: claimed
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+EOF
+
+wait_for "the second binding reports Conflict" 60 bash -c \
+  "[[ \$(kubectl get ansiblebinding e2e-claim-b -n ${TEST_NS} -o jsonpath='{.status.state}') == Conflict ]]"
+
+CLAIM_COUNT=$(kubectl get ansiblebindingvm -n "$TEST_NS" \
+  -o jsonpath="{.items[?(@.spec.vmName=='web-11')].metadata.name}" | wc -w)
+if [[ "$CLAIM_COUNT" != "1" ]]; then
+  echo "expected exactly one AnsibleBindingVM for web-11, found $CLAIM_COUNT"
+  exit 1
+fi
+
+CONFLICT_MSG=$(kubectl get ansiblebinding e2e-claim-b -n "$TEST_NS" -o jsonpath='{.status.message}')
+if ! echo "$CONFLICT_MSG" | grep -q "e2e-claim-a"; then
+  echo "the conflict does not name the binding holding the claim: $CONFLICT_MSG"
+  exit 1
+fi
+if [[ "$(kubectl get ansiblebinding e2e-claim-b -n "$TEST_NS" -o jsonpath='{.status.ready}')" == "true" ]]; then
+  echo "a binding that owns none of its selected VMs reported Ready"
+  exit 1
+fi
+
+sleep 4   # a resync or two for a second launch to happen on, if it would
+CLAIM_JOBS_AFTER=$(grep -c "fakeawx: launched job" "$WORK_DIR/fakeawx.log" || true)
+if [[ "$CLAIM_JOBS_BEFORE" != "$CLAIM_JOBS_AFTER" ]]; then
+  echo "the second binding launched a job against a VM it does not own: $CLAIM_JOBS_BEFORE -> $CLAIM_JOBS_AFTER"
+  exit 1
+fi
+
+# The claim's identity is what the exclusivity rests on, so the schema
+# refuses to let it be edited out from under a running job.
+if kubectl patch ansiblebindingvm "$CLAIM_CHILD" -n "$TEST_NS" --type=merge \
+  -p '{"spec":{"vmName":"web-1"}}' >/dev/null 2>&1; then
+  echo "spec.vmName was mutable: the claim can be pointed at another VM"
+  exit 1
+fi
+
+kubectl delete ansiblebinding e2e-claim-b -n "$TEST_NS" --timeout=60s >/dev/null
+sleep 2
+if [[ -z "$(kubectl get ansiblebindingvm "$CLAIM_CHILD" -n "$TEST_NS" --ignore-not-found -o name)" ]]; then
+  echo "deleting the conflicting binding took the owner's claim with it"
+  exit 1
+fi
+wait_for "the owning binding is still Ready" 60 bash -c \
+  "[[ \$(kubectl get ansiblebinding e2e-claim-a -n ${TEST_NS} -o jsonpath='{.status.ready}') == true ]]"
+kubectl delete ansiblebinding e2e-claim-a -n "$TEST_NS" --timeout=90s >/dev/null
+kubectl delete virtualmachine web-11 -n "$TEST_NS" --ignore-not-found --timeout=60s >/dev/null
+log "one claim, one owner: the second binding reported it and launched nothing"
+
+# --- onDeleted targeting: Template ---
+# A decommission whose records live somewhere other than the machine.
+# The workflow has no inventory of its own and no limit to prompt for -
+# refused under the default ManagedHost targeting, which is the point of
+# having the other mode - and the controller must supply neither, nor
+# touch the inventory host on its way past.
+log "checking onDeleted.targeting: Template launches a workflow the managed host cannot narrow"
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: vmoperator.vmware.com/v1alpha2
+kind: VirtualMachine
+metadata:
+  name: web-12
+  namespace: ${TEST_NS}
+  labels:
+    app: records
+spec: {}
+status:
+  powerState: PoweredOn
+  network:
+    primaryIP4: "10.0.0.112"
+---
+apiVersion: field.vmware.com/v1
+kind: AnsibleBinding
+metadata:
+  name: e2e-template-hook
+  namespace: ${TEST_NS}
+spec:
+  vmSelector:
+    app: records
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  onDeleted:
+    targeting: Template
+    template:
+      name: "Decommission Records"
+      type: WorkflowTemplate
+    timeoutSeconds: 120
+EOF
+
+wait_for "the template-targeted binding runs once" 60 bash -c \
+  "[[ \$(vm_field e2e-template-hook web-12 phase) == Succeeded ]]"
+TMPL_HOST=$(vm_field e2e-template-hook web-12 awxHostID)
+TMPL_HOST_NAME=$(vm_field e2e-template-hook web-12 awxHostName)
+TMPL_CHILD=$(child_name e2e-template-hook web-12)
+
+log "deleting the VirtualMachine"
+kubectl delete virtualmachine web-12 -n "$TEST_NS" --wait=false >/dev/null
+
+wait_for "the template-targeted hook launches" 60 bash -c \
+  "[[ \$(hook_launches ${AWX_ADDR} 5) == 1 ]]"
+
+TMPL_LIMIT=$(hook_launch_field "$AWX_ADDR" 5 limit)
+if [[ -n "$TMPL_LIMIT" ]]; then
+  echo "Template targeting narrowed the run anyway: limit=$TMPL_LIMIT"
+  exit 1
+fi
+
+TMPL_VARS=$(hook_launch_field "$AWX_ADDR" 5 extraVars)
+if ! echo "$TMPL_VARS" | grep -q '"asb_vm_name": *"web-12"'; then
+  echo "the deletion context did not survive a launch with no host to read it from: $TMPL_VARS"
+  exit 1
+fi
+
+# Nothing was aimed at the inventory host, so nothing may have been
+# written to it either.
+TMPL_HOST_VARS=$(host_field "$AWX_ADDR" "$TMPL_HOST_NAME" variables)
+if echo "$TMPL_HOST_VARS" | grep -q ansible_connection; then
+  echo "a Template-targeted hook pinned a host it was never aimed at: $TMPL_HOST_VARS"
+  exit 1
+fi
+
+wait_for "the host is removed once the hook is terminal" 90 host_deleted "$AWX_ADDR" "$TMPL_HOST"
+wait_for "the child finishes finalizing" 60 bash -c \
+  "[[ -z \$(kubectl get ansiblebindingvm ${TMPL_CHILD} -n ${TEST_NS} --ignore-not-found -o name) ]]"
+kubectl delete ansiblebinding e2e-template-hook -n "$TEST_NS" --timeout=90s >/dev/null
+log "Template targeting launched with no limit and no inventory, and left the managed host alone"
 
 log "ALL CHECKS PASSED"
