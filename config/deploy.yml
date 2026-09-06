@@ -40,6 +40,7 @@ spec:
         - #@ "--host-check-period=" + data.values.host_check_period
         - #@ "--api-qps=" + data.values.api_qps
         - #@ "--api-burst=" + data.values.api_burst
+        - #@ "--log-level=" + data.values.log_level
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -77,6 +78,13 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get"]
+  #! create only: a deprovision hook releases its finalizer and the child
+  #! is then deleted, taking the status that described the teardown with
+  #! it. An Event on the parent binding is what is left for whoever ran
+  #! kubectl delete. Nothing here reads or edits anyone else's events.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
   - apiGroups: ["vmoperator.vmware.com"]
     resources: ["virtualmachines"]
     verbs: ["get", "list", "watch"]

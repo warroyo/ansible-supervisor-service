@@ -44,6 +44,33 @@ func childrenByBindingIndexFunc(obj interface{}) ([]string, error) {
 	return []string{key(u.GetNamespace(), binding)}, nil
 }
 
+// getCachedChild reads one AnsibleBindingVM by name out of the informer
+// store the whole process shares.
+//
+// This is how a binding sees a claim held by a different binding: its
+// own children come from the by-binding index, which by construction
+// contains nothing else. A miss means only that the cache has not seen
+// the object - never that the name is free - so the caller still has to
+// treat a create that fails with AlreadyExists as the real answer.
+func getCachedChild(namespace, name string) (*AnsibleBindingVM, bool) {
+	if ansBindVMStore == nil {
+		return nil, false
+	}
+	obj, exists, err := ansBindVMStore.GetByKey(key(namespace, name))
+	if err != nil || !exists {
+		return nil, false
+	}
+	u, err := toUnstructured(obj)
+	if err != nil {
+		return nil, false
+	}
+	child, err := convertAnsibleBindingVM(u)
+	if err != nil || child.Spec == nil {
+		return nil, false
+	}
+	return &child, true
+}
+
 // getAWXConnection reads an AWXConnection through the informer store,
 // falling back to the API server on a miss - a connection created
 // moments ago may not have reached the cache yet, and "not in the cache"

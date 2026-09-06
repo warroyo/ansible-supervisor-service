@@ -54,6 +54,27 @@ type Result struct {
 	RequeueAfter time.Duration
 }
 
+// CleanupResult is what a cleanupFunc hands back.
+//
+// Done reports whether finalization has actually finished. A cleanup
+// that has more to do - a teardown playbook still running - returns
+// Done false with a RequeueAfter, and the finalizer stays on until a
+// later pass says otherwise.
+//
+// That is deliberately not the same as returning an error. An error
+// means the pass failed and should be retried on the rate limiter's
+// escalating backoff, and it writes a failure into the resource's
+// status; waiting for a job that is running normally is neither of
+// those things.
+type CleanupResult struct {
+	Done         bool
+	RequeueAfter time.Duration
+}
+
+// defaultCleanupRequeue is how soon an unfinished cleanup is looked at
+// again when it asks for no particular delay.
+const defaultCleanupRequeue = 10 * time.Second
+
 // Controller is a generic reconcile loop for one CRD kind: fetch by key,
 // manage a cleanup finalizer, call provisionFunc/cleanupFunc, patch
 // status. Every kind this service manages (AWXConnection,
@@ -70,7 +91,7 @@ type Controller struct {
 	// older version of the controller stay deletable after an upgrade.
 	staleFinalizers  []string
 	provisionFunc    func(context.Context, *dynamic.DynamicClient, interface{}) (Result, error)
-	cleanupFunc      func(context.Context, *dynamic.DynamicClient, interface{}) error
+	cleanupFunc      func(context.Context, *dynamic.DynamicClient, interface{}) (CleanupResult, error)
 	updateStatusFunc StatusUpdater
 
 	// indexer is this kind's informer store. Reads below the workqueue
@@ -389,7 +410,7 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 	}()
 
 	if !u.GetDeletionTimestamp().IsZero() {
-		log.Printf("%s DeletionTimestamp detected. Initiating finalization.\n", logPrefix)
+		debugf("%s DeletionTimestamp detected. Initiating finalization.\n", logPrefix)
 
 		// Everything this controller holds on the object comes off in one
 		// patch: its own finalizer once cleanup has actually succeeded,
@@ -397,13 +418,27 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 		releasing := false
 
 		if c.finalizerName != "" && containsFinalizer(u, c.finalizerName) {
-			log.Printf("%s Finalizer %s is present. Starting cleanup...\n", logPrefix, c.finalizerName)
+			debugf("%s Finalizer %s is present. Starting cleanup...\n", logPrefix, c.finalizerName)
 
 			if c.cleanupFunc != nil {
-				if cleanupErr := c.cleanupFunc(ctx, c.client, obj); cleanupErr != nil {
+				cleanupResult, cleanupErr := c.cleanupFunc(ctx, c.client, obj)
+				if cleanupErr != nil {
 					log.Printf("%s CLEANUP FAILED: %v. Will retry.\n", logPrefix, cleanupErr)
 					reconcileErr = &errCleanupPending{fmt.Errorf("cleanup failed: %w", cleanupErr)}
 					return reconcileErr
+				}
+				// Cleanup is under way and not finished - a teardown
+				// playbook running, children still finalizing. Come back
+				// to it rather than holding a worker, and leave the
+				// finalizer exactly where it is.
+				if !cleanupResult.Done {
+					after := cleanupResult.RequeueAfter
+					if after <= 0 {
+						after = defaultCleanupRequeue
+					}
+					debugf("%s Cleanup still in progress. Looking again in %s.\n", logPrefix, after)
+					c.Queue.AddAfter(key(namespace, name), after)
+					return nil
 				}
 			}
 			releasing = true
@@ -415,7 +450,7 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 		}
 
 		if !releasing {
-			log.Printf("%s Finalizer not present. Deletion complete/in progress by Kubernetes.\n", logPrefix)
+			debugf("%s Finalizer not present. Deletion complete/in progress by Kubernetes.\n", logPrefix)
 			return nil
 		}
 
@@ -461,7 +496,7 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 		log.Printf("%s Finalizers set. Continuing from the updated object.\n", logPrefix)
 	}
 
-	log.Printf("%s Running normal reconciliation.\n", logPrefix)
+	debugf("%s Running normal reconciliation.\n", logPrefix)
 	result, provisionErr := c.provisionFunc(ctx, c.client, obj)
 	if provisionErr != nil {
 		reconcileErr = fmt.Errorf("provisioning failed: %w", provisionErr)
@@ -489,7 +524,7 @@ func (c *Controller) Reconcile(ctx context.Context, obj interface{}) (reconcileR
 		}
 	}
 
-	log.Printf("%s Reconciliation complete and status updated.\n", logPrefix)
+	debugf("%s Reconciliation complete and status updated.\n", logPrefix)
 	return nil
 }
 
@@ -574,13 +609,29 @@ func setupInformer(ctx context.Context, client dynamic.Interface, gvr schema.Gro
 	)
 	controller.indexer = informer.GetIndexer()
 
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	informer.AddEventHandler(informerEventHandler(controller))
+	return informer
+}
+
+// informerEventHandler decides which watch events are worth a reconcile.
+//
+// Split out from setupInformer so the predicate can be tested against a
+// real informer rather than by reasoning about it: what does and does
+// not wake a resource is now load-bearing for how much work a large
+// teardown does.
+func informerEventHandler(controller *Controller) cache.ResourceEventHandlerFuncs {
+	enqueue := func(obj interface{}) {
+		key, err := cache.MetaNamespaceKeyFunc(obj)
+		if err == nil {
+			controller.Queue.Add(key)
+		}
+	}
+	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			key, err := cache.MetaNamespaceKeyFunc(obj)
-			if err == nil {
-				log.Printf("--- %s ADD event. queuing %s ---\n", controller.gvr.Resource, key)
-				controller.Queue.Add(key)
+			if key, err := cache.MetaNamespaceKeyFunc(obj); err == nil {
+				debugf("--- %s ADD event. queuing %s ---\n", controller.gvr.Resource, key)
 			}
+			enqueue(obj)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			oldU, err := toUnstructured(oldObj)
@@ -593,26 +644,48 @@ func setupInformer(ctx context.Context, client dynamic.Interface, gvr schema.Gro
 				log.Printf("Error converting new object for update filter: %v\n", err)
 				return
 			}
-
-			generationChanged := oldU.GetGeneration() != newU.GetGeneration()
-			deletionRequested := !newU.GetDeletionTimestamp().IsZero()
-			isResync := oldU.GetResourceVersion() == newU.GetResourceVersion()
-			annotationsChanged := oldU.GetAnnotations()[ReconcileRequestedAtAnnotation] != newU.GetAnnotations()[ReconcileRequestedAtAnnotation]
-
-			if generationChanged || deletionRequested || isResync || annotationsChanged {
-				key, err := cache.MetaNamespaceKeyFunc(newObj)
-				if err == nil {
-					controller.Queue.Add(key)
-				}
+			if shouldEnqueueOnUpdate(oldU, newU) {
+				enqueue(newObj)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			key, err := cache.MetaNamespaceKeyFunc(obj)
-			if err == nil {
-				log.Printf("--- %s DELETE event. queuing %s ---\n", controller.gvr.Resource, key)
-				controller.Queue.Add(key)
+			if key, err := cache.MetaNamespaceKeyFunc(obj); err == nil {
+				debugf("--- %s DELETE event. queuing %s ---\n", controller.gvr.Resource, key)
 			}
+			enqueue(obj)
 		},
-	})
-	return informer
+	}
+}
+
+// shouldEnqueueOnUpdate reports whether one watch update is worth a
+// reconcile.
+//
+// The deletion test is an edge, not a level: it fires on the pass where
+// a deletionTimestamp first appears, not on every update to an object
+// that already has one. A terminating resource writes to its own status
+// while it finalizes - a deprovision hook records a deadline, a launch,
+// a job id - and treating those writes as "deletion requested" enqueued
+// the object again immediately, so the delay its own cleanup asked for
+// was skipped and the next poll went out at once. At teardown scale that
+// is the difference between polling on the interval and polling as fast
+// as the writes come.
+//
+// What still moves a terminating object: the requeue its cleanup asked
+// for, the retry on a cleanup error, the periodic resync below, and a
+// spec change - which is how the parent copying cleanupPolicy: Retain
+// down into a terminating child still takes effect promptly.
+func shouldEnqueueOnUpdate(oldU, newU *unstructured.Unstructured) bool {
+	// A resync redelivery: same object, delivered again on the informer's
+	// own period. This is the level-triggered backstop, and it is what
+	// picks up anything the filters below decided to skip.
+	if oldU.GetResourceVersion() == newU.GetResourceVersion() {
+		return true
+	}
+	if oldU.GetGeneration() != newU.GetGeneration() {
+		return true
+	}
+	if oldU.GetDeletionTimestamp().IsZero() && !newU.GetDeletionTimestamp().IsZero() {
+		return true
+	}
+	return oldU.GetAnnotations()[ReconcileRequestedAtAnnotation] != newU.GetAnnotations()[ReconcileRequestedAtAnnotation]
 }

@@ -30,6 +30,7 @@ func main() {
 	reconcileTimeoutFlag := flag.Int("reconcile-timeout", 300, "maximum time one reconcile of one resource may take, in seconds, so a slow AWX cannot pin a worker indefinitely")
 	supervisorIDFlag := flag.String("supervisor-id", "", "identity stamped on AWX inventory hosts this supervisor owns, so one AWX instance can be shared by several supervisors (default: the kube-system namespace UID)")
 	hostCheckFlag := flag.Int("host-check-period", 600, "how often, in seconds, each VM's AWX inventory host is reconciled against AWX itself - the worst case for repairing a host deleted or edited by hand in the AWX UI, and what sets the steady-state AWX request rate")
+	logLevelFlag := flag.String("log-level", "info", "info logs launches, terminal outcomes and errors; debug adds a line per reconcile pass, which at teardown scale is a great many")
 	apiQPSFlag := flag.Float64("api-qps", 50, "sustained requests per second this controller makes to the Kubernetes API server")
 	apiBurstFlag := flag.Int("api-burst", 100, "how far above --api-qps a burst of requests may go, e.g. creating children for a selector that suddenly matches many VMs")
 	flag.Parse()
@@ -48,6 +49,7 @@ func main() {
 		{"--host-check-period must be a positive number of seconds", *hostCheckFlag > 0},
 		{"--api-qps must be greater than zero", *apiQPSFlag > 0},
 		{"--api-burst must be at least --api-qps", float64(*apiBurstFlag) >= *apiQPSFlag},
+		{`--log-level must be "info" or "debug"`, *logLevelFlag == "info" || *logLevelFlag == "debug"},
 	} {
 		if !check.ok {
 			fmt.Fprintln(os.Stderr, check.name)
@@ -58,6 +60,7 @@ func main() {
 	resyncPeriod := time.Duration(*resync) * time.Second
 	reconcileTimeout = time.Duration(*reconcileTimeoutFlag) * time.Second
 	hostCheckPeriod = time.Duration(*hostCheckFlag) * time.Second
+	debugLogging = *logLevelFlag == "debug"
 
 	// A kubeconfig is for local development; running as a supervisor
 	// service there is none and the service account is used instead.
@@ -125,6 +128,15 @@ func main() {
 		vmGVR = resolved
 	}
 	fmt.Printf("virtualmachine api: %s\n", vmGVR.GroupVersion())
+
+	// Before any worker runs and before a single AWX request goes out:
+	// this version's claim scheme cannot coexist with children from the
+	// previous one, and the check is worth nothing once reconciles have
+	// started creating canonical children alongside them.
+	if err := checkForLegacyChildren(ctx, dynClient); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
+	}
 
 	// One rate limiter per queue: its backoff state is keyed by
 	// "namespace/name", so a shared limiter would let a failing

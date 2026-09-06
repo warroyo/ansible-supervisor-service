@@ -152,6 +152,38 @@ spec:
                     - Delete
                     - Retain
                   default: Delete
+                onDeleted:
+                  type: object
+                  description: playbook to run when a matched VirtualMachine is deleted, before its inventory host is removed. fires only for a VM that is really gone - one that merely stopped matching the selector is still running. the guest is already destroyed by then, so the playbook must act on the external record (DNS, IPAM, CMDB, monitoring) rather than on the machine
+                  properties:
+                    targeting:
+                      type: string
+                      description: what the hook is aimed at. ManagedHost, the default, supplies this VM's inventory host as the launch limit, which requires the template to share that inventory and to have Prompt on Launch enabled for Limit. Template supplies neither inventory nor limit and leaves the template's own targeting alone, for a decommissioning job or workflow that acts on records held elsewhere
+                      enum:
+                        - ManagedHost
+                        - Template
+                      default: ManagedHost
+                    template:
+                      type: object
+                      description: the AWX job or workflow template to launch. under targeting ManagedHost it must have Prompt on Launch enabled for Limit, or the hook is refused rather than run against the whole inventory
+                      properties:
+                        name:
+                          type: string
+                        type:
+                          type: string
+                          enum:
+                            - JobTemplate
+                            - WorkflowTemplate
+                      required:
+                        - name
+                        - type
+                    timeoutSeconds:
+                      type: integer
+                      description: how long the whole hook may take - waiting for an in-flight provisioning job, launching, and polling to a terminal state. past it the finalizer is released anyway, so a playbook that hangs cannot hold a VM or a namespace in Terminating
+                      minimum: 1
+                      default: 900
+                  required:
+                    - template
               required:
                 - vmSelector
                 - awxConnectionRef
@@ -204,6 +236,14 @@ spec:
                     terminating:
                       type: integer
                       description: children being deleted, counted apart from the phases above and not included in total. a child wedged in Terminating would otherwise drop out of the rollup entirely and leave the binding reading Ready
+                    conflicted:
+                      type: integer
+                      description: selected VMs another binding already claims. part of total, and counted here rather than as pending because this binding is not waiting for them to start - it will not run them at all while someone else owns them
+                    conflictedVMs:
+                      type: array
+                      description: a bounded sample of those VMs with the binding holding each claim, which is what an operator needs to resolve one
+                      items:
+                        type: string
       subresources:
         status: {}
       additionalPrinterColumns:
@@ -247,6 +287,18 @@ spec:
           properties:
             spec:
               type: object
+              x-kubernetes-validations:
+                # The object's name is the claim on a VirtualMachine, so
+                # what it says it is a claim on cannot change under it.
+                # Retarget by deleting this object, which runs its
+                # cleanup, rather than by editing the identity out from
+                # under a running job.
+                - rule: self.vmName == oldSelf.vmName
+                  message: spec.vmName identifies the claim and is immutable; delete this object instead
+                - rule: self.bindingName == oldSelf.bindingName
+                  message: spec.bindingName identifies the owning binding and is immutable; delete this object instead
+                - rule: '!has(oldSelf.bindingUID) || (has(self.bindingUID) && self.bindingUID == oldSelf.bindingUID)'
+                  message: spec.bindingUID identifies the owning binding incarnation and is immutable once set
               properties:
                 vmName:
                   type: string
@@ -254,6 +306,9 @@ spec:
                 bindingName:
                   type: string
                   description: the AnsibleBinding that owns this child. the AWX host ownership marker is keyed to it, so hosts provisioned before the per-VM split are adopted unchanged
+                bindingUID:
+                  type: string
+                  description: which incarnation of that binding owns it. a binding deleted and recreated under the same name is a different object and must claim its VMs rather than inherit live ones
                 awxConnectionRef:
                   type: string
                   description: name of an AWXConnection in this namespace to launch through
@@ -295,6 +350,38 @@ spec:
                     - Delete
                     - Retain
                   default: Delete
+                onDeleted:
+                  type: object
+                  description: playbook to run when a matched VirtualMachine is deleted, before its inventory host is removed. fires only for a VM that is really gone - one that merely stopped matching the selector is still running. the guest is already destroyed by then, so the playbook must act on the external record (DNS, IPAM, CMDB, monitoring) rather than on the machine
+                  properties:
+                    targeting:
+                      type: string
+                      description: what the hook is aimed at. ManagedHost, the default, supplies this VM's inventory host as the launch limit, which requires the template to share that inventory and to have Prompt on Launch enabled for Limit. Template supplies neither inventory nor limit and leaves the template's own targeting alone, for a decommissioning job or workflow that acts on records held elsewhere
+                      enum:
+                        - ManagedHost
+                        - Template
+                      default: ManagedHost
+                    template:
+                      type: object
+                      description: the AWX job or workflow template to launch. under targeting ManagedHost it must have Prompt on Launch enabled for Limit, or the hook is refused rather than run against the whole inventory
+                      properties:
+                        name:
+                          type: string
+                        type:
+                          type: string
+                          enum:
+                            - JobTemplate
+                            - WorkflowTemplate
+                      required:
+                        - name
+                        - type
+                    timeoutSeconds:
+                      type: integer
+                      description: how long the whole hook may take - waiting for an in-flight provisioning job, launching, and polling to a terminal state. past it the finalizer is released anyway, so a playbook that hangs cannot hold a VM or a namespace in Terminating
+                      minimum: 1
+                      default: 900
+                  required:
+                    - template
                 bindingGeneration:
                   type: integer
                   description: the binding's generation as of the last time the parent wrote this spec. compared against status.appliedGeneration to decide whether to relaunch
@@ -343,6 +430,55 @@ spec:
                   type: string
                   format: date-time
                   description: when this VM's inventory host was last reconciled against AWX itself. kept in status so the decision survives a controller restart. the period is the controller's --host-check-period
+                deprovision:
+                  type: object
+                  description: how far the onDeleted hook has got. written during finalization so each pass resumes where the last one stopped rather than launching the playbook again
+                  properties:
+                    phase:
+                      type: string
+                      description: Launching, Running, Succeeded, Failed, TimedOut or Skipped. Failed, TimedOut and Skipped all still release the finalizer - a teardown playbook that cannot finish must not hold a namespace in Terminating
+                    targeting:
+                      type: string
+                      enum:
+                        - ManagedHost
+                        - Template
+                      description: the targeting this hook actually started under, stamped once so editing spec.onDeleted.targeting mid-teardown cannot change what a running hook is aimed at. absent on a hook started before this was recorded, which means ManagedHost
+                    message:
+                      type: string
+                    startedAt:
+                      type: string
+                      format: date-time
+                    deadline:
+                      type: string
+                      format: date-time
+                      description: startedAt plus spec.onDeleted.timeoutSeconds, stamped once so editing the timeout mid-teardown cannot extend a hook already running
+                    jobID:
+                      type: integer
+                    jobURL:
+                      type: string
+                    jobStatus:
+                      type: string
+                    jobType:
+                      type: string
+                      enum: [JobTemplate, WorkflowTemplate]
+                    endpoint:
+                      type: string
+                      description: fingerprint of the AWX instance the hook's job was launched on. a poll checks it so a repointed AWXConnection cannot make it follow the same job number to an unrelated job on another instance
+                    launchError:
+                      type: string
+                      description: what AWX said it ignored about the launch. a job launched with its limit dropped is not running against this host, so the hook cannot report success however well the job itself ran
+                    hostPinned:
+                      type: boolean
+                      description: whether the hook set ansible_connection on a host that will outlive it (cleanupPolicy Retain, or an adopted host), so the override can be taken back off before the finalizer is released
+                    priorConnection:
+                      type: string
+                      description: what ansible_connection said on that host before the hook pinned it. absent means it was not set at all, which restores differently from an explicit value
+                    pinnedHostID:
+                      type: integer
+                      description: id of the host the override was written to. the restore is refused on any other host, so a host deleted and recreated under the same name during the hook is left alone rather than given a variable nothing set on it
+                    pinnedHostEndpoint:
+                      type: string
+                      description: fingerprint of the AWX instance that host is on, so a repointed AWXConnection cannot make the restore act on a same-named host elsewhere
                 appliedGeneration:
                   type: integer
                   description: spec.bindingGeneration this VM last launched a run for

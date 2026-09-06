@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"reflect"
 	"sort"
 	"strings"
@@ -95,6 +96,21 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 	matched := map[string]bool{}
 	vmUIDs := map[string]types.UID{}
 
+	// Conflicts are recorded rather than returned as errors. A VM some
+	// other binding owns is not a reconciliation failure - nothing is
+	// broken, nothing will be fixed by retrying quickly, and treating it
+	// as an error would bury the one thing the operator has to see
+	// behind a generic "reconciliation failed". They are collected under
+	// a lock because the create path records them from inside the write
+	// batch, which runs in parallel.
+	var conflictMu sync.Mutex
+	conflicts := map[string]string{}
+	recordConflict := func(vmName, owner string) {
+		conflictMu.Lock()
+		defer conflictMu.Unlock()
+		conflicts[vmName] = owner
+	}
+
 	// The writes this pass wants, collected before any of them is
 	// issued. A generation bump across a binding matching thousands of
 	// VMs used to mean that many sequential Updates inside one reconcile
@@ -110,34 +126,71 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 		vmUIDs[name] = vm.GetUID()
 
 		desired := childSpecFor(&ac, name, triggerValue)
+		canonical := childName(name)
 
+		// This binding's own children come from the index it already
+		// listed. Anything else claiming the canonical name is read out
+		// of the shared informer store - one map lookup, no request -
+		// because the binding index by definition cannot show a claim
+		// held by a different binding.
 		existing, ok := childByVM[name]
 		if !ok {
+			if cached, found := getCachedChild(ac.Namespace, canonical); found {
+				existing, ok = *cached, true
+			}
+		}
+		if !ok {
+			// Not in any cache, which is not the same as not there. The
+			// create is the arbitration: Kubernetes lets exactly one
+			// object hold the name, so whoever it rejects has lost the
+			// VM rather than merely raced with itself.
 			writes = append(writes, func() error {
-				if cErr := createBindingChild(ctx, client, &ac, &vm, desired); cErr != nil {
-					if apierrors.IsAlreadyExists(cErr) {
-						// Another pass got there first, or a child exists
-						// under this name for a different binding. Either
-						// way the next reconcile sees it in the list and
-						// decides.
-						return nil
-					}
+				cErr := createBindingChild(ctx, client, &ac, &vm, desired)
+				if cErr == nil {
+					return nil
+				}
+				if !apierrors.IsAlreadyExists(cErr) {
 					return fmt.Errorf("creating the AnsibleBindingVM for VM %q: %w", name, cErr)
 				}
+				owner, gErr := client.Resource(ansBindVMGVR).Namespace(ac.Namespace).Get(ctx, canonical, metav1.GetOptions{})
+				switch {
+				case apierrors.IsNotFound(gErr):
+					// Deleted between the create and the read. Nothing
+					// is decided; the next pass tries again.
+					return nil
+				case gErr != nil:
+					// An unread claim is not an available VM.
+					return fmt.Errorf("reading AnsibleBindingVM %q to resolve the claim on VM %q: %w", canonical, name, gErr)
+				}
+				claimant, cvErr := convertAnsibleBindingVM(owner)
+				if cvErr != nil {
+					recordConflict(name, "an unreadable object under the claim name")
+					return nil
+				}
+				if claimHeldBy(&claimant, &ac) {
+					// Our own create from an earlier pass, seen before
+					// the cache caught up.
+					return nil
+				}
+				recordConflict(name, claimOwnerOf(&claimant))
 				return nil
 			})
 			continue
 		}
 
-		// Refuse to adopt a child another binding owns rather than
+		// Refuse to adopt a claim another binding holds rather than
 		// fighting over it - the same refusal the AWX host path makes on
-		// its ownership marker.
-		if existing.Spec.BindingName != ac.Name {
-			recordErr(fmt.Errorf("AnsibleBindingVM %q is owned by binding %q, not %q",
-				existing.Name, existing.Spec.BindingName, ac.Name))
+		// its ownership marker, and for the same reason: two owners
+		// running playbooks at one machine is worse than one binding
+		// reporting that it cannot.
+		if !claimHeldBy(&existing, &ac) {
+			recordConflict(name, claimOwnerOf(&existing))
 			continue
 		}
 		if !existing.DeletionTimestamp.IsZero() || !bindingChildMatchesVM(&existing, vm.GetUID()) {
+			// Held until the child is really gone, finalizers included.
+			// A VM replaced under the same name waits for its
+			// predecessor's cleanup rather than provisioning over it.
 			continue
 		}
 		if reflect.DeepEqual(*existing.Spec, desired) {
@@ -156,7 +209,7 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 	// free it. A replacement VM must finish retiring its old child first.
 	var summaryChildren []AnsibleBindingVM
 	for _, c := range children {
-		if c.Spec == nil || c.Spec.BindingName != ac.Name {
+		if c.Spec == nil || !claimHeldBy(&c, &ac) {
 			continue
 		}
 		currentVM := matched[c.Spec.VMName] && bindingChildMatchesVM(&c, vmUIDs[c.Spec.VMName])
@@ -183,7 +236,7 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 	deferred := len(writes) - issued + len(deletions) - deleted
 	issued += deleted
 
-	summary := summarize(summaryChildren, matched, ac.Generation, triggerValue)
+	summary := summarize(summaryChildren, matched, conflicts, ac.Generation, triggerValue)
 
 	// Orphan reaping is rare, destructive and costs an AWX request, so
 	// it runs on its own period rather than every pass - and never while
@@ -201,6 +254,14 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 		}
 	}
 
+	// An Event only on entering a conflict, or when which VMs are
+	// conflicted changes. The helper creates a new Event per call, so a
+	// binding that stays conflicted would otherwise write one per pass
+	// for as long as the overlap lasts.
+	if conflictWorthAnEvent(ac.Status, summary) {
+		recordEvent(ctx, client, u, eventWarning, "VMClaimedByAnotherBinding", conflictMessage(summary))
+	}
+
 	if !ansibleBindingDetailsCurrent(ac.Status, summary, ac.Generation, triggerValue, orphanScan) {
 		if dErr := writeAnsibleBindingDetails(ctx, client, u, summary, ac.Generation, triggerValue, orphanScan); dErr != nil {
 			log.Printf("[AnsibleBinding/%s/%s] failed to persist status: %v", ac.Namespace, ac.Name, dErr)
@@ -209,6 +270,14 @@ func applyAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj
 	}
 
 	result := Result{Object: bindingWithDetails(u, summary, ac.Generation, triggerValue, orphanScan)}
+	if summary.Conflicted > 0 && firstErr == nil {
+		// A claim is released by its owner's child being deleted, and
+		// that wakes the owner, not the bindings waiting behind it. So a
+		// waiter comes back on its own - slowly, and jittered, because
+		// the alternative is waking every binding in the namespace on
+		// every child status update to catch the rare handover.
+		result.RequeueAfter = conflictRetryInterval + time.Duration(rand.Int63n(int64(conflictRetryJitter)))
+	}
 	if deferred > 0 {
 		// Level-triggered, so the next pass simply recomputes what is
 		// still missing. Coming straight back keeps a large rollout
@@ -299,8 +368,10 @@ func issueChildWrites(writes []func() error) (int, error) {
 // binding is gone - is copied down rather than referenced.
 func childSpecFor(ac *AnsibleBinding, vmName, trigger string) AnsibleBindingVMSpec {
 	return AnsibleBindingVMSpec{
+		OnDeleted:         ac.Spec.OnDeleted,
 		VMName:            vmName,
 		BindingName:       ac.Name,
+		BindingUID:        string(ac.UID),
 		AWXConnectionRef:  ac.Spec.AWXConnectionRef,
 		Template:          ac.Spec.Template,
 		HostName:          ac.Spec.HostName,
@@ -311,6 +382,34 @@ func childSpecFor(ac *AnsibleBinding, vmName, trigger string) AnsibleBindingVMSp
 		BindingGeneration: ac.Generation,
 		BindingTrigger:    trigger,
 	}
+}
+
+// claimHeldBy reports whether a child is this binding incarnation's
+// claim on its VM.
+//
+// Both halves of the identity are checked. The name alone would let a
+// recreated binding inherit whatever the previous one left behind, and
+// the UID alone would not survive being read from a child written by a
+// controller that did not record it - which is a child from before this
+// scheme existed, and is refused rather than adopted. The startup gate
+// is what makes sure there are none left to refuse.
+func claimHeldBy(child *AnsibleBindingVM, ac *AnsibleBinding) bool {
+	if child == nil || child.Spec == nil || ac == nil {
+		return false
+	}
+	return child.Spec.BindingName == ac.Name && child.Spec.BindingUID == string(ac.UID) && child.Spec.BindingUID != ""
+}
+
+// claimOwnerOf names the binding a claim belongs to, for a status
+// message an operator has to act on.
+func claimOwnerOf(child *AnsibleBindingVM) string {
+	if child == nil || child.Spec == nil || child.Spec.BindingName == "" {
+		return "an unrecognised object"
+	}
+	if child.Spec.BindingUID == "" {
+		return child.Namespace + "/" + child.Spec.BindingName + " (an earlier controller's child)"
+	}
+	return child.Namespace + "/" + child.Spec.BindingName
 }
 
 // createBindingChild creates one child, owned by the VirtualMachine.
@@ -326,7 +425,7 @@ func createBindingChild(ctx context.Context, client *dynamic.DynamicClient, ac *
 	}
 
 	meta := map[string]interface{}{
-		"name":      childName(ac.Name, spec.VMName),
+		"name":      childName(spec.VMName),
 		"namespace": ac.Namespace,
 		"labels": map[string]interface{}{
 			BindingLabel: bindingLabelValue(ac.Name),
@@ -487,8 +586,18 @@ func listBindingChildren(ctx context.Context, client *dynamic.DynamicClient, nam
 // observedGeneration already bumped to the new generation - for the
 // window between the request and the first child acting on it. Anything
 // waiting on the binding would take that as "the new playbook has run".
-func summarize(children []AnsibleBindingVM, matched map[string]bool, wantGeneration int64, wantTrigger string) BindingSummary {
-	s := BindingSummary{Total: len(matched), Pending: len(matched)}
+func summarize(children []AnsibleBindingVM, matched map[string]bool, conflicts map[string]string, wantGeneration int64, wantTrigger string) BindingSummary {
+	s := BindingSummary{Total: len(matched), Pending: len(matched) - len(conflicts), Conflicted: len(conflicts)}
+	// Sorted so an unchanged conflict produces an unchanged status, and
+	// bounded for the same reason the failure sample is: a selector
+	// overlapping hundreds of VMs must not produce an unwritable object.
+	for vmName, owner := range conflicts {
+		s.ConflictedVMs = append(s.ConflictedVMs, fmt.Sprintf("%s (%s)", vmName, owner))
+	}
+	sort.Strings(s.ConflictedVMs)
+	if len(s.ConflictedVMs) > summaryNameLimit {
+		s.ConflictedVMs = s.ConflictedVMs[:summaryNameLimit]
+	}
 	seen := map[string]bool{}
 	for _, c := range children {
 		if c.Spec == nil {
@@ -504,7 +613,7 @@ func summarize(children []AnsibleBindingVM, matched map[string]bool, wantGenerat
 			s.Terminating++
 			continue
 		}
-		if !matched[c.Spec.VMName] || seen[c.Spec.VMName] {
+		if !matched[c.Spec.VMName] || seen[c.Spec.VMName] || conflicts[c.Spec.VMName] != "" {
 			continue
 		}
 		seen[c.Spec.VMName] = true
@@ -558,6 +667,37 @@ func summarize(children []AnsibleBindingVM, matched map[string]bool, wantGenerat
 
 // summaryNameLimit bounds how many failing VM names the rollup lists.
 const summaryNameLimit = 3
+
+// How long a binding waits before looking again at a VM another binding
+// owns. Long, because a handover is rare and the wait costs nothing but
+// latency on it; jittered, because a namespace whose bindings all
+// overlap would otherwise retry in lockstep forever.
+const (
+	conflictRetryInterval = 30 * time.Second
+	conflictRetryJitter   = 10 * time.Second
+)
+
+// conflictMessage says what is conflicted and what to do about it.
+func conflictMessage(s BindingSummary) string {
+	return fmt.Sprintf("%d of %d selected VM(s) are claimed by another binding: %s. "+
+		"Narrow vmSelector, or release the existing owner; one binding owns a VM's whole lifecycle, "+
+		"so several playbooks for one VM belong in one AWX workflow under it.",
+		s.Conflicted, s.Total, nameList(s.ConflictedVMs))
+}
+
+// conflictWorthAnEvent reports whether this pass found something an
+// operator has not already been told, so a standing conflict costs no
+// writes at all.
+func conflictWorthAnEvent(prior *AnsibleBindingStatus, summary BindingSummary) bool {
+	if summary.Conflicted == 0 {
+		return false
+	}
+	if prior == nil || prior.Summary == nil {
+		return true
+	}
+	return prior.Summary.Conflicted != summary.Conflicted ||
+		!reflect.DeepEqual(prior.Summary.ConflictedVMs, summary.ConflictedVMs)
+}
 
 func ansibleBindingDetailsCurrent(prior *AnsibleBindingStatus, summary BindingSummary, observedGeneration int64, lastTrigger string, lastOrphanScan string) bool {
 	if prior == nil {
@@ -743,21 +883,70 @@ func expectedHostName(ac *AnsibleBinding, vmName string) string {
 // it has to be done here. Returning while any remain keeps the binding
 // in Terminating, which is what makes each child's own finalizer run to
 // completion before the binding disappears.
-func cleanupAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) error {
+func cleanupAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) (CleanupResult, error) {
 	u, err := toUnstructured(obj)
 	if err != nil {
-		return nil
+		return CleanupResult{Done: true}, nil
 	}
 	ac, err := convertAnsibleBinding(u)
 	if err != nil {
-		return nil
+		return CleanupResult{Done: true}, nil
 	}
 
-	children, err := listBindingChildren(ctx, client, ac.Namespace, ac.Name)
+	// Waiting is read from the cache. A binding whose children are
+	// running teardown playbooks waits for as long as the slowest of
+	// them, and a live LIST every pass for the whole of that - one
+	// request, but a response carrying every remaining child - is the
+	// most expensive thing a terminating binding does.
+	children, err := listBindingChildrenCached(ctx, client, ac.Namespace, ac.Name)
 	if err != nil {
-		return fmt.Errorf("listing the AnsibleBindingVMs to clean up: %w", err)
+		return CleanupResult{}, fmt.Errorf("listing the AnsibleBindingVMs to clean up: %w", err)
+	}
+	remaining, err := deleteBindingChildren(ctx, client, &ac, children)
+	if err != nil {
+		return CleanupResult{}, err
+	}
+	if remaining > 0 {
+		// Waiting for children that are finalizing normally - a
+		// deprovision hook can take minutes - is not a failure, so it is
+		// not reported as one. Each child that finishes wakes the parent
+		// through its child watch, so this interval is the backstop for a
+		// missed event rather than the mechanism.
+		debugf("[AnsibleBinding/%s/%s] waiting for %d AnsibleBindingVM(s) to finish cleaning up",
+			ac.Namespace, ac.Name, remaining)
+		return CleanupResult{RequeueAfter: childCleanupPollInterval}, nil
 	}
 
+	// The cache says there is nothing left, which is not something to
+	// release a finalizer on: a cache lags, and a child it has not seen
+	// yet would be abandoned with its AWX host and its teardown playbook
+	// unrun. Releasing is rare and irreversible, so it is worth the one
+	// live read - the same rule the orphan reaper follows before it
+	// deletes anything.
+	fresh, err := listBindingChildren(ctx, client, ac.Namespace, ac.Name)
+	if err != nil {
+		return CleanupResult{}, fmt.Errorf("confirming the AnsibleBindingVMs are gone: %w", err)
+	}
+	remaining, err = deleteBindingChildren(ctx, client, &ac, fresh)
+	if err != nil {
+		return CleanupResult{}, err
+	}
+	if remaining > 0 {
+		debugf("[AnsibleBinding/%s/%s] the cache said no children remained, but %d are still there",
+			ac.Namespace, ac.Name, remaining)
+		return CleanupResult{RequeueAfter: childCleanupPollInterval}, nil
+	}
+	return CleanupResult{Done: true}, nil
+}
+
+// deleteBindingChildren deletes the children a binding still owns and
+// reports how many it is waiting on.
+//
+// The policy in force is copied down into each one first: finalization
+// no longer runs the normal reconcile that would otherwise do it, so
+// without this, setting cleanupPolicy: Retain on a binding already stuck
+// on an unreachable AWX would change nothing.
+func deleteBindingChildren(ctx context.Context, client *dynamic.DynamicClient, ac *AnsibleBinding, children []AnsibleBindingVM) (int, error) {
 	var remaining int
 	for _, c := range children {
 		if c.Spec != nil && c.Spec.BindingName != ac.Name {
@@ -769,14 +958,18 @@ func cleanupAnsibleBinding(ctx context.Context, client *dynamic.DynamicClient, o
 			policy = ac.Spec.CleanupPolicy
 		}
 		if err := deleteBindingChild(ctx, client, &c, policy); err != nil {
-			return err
+			return remaining, err
 		}
 	}
-	if remaining > 0 {
-		return fmt.Errorf("waiting for %d AnsibleBindingVM(s) to finish cleaning up", remaining)
-	}
-	return nil
+	return remaining, nil
 }
+
+// childCleanupPollInterval is how often a binding whose children are
+// still finalizing looks again on its own. It is long because it is not
+// the thing that drives progress: a child finishing wakes the parent
+// through the child watch, and this only has to cover an event that
+// never arrived.
+const childCleanupPollInterval = 30 * time.Second
 
 // updateAnsibleBindingStatus derives the binding's aggregate state from
 // the rollup applyAnsibleBinding wrote.
@@ -812,6 +1005,17 @@ func updateAnsibleBindingStatus(u *unstructured.Unstructured, success bool, reco
 	switch {
 	case s.Total == 0 && s.Terminating > 0:
 		return status("Terminating", fmt.Sprintf("%d VM(s) still cleaning up.", s.Terminating), false)
+	// Conflict outranks a failed run. A run that failed is this
+	// binding's own work going wrong and its detail is in the summary
+	// either way; a VM claimed elsewhere is a misconfiguration nothing
+	// will resolve on its own, and it is the reason those VMs are not
+	// running at all.
+	case s.Conflicted > 0:
+		msg := conflictMessage(*s)
+		if s.Failed > 0 {
+			msg += fmt.Sprintf(" %d other VM(s) also failed their last run.", s.Failed)
+		}
+		return status("Conflict", msg, false)
 	case s.Failed > 0:
 		msg := fmt.Sprintf("%d of %d VM(s) failed their last run: %s.", s.Failed, s.Total, nameList(s.FailedVMs))
 		if s.FirstFailure != "" {

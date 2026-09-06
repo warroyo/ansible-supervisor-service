@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -98,6 +99,22 @@ func resolveVMGVR(d versionDiscoverer) (schema.GroupVersionResource, error) {
 var awxConnGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "awxconnections"}
 var ansBindGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "ansiblebindings"}
 var ansBindVMGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "ansiblebindingvms"}
+
+// debugLogging turns on the per-pass lines below. They describe a
+// reconcile that is progressing normally, which is exactly what there is
+// most of: one terminating child polling a teardown playbook logs on
+// every pass, so a namespace of a thousand VMs would write hundreds of
+// lines a second saying nothing had changed. Launches, terminal
+// outcomes and errors are never gated on this.
+//
+// Set once at startup from --log-level, before any worker runs.
+var debugLogging bool
+
+func debugf(format string, args ...interface{}) {
+	if debugLogging {
+		log.Printf(format, args...)
+	}
+}
 
 // ReconcileRequestedAtAnnotation is the annotation a user bumps to force
 // a re-run of an AnsibleBinding that's already up to date
@@ -248,25 +265,28 @@ func bindingLabelValue(name string) string {
 	return clipNameSegment(name[:maxLabelValue-childNameHashLen-1]) + "-" + hex.EncodeToString(sum[:])[:childNameHashLen]
 }
 
-// childName is the deterministic name of the AnsibleBindingVM a binding
-// creates for one VM. Deterministic so the parent can create it blind
-// and let AlreadyExists mean "nothing to do", rather than listing first
-// and racing with its own previous pass.
+// childName is the name of the AnsibleBindingVM that claims one
+// VirtualMachine. It depends on the VM alone, so within a namespace
+// every binding that selects a VM computes the same name for it - which
+// is what makes the claim exclusive: Kubernetes will only let one object
+// hold a name, so the create that wins is the arbitration and no lease,
+// lock or extra CRD is needed to decide it.
 //
-// Plain concatenation was ambiguous - binding "a-b" with VM "c" and
-// binding "a" with VM "b-c" produce the same string - and unbounded, so
-// a long binding name plus a long VM name simply failed to create. The
-// hash of the exact pair resolves both: it disambiguates the join, and
-// it stays stable when the readable halves are truncated. It is the same
-// construction EndpointSlice and Job-owned Pod names use.
+// Deterministic so the parent can create it blind rather than listing
+// first and racing with its own previous pass. The VM name is clipped
+// for legibility and the hash is of the whole name, so two VMs that
+// differ only past the clip still get different children rather than one
+// binding silently reconciling the other's VM.
 //
-// generateName would also have solved it, but it makes creation
-// non-idempotent: a create whose response is lost leaks a duplicate
-// child the next pass cannot recognise.
-func childName(bindingName, vmName string) string {
-	sum := sha256.Sum256([]byte(bindingName + "/" + vmName))
+// Keyed on the name and not the VM's UID on purpose: a VM deleted and
+// recreated under the same name maps to the same AWX inventory host, and
+// the claim has to hold that slot across the replacement until the old
+// VM's cleanup has finished. The owner reference carries the UID, which
+// is what stops the old child being treated as the new VM's.
+func childName(vmName string) string {
+	sum := sha256.Sum256([]byte(vmName))
 	suffix := hex.EncodeToString(sum[:])[:childNameHashLen]
-	return clipNameSegment(bindingName) + "-" + clipNameSegment(vmName) + "-" + suffix
+	return "vm-" + clipNameSegment(vmName) + "-" + suffix
 }
 
 // clipNameSegment bounds one half of a child name and makes sure the

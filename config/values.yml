@@ -22,6 +22,10 @@ host_check_period: "600"
 #! bounds this.
 api_qps: "50"
 api_burst: "100"
+#! "info" logs launches, terminal outcomes and errors. "debug" adds a line per
+#! reconcile pass, which is a great many during a large teardown: every
+#! terminating VM polling a deprovision hook would log on every pass.
+log_level: "info"
 #! identity stamped on AWX inventory hosts this supervisor owns, so one AWX
 #! instance can be shared by several supervisors without them fighting over
 #! host entries. leave empty to derive it from the kube-system namespace UID.
