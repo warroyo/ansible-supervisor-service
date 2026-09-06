@@ -39,6 +39,25 @@ type jobRec struct {
 	ID       int
 	Workflow bool
 	Polls    int
+	// Held keeps a job "running" however often it is polled, until
+	// /_test/finish-job releases it. A job that goes terminal on its
+	// second poll is fine for provisioning, but it makes a deprovision
+	// hook finish before a test can observe the window that matters -
+	// the one where the playbook is running and the inventory host it
+	// targets must still exist.
+	Held bool
+}
+
+// launchRec is one launch as it arrived, kept so the e2e suite can
+// assert what a deprovision hook actually asked AWX for - the limit
+// above all, since a hook without one would run against every host in
+// the inventory.
+type launchRec struct {
+	JobID      int    `json:"jobID"`
+	TemplateID int    `json:"templateID"`
+	Workflow   bool   `json:"workflow"`
+	Limit      string `json:"limit"`
+	ExtraVars  string `json:"extraVars"`
 }
 
 type server struct {
@@ -53,6 +72,10 @@ type server struct {
 	// ?name= field lookup (it is not part of the published API schema),
 	// so host lookups come back unfiltered.
 	ignoreNameFilter bool
+	// holdTemplate is a template id whose jobs stay running until
+	// released, so a test can hold a playbook open and look at the world
+	// while it runs. 0 holds nothing.
+	holdTemplate int
 
 	nextHostID int
 	nextJobID  int
@@ -66,13 +89,15 @@ type server struct {
 	workflowTemplates []templateRec
 	hosts             map[int]*hostRec
 	jobs              map[int]*jobRec
+	launches          []launchRec
 }
 
-func newServer(basePath string, ignoreNameFilter bool) *server {
+func newServer(basePath string, ignoreNameFilter bool, holdTemplate int) *server {
 	inv := 1
 	return &server{
 		basePath:         basePath,
 		ignoreNameFilter: ignoreNameFilter,
+		holdTemplate:     holdTemplate,
 		nextHostID:       100,
 		nextJobID:        1000,
 		jobTemplates: []templateRec{
@@ -81,9 +106,16 @@ func newServer(basePath string, ignoreNameFilter bool) *server {
 			// controller must refuse to launch against this one rather
 			// than let AWX run it against the whole inventory.
 			{ID: 3, Name: "No Prompt Template", Inventory: &inv},
+			// The deprovision hook's template.
+			{ID: 4, Name: "Deregister Host", Inventory: &inv, AskLimitOnLaunch: true, AskVariablesOnLaunch: true},
 		},
 		workflowTemplates: []templateRec{
 			{ID: 2, Name: "Configure Webserver Workflow", Inventory: &inv, AskLimitOnLaunch: true, AskVariablesOnLaunch: true},
+			// A decommissioning workflow whose nodes carry their own
+			// inventories: no top-level inventory of its own, and no
+			// limit to prompt for. Only launchable by a hook with
+			// onDeleted.targeting: Template, which supplies neither.
+			{ID: 5, Name: "Decommission Records", AskVariablesOnLaunch: true},
 		},
 		hosts:    map[int]*hostRec{},
 		jobs:     map[int]*jobRec{},
@@ -268,7 +300,10 @@ func (s *server) handleLaunch(list []templateRec, workflow bool) func(http.Respo
 
 		id := s.nextJobID
 		s.nextJobID++
-		s.jobs[id] = &jobRec{ID: id, Workflow: workflow}
+		s.jobs[id] = &jobRec{ID: id, Workflow: workflow, Held: s.holdTemplate != 0 && templateID == s.holdTemplate}
+		limit, _ := body["limit"].(string)
+		extraVars, _ := body["extra_vars"].(string)
+		s.launches = append(s.launches, launchRec{JobID: id, TemplateID: templateID, Workflow: workflow, Limit: limit, ExtraVars: extraVars})
 		log.Printf("fakeawx: launched job %d (template=%d workflow=%v limit=%v ignored=%v)", id, templateID, workflow, body["limit"], ignored)
 
 		resp := map[string]interface{}{}
@@ -298,7 +333,7 @@ func (s *server) handleJobStatus(w http.ResponseWriter, r *http.Request, id int)
 	}
 	j.Polls++
 	status := "running"
-	if j.Polls >= 2 {
+	if j.Polls >= 2 && !j.Held {
 		status = "successful"
 	}
 	writeJSON(w, 200, map[string]interface{}{"id": id, "status": status})
@@ -368,6 +403,35 @@ func (s *server) handleTestRequestCount(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, 200, counts)
 }
 
+// /_test/finish-job?id=N releases a held job, so a test controls when a
+// playbook finishes rather than racing the fake's poll counter.
+func (s *server) handleTestFinishJob(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.URL.Query().Get("id"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[id]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	j.Held = false
+	j.Polls = 2
+	log.Printf("fakeawx: released held job %d", id)
+	writeJSON(w, 200, map[string]interface{}{"id": id, "status": "successful"})
+}
+
+func (s *server) handleTestLaunches(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	launches := make([]launchRec, len(s.launches))
+	copy(launches, s.launches)
+	writeJSON(w, 200, launches)
+}
+
 func (s *server) handleTestDeletedHosts(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -403,6 +467,12 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/_test/request-count":
 		s.handleTestRequestCount(w, r)
+		return
+	case "/_test/launches":
+		s.handleTestLaunches(w, r)
+		return
+	case "/_test/finish-job":
+		s.handleTestFinishJob(w, r)
 		return
 	}
 
@@ -473,9 +543,10 @@ func main() {
 	addr := flag.String("addr", ":8756", "listen address")
 	basePath := flag.String("api-base-path", "/api/v2", "API root to serve: /api/v2 like AWX/Tower/AAP<=2.4, or /api/controller/v2 like AAP 2.5+")
 	ignoreNameFilter := flag.Bool("ignore-name-filter", false, "ignore the ?name= host lookup filter, returning every host in the inventory")
+	holdTemplate := flag.Int("hold-template", 0, "template id whose jobs stay running until POST /_test/finish-job?id=N releases them")
 	flag.Parse()
 
-	s := newServer(strings.TrimRight(*basePath, "/"), *ignoreNameFilter)
+	s := newServer(strings.TrimRight(*basePath, "/"), *ignoreNameFilter, *holdTemplate)
 	fmt.Printf("fakeawx listening on %s serving %s\n", *addr, s.basePath)
 	log.Fatal(http.ListenAndServe(*addr, s))
 }
