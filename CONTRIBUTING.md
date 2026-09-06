@@ -1,11 +1,13 @@
 # Contributing
 
+New to the codebase? [Architecture](ARCHITECTURE.md) is the map: which object owns which, what the running process looks like, and where each piece of state lives.
+
 ## Layout
 
 | Path | What's in it |
 |---|---|
 | `controller/` | the Go controller - one file per concern (`awxconnection.go`, `ansiblebinding.go`, `awx_client.go`, `engine.go`) |
-| `controller/manifests/crd.yml` | both CRDs; copied into `config/` at release time |
+| `controller/manifests/crd.yml` | all three CRDs - `AWXConnection`, `AnsibleBinding`, `AnsibleBindingVM`; copied into `config/` at release time |
 | `config/` | ytt templates for the deployed service: `Deployment`, `ServiceAccount`, RBAC, values schema |
 | `examples/` | the three manifests a user applies |
 | `test/` | the e2e suite and its fake AWX server, plus the live pre-release gate: `install-supervisor-service.sh`, `fixture.sh`, `verify-supervisor.sh`, and `lib/dotenv.sh`, which loads `.env` for all three |
@@ -35,6 +37,11 @@ The e2e suite runs the controller authenticated as its own service account (`ans
 - detecting `/api/v2` vs `/api/controller/v2` against two fake instances, and running a full launch/poll cycle through the AAP 2.5-style gateway path
 - refusing a host owned by another supervisor (nothing written, no job launched), and `hostNamePrefix` resolving that collision
 - `cleanupPolicy: Retain` → delete → recreate reclaiming ownership of the retained host, which is then deletable again
+- the `onDeleted` hook on a real `VirtualMachine` delete: launched with the host's `--limit`, the host pinned to the control node and still present while the job runs, then removed once it is terminal, with the outcome recorded as an Event on the binding
+- a VM *relabelled out* of the selector getting no hook - its guest is still running, so only the inventory host goes
+- `onDeleted.targeting: Template` launching a workflow the managed host could not narrow: no limit and no inventory sent, and the managed host neither pinned nor edited
+- a second binding selecting a VM the first already owns being refused a claim: it reports `Conflict`, creates no child and launches no job, while the owner is untouched
+- switching to `Retain` *while an `onDeleted` hook is still running* - the held job gives a window the live gate cannot - after which the host must survive with the hook's `ansible_connection: local` pin taken back off and its variables byte-for-byte what they were
 - per-VM AWX host cleanup when a VM drops out of `vmSelector`, and finalizer-driven cleanup on delete
 - an idle child making **no** AWX requests at all between host checks, sampled over a window - the assertion that keeps the per-VM split from costing one AWX round trip per VM per resync
 - the binding's `status.summary` agreeing with the children it is a rollup of
@@ -53,6 +60,7 @@ Those gaps only a live environment closes, and `make verify-supervisor` closes t
 - a real AWX token and Machine credential SSHing into a VM Service VM, with `--limit` honored
 - the in-cluster startup path under the service's own `ClusterRole`
 - one binding fanning out to several VMs, each with its own inventory host and run
+- the VM claim arbitrated by a real API server rather than a fake client's storage: a second binding selecting an owned VM is refused the claim and reports `Conflict`
 
 Run it after you change VM lookup, the AWX client, RBAC, or the packaging.
 
@@ -116,6 +124,8 @@ make verify-supervisor DEV_VERSION=1.0.1-rc1 \
 
 `AWX_TEMPLATE` must have Prompt on Launch enabled for Limit and must have an inventory. It is checked in a preflight pass before anything is created, so a misconfigured run fails in seconds rather than after an install.
 
+`AWX_DEPROVISION_TEMPLATE` is the `onDeleted` hook's template, and naming one is what turns the hook checks on. Its requirements are stricter than the provisioning template's: Prompt on Launch for Limit *and* for Variables - the hook always passes `asb_*` extra vars, so there is no `useDefaultLimit`-style way out of the second - and the same inventory the host lives in, or its limit would match nothing. All three are checked in the same preflight pass. Leave it unset and the hook goes unexercised here: `make test-e2e` covers it against the fake AWX, and nothing else covers it against a real one.
+
 **The VM it runs against is part of the harness.** With no `VM_LABEL`, `verify-supervisor` creates its own fixture VM and destroys it afterwards, discovering the image, class and storage class from the namespace. It needs a public key whose private half AWX already holds in the Machine credential on the template:
 
 ```bash
@@ -133,8 +143,12 @@ What it asserts, in order:
 1. **The build under test is what is installed.** Exactly one controller Deployment, Available, running the digest `dev-release` just pushed - so a run cannot silently validate last week's install. The image must be pinned by digest, not a tag: a tag sends kapp-controller back to the registry on every deploy, which unpins it and breaks air-gapped installs.
 2. **It starts clean in-cluster.** CRDs Established, `controller started successfully` in the log, and no `Forbidden` anywhere in it - a missing `ClusterRole` rule shows up here and nowhere else.
 3. **A real run completes.** `AWXConnection` goes Ready with the API base path the harness independently detected, every matched VM reaches `Succeeded`, the binding's fan-out matches the selector, and the inventory host is read back *out of AWX* to confirm its `ansible_host` is the IP the live VM reports.
-4. **An idle binding costs nothing.** `metadata.resourceVersion` and the AWX host's `modified` timestamp must both be unchanged across three or more resync passes. This is the assertion that would have caught the per-pass status write fixed in 1.0.1, and it is cheap to keep honest. A *child* is not quite as quiet: it records `status.lastHostCheck` each time it reconciles its inventory host against AWX, so an idle VM costs one status write per `host_check_period` (600s by default) and nothing in between. That timestamp is in status rather than in memory on purpose - the decision has to survive a controller restart and be derivable from the object rather than from what the process remembers doing.
-5. **Teardown removes what it created.** The finalizer releases, a host the controller created is gone from AWX, and a host it merely adopted is still there.
+4. **One VM, one owner.** A second `AnsibleBinding` selecting the VM the first already owns must report `state: Conflict` with `summary.total/conflicted` of `1/1`, name the VM and its owner in `summary.conflictedVMs`, and own **no** `AnsibleBindingVM` at all - the losing side launches nothing. The owner has to come through it unchanged, still `Ready`: a challenger must not perturb the binding actually holding the claim. Unit tests arbitrate this against a fake client's storage; only a real API server proves the create is what decides it.
+5. **An idle binding costs nothing.** `metadata.resourceVersion` and the AWX host's `modified` timestamp must both be unchanged across three or more resync passes. This is the assertion that would have caught the per-pass status write fixed in 1.0.1, and it is cheap to keep honest. A *child* is not quite as quiet: it records `status.lastHostCheck` each time it reconciles its inventory host against AWX, so an idle VM costs one status write per `host_check_period` (600s by default) and nothing in between. That timestamp is in status rather than in memory on purpose - the decision has to survive a controller restart and be derivable from the object rather than from what the process remembers doing.
+6. **A deleted VM runs its `onDeleted` hook.** Only when `AWX_DEPROVISION_TEMPLATE` names a hook template *and* the harness owns the fixture VM - checking this live means destroying the VM, so a `VM_LABEL` VM someone else manages is left alone and the checks are skipped. The VirtualMachine is deleted, and the hook must launch a new job on that template, limited to that VM's host and carrying `asb_hook`, `asb_vm_name`, `asb_binding` and `asb_last_known_ip`. The host must still be in the inventory and pinned with `ansible_connection: local` while the job runs, and must go only once the job is terminal. The job has to end `successful` - the finalizer releases either way, so the child disappearing proves nothing on its own - and the outcome has to be recorded as a `DeprovisionHook` Event on the binding, which outlives the child that ran it.
+
+   `cleanupPolicy: Retain` is then checked on **its own second fixture VM**, brought up for the purpose and deleted the same way. It needs one: a VM has exactly one owning binding now, so the two policies can no longer ride on a single delete the way they did when children were named per binding *and* VM. Its host has to survive its hook and be handed back exactly as it was found - specifically without the `ansible_connection: local` pin, which on a surviving host would send the next provisioning run to the AWX control node instead of the machine. Deleting that binding must not take the host either. The harness removes both the host and the second VM on the way out, since by definition the controller will not.
+7. **Teardown removes what it created.** The finalizer releases, a host the controller created is gone from AWX, and a host it merely adopted is still there.
 
 It always removes its own `AnsibleBinding`, `AWXConnection` and `Secret`, including on failure - it runs in a real tenant namespace, and a leaked binding keeps launching jobs. `--keep` (via `test/verify-supervisor.sh --keep`) leaves them for debugging, and any failure dumps the controller log and the binding's status first.
 

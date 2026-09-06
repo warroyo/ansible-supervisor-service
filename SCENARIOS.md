@@ -1,6 +1,6 @@
 # Scenarios
 
-What actually happens, step by step, when something changes. The [README](README.md) covers what the CRDs are; this page covers what the controller does with them - on a create, on an update, and on a delete.
+What actually happens, step by step, when something changes. The [README](README.md) covers what the CRDs are and [Architecture](ARCHITECTURE.md) covers how they fit together; this page covers what the controller does with them - on a create, on an update, and on a delete.
 
 - [The cast](#the-cast)
 - [Creates](#creates)
@@ -113,6 +113,15 @@ A host carrying **another supervisor's** ownership marker is refused outright - 
 
 The launch path re-reads the template every time precisely for this. `ask_limit_on_launch` off with a per-VM limit in play, or `ask_variables_on_launch` off with `extraVars` set, means AWX would silently drop the field - so the child refuses and tells you which setting to enable. The first would run your playbook against the whole inventory.
 
+### Two bindings select the same VM
+
+1. Both compute the same child name for it - children are named after the VM alone - so both try to create the same object.
+2. Kubernetes accepts one. The other's create comes back `AlreadyExists`, and it reads the object live to find out whose it is rather than assuming it is its own from an earlier pass.
+3. The loser records the VM under `summary.conflicted` with the owner's name, reports `Conflict`, and is not `Ready`. It creates nothing, launches nothing, and touches neither the child nor the AWX host.
+4. Its other VMs reconcile normally: one contested VM does not stall the rest.
+5. It looks again on a jittered ~30s interval. A released claim wakes its former owner, not the bindings queued behind it, so the waiters come back on their own rather than the namespace waking every binding on every child update.
+6. When the owner releases the VM - stops selecting it, or is deleted - the claim is free only once that child's finalizer has finished, `onDeleted` hook included. Under `cleanupPolicy: Retain` the AWX host still carries the old binding's ownership marker, so the new owner claims the VM but refuses that host until it is retired or the new binding gets its own `hostNamePrefix`.
+
 ## Deletes
 
 ### A VM is deleted
@@ -123,6 +132,23 @@ The launch path re-reads the template every time precisely for this. `ask_limit_
 4. A host with no marker (adopted) is left alone, as is everything under `cleanupPolicy: Retain`.
 5. If AWX is unreachable, the error is returned and the finalizer holds - the delete is retried rather than leaking the host. Only a genuinely unrecoverable case - the `AWXConnection` or its `Secret` is gone or malformed - is logged and abandoned, since blocking the delete forever would not bring the host back either.
 6. The binding counts the child under `summary.terminating`, apart from the phase buckets. A child wedged on an AWX host that will not delete stays visible instead of vanishing from the rollup while the binding above it reads `Ready`.
+
+### A VM is deleted and the binding has an `onDeleted` hook
+
+The same finalizer, with a playbook in front of the host deletion.
+
+1. The child re-reads itself **live from the API server** rather than from the informer cache. Everything below resumes from what the previous pass recorded, and a stale copy saying "nothing launched yet" would launch a second decommission run.
+2. It confirms the VM is genuinely gone: absent, carrying a `deletionTimestamp`, or resolving to a different UID than the one in its owner reference. A VM that is merely unmatched gets no playbook - see [A VM is relabelled out of the selector](#a-vm-is-relabelled-out-of-the-selector).
+3. A deadline is stamped into `status.deprovision.deadline` once, from `timeoutSeconds`. It is read back on later passes rather than recomputed, so editing the timeout mid-teardown cannot extend a hook already running.
+4. If a provisioning job is still in flight against this host, the hook waits for it. Two playbooks against the same target with opposite intent is the one ordering that has to be got right.
+5. The targeting the hook started under is stamped alongside the deadline and read back afterwards, so editing `spec.onDeleted.targeting` mid-teardown cannot re-aim a hook that is already running. A record with no mode - one written before this existed - means `ManagedHost`.
+6. The hook's template is resolved from AWX at launch time, never from the template cache. Under `ManagedHost` it is refused unless it accepts a limit **and is configured with the same inventory as the host**: a deprovision run against a whole inventory would decommission every host in it, and a limit naming a host in a different inventory selects nothing while the teardown reports success. There is no `useDefaultLimit` here, and neither refusal is quietly downgraded to `Template`. A host marked as another binding's is refused before any of this - not modified, not run against, not deleted, and no playbook launched.
+7. Under `targeting: Template` steps 6 and 8 do not apply: no inventory and no limit are sent, no host is required to exist or to be ours, and nothing is written to one. A transient failure to look the host up does not hold the hook up either - the lookup is owed to the cleanup that follows, and is retried there. The workflow runs against what it is configured for.
+8. The inventory host gets `ansible_connection: local` before the launch. The guest is already destroyed and its address may have been re-leased, so a play that forgets `delegate_to` must not reach whatever now answers there. If the host is one that survives the teardown - `cleanupPolicy: Retain`, or an adopted host - what the variable said before is recorded first and put back once the hook is terminal, so the next provisioning run is not silently redirected to the AWX control node.
+9. `status.deprovision.phase` goes to `Launching` **before** the launch request, then to `Running` with the job id. A pass that finds `Launching` with no job id does not relaunch: the job may well be running, and running a decommission playbook twice is worse than not knowing whether it ran once.
+10. Each later pass polls the job and requeues. The finalizer holds, but nothing sleeps: the work is one AWX request per poll on a terminating object.
+11. On any terminal outcome - `Succeeded`, `Failed`, `TimedOut` - the outcome is recorded, the host is deleted and the finalizer is released. The record is written before any retry of the host deletion, so a host that will not delete cannot cost the hook's outcome or cause a relaunch. The `ansible_connection` override is only ever taken back off the host it was written on - checked by id, not by name, so a host recreated under the same name during the hook is left alone. Failure never blocks: a broken teardown playbook would otherwise hold the VM, its binding, and any namespace being deleted above it.
+12. The outcome is written to the log with the AWX job URL, and to an Event on the `AnsibleBinding`. The child is deleted a moment later and takes `status.deprovision` with it, so the Event is what an operator finds afterwards.
 
 ### A VM is deleted and recreated under the same name
 
@@ -139,7 +165,7 @@ This matters more than it looks: a stale inventory host keeps an `ansible_host` 
 1. The binding's finalizer runs `cleanupAnsibleBinding`.
 2. The children are owned by their VMs, not by the binding, so the garbage collector will not remove them. The binding lists them **live from the API server** - not from the cache - and deletes each one.
 3. Before deleting a child, the binding copies the current `cleanupPolicy` down into it. Finalization no longer runs the normal reconcile that would otherwise copy the spec down, so without this, setting `cleanupPolicy: Retain` on a binding already stuck on an unreachable AWX would change nothing - the one thing the docs promise it does.
-4. While any child remains, the binding returns an error and stays in `Terminating`. That is what makes every child's own finalizer run to completion before the binding disappears.
+4. While any child remains, the binding stays in `Terminating`. It reads the remaining children from the informer cache rather than listing them live on every pass, and is woken by each child that finishes; the 30-second interval is the backstop for a missed event. Before it releases its own finalizer it confirms with a **live** list - an empty cache is not proof that nothing is left, and releasing on one would abandon a child, its AWX host and its teardown playbook. That is what makes every child's own finalizer run to completion before the binding disappears - including any `onDeleted` hook, for the children whose VMs went first. Waiting is reported as waiting, not as a failure: a teardown playbook taking minutes is not an error to retry on a backoff.
 
 If the service itself is uninstalled while bindings still exist, nothing is left to drain them and they hang in `Terminating` - see the [uninstall notes](README.md#uninstalling) and [how to find leftover hosts](FAQ.md#how-do-i-find-awx-hosts-a-supervisor-left-behind).
 

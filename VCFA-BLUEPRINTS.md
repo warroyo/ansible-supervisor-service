@@ -298,6 +298,10 @@ Deleting the deployment deletes the `AnsibleBinding`, whose finalizer blocks unt
 
 Set `cleanupPolicy: Retain` on the binding if you want the AWX host entries kept after the deployment is gone - for run history or audit. They are then yours to clean up.
 
+**Running a playbook on the way out.** `spec.onDeleted` on the binding launches a template when a VM in the deployment is deleted, before its inventory host goes - the deregistration half of what `Cloud.Ansible.Tower`'s `templates.de-provision[]` did in a VM Apps organization. Deleting the deployment deletes both the VMs and the binding, and each VM's hook runs before the binding finishes, so a deployment teardown takes as long as the slowest deregistration playbook rather than a second or two. Budget for that, or bound it with `timeoutSeconds` - past which the finalizer is released regardless, so a hung playbook cannot leave a deployment stuck deleting.
+
+The hook cannot reach inside the guest: vm-operator has destroyed the machine by the time it runs. Anything that needs a live guest has to happen while the deployment still exists, as a day-2 action against the binding rather than as part of the teardown.
+
 ## Troubleshooting
 
 Everything here is visible with `kubectl` against the project's Supervisor namespace, which is generally faster than reading it out of the deployment view.
@@ -312,6 +316,7 @@ Everything here is visible with `kubectl` against the project's Supervisor names
 | Job fails `unreachable` | The cloud-init public key does not match the AWX Machine credential's private key, or AWX has no route to the VM's IP |
 | Second deployment fails where the first succeeded | Resource names are not per-deployment. Add `${env.shortDeploymentId}` to the VM name |
 | Playbook ran against VMs from another deployment | The selector is not scoped per deployment. See [Scope the selector to the deployment](#scope-the-selector-to-the-deployment) |
+| Deployment times out, state `Conflict` | Another deployment's binding already owns one of these VMs - only one `AnsibleBinding` may own a VM. Almost always an unscoped selector matching the other deployment's machines: see [Scope the selector to the deployment](#scope-the-selector-to-the-deployment). `.status.summary.conflictedVMs` names the VM and the binding holding it |
 
 ```bash
 kubectl get ansiblebinding -n <project-supervisor-namespace>
