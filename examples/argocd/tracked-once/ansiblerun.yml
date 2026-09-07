@@ -1,0 +1,44 @@
+# A run as a tracked resource: Argo owns it, it executes on the first sync,
+# and it never executes again.
+#
+# This is the shape for something that belongs to the application's own
+# lifecycle - register the app in DNS, open the change ticket that gates its
+# rollout. The manifest stays in Git and stays applied; re-syncing it is a
+# no-op because the spec is immutable and the run is terminal.
+#
+# Note what is NOT here:
+#
+#   ttlSecondsAfterFinished   Argo tracks this object. A TTL would delete it
+#                             behind Argo's back, the app would go OutOfSync,
+#                             the next sync would recreate it - and a new
+#                             object is a new execution. See ARGOCD.md.
+#
+#   an argocd.argoproj.io/hook annotation
+#                             A hook is not tracked and runs per sync. This
+#                             is the opposite choice, deliberately.
+#
+# The wave puts it after the resources it describes. Health for this kind
+# comes from examples/argocd/platform - without it the wave does not wait.
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: register-dns
+  namespace: my-namespace
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  awxConnectionRef: awx
+  template:
+    name: "Register DNS Record"
+    type: JobTemplate
+  # No hosts and no vmRef: the playbook runs on localhost against an
+  # external API, so nothing is written to the AWX inventory and no --limit
+  # is sent. The template's own scope applies.
+  extraVars:
+    record_name: webserver
+    zone: corp.example.com
+    record_state: present
+  # Bound the whole thing, including waiting on anything it references.
+  # Without it a run whose dependency never appears waits forever and the
+  # sync sits Progressing with nothing to show a human.
+  activeDeadlineSeconds: 1800

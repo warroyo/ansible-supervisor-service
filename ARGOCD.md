@@ -9,11 +9,13 @@ One thing does not transfer, and it is the thing that fails silently: **Argo has
 - [Immutability, and what `Replace=true` does not fix](#immutability-and-what-replacetrue-does-not-fix)
 - [Never set a TTL on a run Argo tracks](#never-set-a-ttl-on-a-run-argo-tracks)
 - [Sync waves, and why `varsFrom` softens them](#sync-waves-and-why-varsfrom-softens-them)
-- [Explicit hosts and the regenerated-name trap](#explicit-hosts-and-the-regenerated-name-trap)
+- [Explicit hosts, and what a run may write](#explicit-hosts-and-what-a-run-may-write)
 - [Decommissioning: `PostDelete` is too late](#decommissioning-postdelete-is-too-late)
 - [Scenarios](#scenarios) - nine worked examples
 - [Teardown](#teardown)
 - [Troubleshooting](#troubleshooting)
+
+Runnable manifests for the shapes below are in [`examples/argocd/`](examples/argocd/): the platform configuration, a tracked once-only run, a `PostSync` smoke test, and externally sequenced teardown.
 
 ## One-time setup
 
@@ -21,7 +23,7 @@ Done once by whoever administers Argo CD, not by every application. Note that th
 
 ### 1. Install the health checks
 
-Add to the `argocd-cm` ConfigMap. The state machine these read is the one documented under [CRD status](README.md#crd-status), and it lines up with Argo's health model exactly: `Failed` is reserved for a *terminal* outcome, and a run still retrying a transient problem stays `Pending` or `Running` with the error in `message`. That is the difference between `Degraded` and `Progressing`, already made for you.
+Add to the `argocd-cm` ConfigMap - [`examples/argocd/platform/argocd-cm.yml`](examples/argocd/platform/argocd-cm.yml) is this same text as an applyable file. The state machine these read is the one documented under [CRD status](README.md#crd-status), and it lines up with Argo's health model exactly: `Failed` is reserved for a *terminal* outcome, and a run still retrying a transient problem stays `Pending` or `Running` with the error in `message`. That is the difference between `Degraded` and `Progressing`, already made for you.
 
 ```yaml
 apiVersion: v1
@@ -186,7 +188,7 @@ So do not reach for `Replace`. Use one of the two shapes that never produce a di
     name: dns-webserver-corp-example-com
   ```
 
-  This is the same guidance as for [VCFA blueprints](VCFA-BLUEPRINTS.md#decommissioning-in-the-right-order), and it is also how you deliberately get "re-run when this input changes" out of a resource that otherwise never runs twice. With Argo it needs `prune: true`, or the superseded run lingers - see [the regenerated-name trap](#explicit-hosts-and-the-regenerated-name-trap).
+  This is the same guidance as for [VCFA blueprints](VCFA-BLUEPRINTS.md#decommissioning-in-the-right-order), and it is also how you deliberately get "re-run when this input changes" out of a resource that otherwise never runs twice. With Argo it needs `prune: true`, or the superseded run lingers - see [what a run may write](#explicit-hosts-and-what-a-run-may-write).
 
 ## Never set a TTL on a run Argo tracks
 
@@ -233,26 +235,32 @@ That said, waves are a convenience here, not a requirement, and it is worth know
 
 The alternative - templating the IP into `extraVars` from Git - is not available at all, because Git does not know it. `varsFrom` is what makes an Argo-managed run possible for anything that depends on runtime state, and the wave is only there to make the first attempt succeed rather than retry a few times. `activeDeadlineSeconds` is what bounds the waiting; without it a reference that never resolves waits forever and the app sits `Progressing` with no explanation.
 
-## Explicit hosts and the regenerated-name trap
+## Explicit hosts, and what a run may write
 
-This one is specific to `spec.hosts`, and it will bite the hook shape if you are not expecting it.
+A run is a visitor in the inventory. It **executes against** an existing AWX host without owning it: the host's variables, address, groups and ownership marker come out of the run exactly as they went in, and deleting the run leaves it alone. That holds whether the host was made by hand, by an `AnsibleBindingVM`, or by an earlier run.
 
-The controller records ownership of an AWX inventory host in the host's description, keyed on the run's **namespace and name** ([why](FAQ.md#can-several-supervisors-share-one-awx-instance)). A host marked as belonging to some *other* run is refused outright - nothing is written and no job is launched. That is the correct behaviour when two different things fight over one host, but "different" is decided by name, and every Argo shape that re-runs a playbook deliberately changes the name.
+A run only writes to a host it created itself - one that was not there when it looked.
 
-It works out for the common case and breaks for two specific ones:
+That single rule decides every repeating-hook shape:
 
 | Setup | Second sync |
 |---|---|
-| `generateName` hook, `cleanupPolicy: Delete` (default), `hook-delete-policy: HookSucceeded` | Fine. The old run's deletion takes its host with it, so the new run creates a fresh one. |
-| Host pre-created by hand in AWX, unmarked | Fine, and the most robust option. An unmarked host is adopted by every run: variables merged, description untouched, never deleted. |
-| `cleanupPolicy: Retain` | **Refused.** The retained host still carries the previous run's marker. |
-| Tracked resource, name derived from an input, `prune: false` | **Refused.** The superseded run was never deleted, so neither was its host. |
+| Names only, no `address` and no `variables` | Fine, whatever the host's history. The run resolves it, scopes the job to it, and changes nothing. |
+| `generateName` hook, `cleanupPolicy: Delete` (default), `hook-delete-policy: HookSucceeded` | Fine. The old run's deletion takes the host it created with it, so the new run creates a fresh one. |
+| `address` or `variables` on a host that already exists | **Refused, before anything launches.** The run cannot apply them and will not pretend it did. Move the values into `extraVars`/`varsFrom`, or drop them and let the host keep its own. |
+| A retained or superseded run's host, plus `address`/`variables` on the new run | Same refusal, and the usual way to meet it: the previous host outlived the run that made it. |
 
-If you target explicit hosts from a hook that runs repeatedly, either leave `cleanupPolicy` at its default so each run cleans up after itself, or pre-create the hosts in AWX and let every run adopt them. A run with `vmRef` or with no target at all is unaffected: a VM-derived host is named from the VM, and a run with neither `hosts` nor `vmRef` touches the inventory not at all - which is one more reason the `hosts: localhost` shape is the easiest thing to drive from Argo.
+Per-execution values belong in `extraVars` and `varsFrom`. AWX passes those as the job's `extra_vars`, which Ansible ranks above inventory variables - so the run gets its value for that job without the inventory ever changing, and the next job on that host sees the inventory's own value again.
+
+A run with `vmRef`, or with no target at all, needs none of this. A VM-derived host is named from the VM and shared with whatever binding manages it; a run with neither `hosts` nor `vmRef` touches the inventory not at all - which is one more reason the `hosts: localhost` shape is the easiest thing to drive from Argo.
 
 ## Decommissioning: `PostDelete` is too late
 
-There is no pre-delete hook this service can use - the mechanism exists in VM Service and is restricted to privileged accounts, and [the FAQ explains why](FAQ.md#why-is-there-no-pre-delete-hook). Argo does not supply one either. Its hook types are `PreSync`, `Sync`, `PostSync`, `SyncFail`, and (2.10+) `PostDelete`, which runs **after** the application's resources have been deleted. By then the VM is gone and the guest is unreachable.
+There is no pre-delete hook *this service* can use - the mechanism exists in VM Service and is restricted to privileged accounts, and [the FAQ explains why](FAQ.md#why-is-there-no-pre-delete-hook).
+
+Argo's own hooks are `PreSync`, `Sync`, `PostSync`, `SyncFail`, and (2.10+) `PostDelete`, which runs **after** the application's resources have been deleted. By then the VM is gone and the guest is unreachable. Newer Argo CD documents a `PreDelete` hook as well, which would fire before the application's resources - the `VirtualMachine` among them - are removed, and that is the right shape for a guest decommission.
+
+**This repo does not pin a minimum version for `PreDelete`, and does not test it.** Check your own Argo CD's documentation and behaviour before relying on it, because the failure mode of getting it wrong is a hook that never runs and a guest destroyed with its decommission playbook unexecuted. The [external sequencing](#9-decommission-a-guest-before-the-vm-is-destroyed) below works on every version and is what the suite covers.
 
 So the limitation carries over intact:
 
@@ -451,13 +459,13 @@ metadata:
   name: deploy-shop-frontend-{{ .Values.appVersion | replace "." "-" }}
 ```
 
-**`prune: true` is required**, not optional. Without it the superseded runs pile up, and with `spec.hosts` they would also hold onto their inventory hosts and refuse the new run - [the regenerated-name trap](#explicit-hosts-and-the-regenerated-name-trap).
+**`prune: true` is required**, not optional. Without it the superseded runs pile up, and each one holds onto any inventory host it created - which the next run will happily execute against, but cannot write an `address` or `variables` onto. See [what a run may write](#explicit-hosts-and-what-a-run-may-write).
 
 Two names must stay legal: a Kubernetes object name is 253 characters, lowercase alphanumeric plus `-` and `.`. A version string with `+build` metadata in it will be rejected, so sanitise it as above.
 
 ### 6. Patch bare-metal hosts on every sync
 
-`spec.hosts` reaches machines this Supervisor does not own. Combined with a repeating hook, this is where [the ownership trap](#explicit-hosts-and-the-regenerated-name-trap) lives, so there are two safe forms and one that breaks.
+`spec.hosts` reaches machines this Supervisor does not own. Combined with a repeating hook, this is where [what a run may write](#explicit-hosts-and-what-a-run-may-write) matters most, so there are two safe forms and one that breaks.
 
 **Safe form A - let each run clean up after itself** (default `cleanupPolicy`):
 
@@ -491,7 +499,7 @@ spec:
   activeDeadlineSeconds: 1800
 ```
 
-**Safe form B - pre-create the hosts in AWX, by hand or by whatever manages your inventory.** An unmarked host is adopted by every run: variables merged, description left alone, never deleted. This is the more robust option when the machines are permanent inventory that happens to get patched, rather than something this service should own:
+**Safe form B - pre-create the hosts in AWX, by hand or by whatever manages your inventory.** An existing host is resolved and used by every run, and written to by none of them. This is the more robust option when the machines are permanent inventory that happens to get patched, rather than something this service should own:
 
 ```yaml
 spec:
@@ -500,7 +508,7 @@ spec:
     - name: db-prod-02        # ansible_host is left exactly as it is
 ```
 
-**The form that breaks:** `generateName` plus `cleanupPolicy: Retain`. The retained host carries the previous run's ownership marker, so the next sync is refused with `already owned by another ansible-supervisor binding` and no job launches. Same outcome for a tracked run with a changing name and `prune: false`.
+**The form that breaks:** either safe form *plus* an `address` or `variables` on a host that is already there - `cleanupPolicy: Retain` with `generateName`, or a tracked run with a changing name and `prune: false`, both of which leave the previous run's host behind. The next sync is refused with `already exists and is not this run's to change` and no job launches. The fix is the same either way: drop the host-level fields once the host exists, and put per-run values in `extraVars`.
 
 Note that `hostNamePrefix` on the `AWXConnection` is **not** applied to `spec.hosts` entries - these are literals naming machines that usually already exist, and prefixing `db-prod-01` would create a duplicate and patch the wrong thing.
 
@@ -559,9 +567,9 @@ Worth it only if the paging path already lives in AWX. Argo's own notifications 
 
 ### 9. Decommission a guest before the VM is destroyed
 
-**This one has no Argo shape.** It is listed because it is the thing people try first.
+**Sequence this from outside Argo unless you have verified `PreDelete` on your own Argo CD.** It is listed because it is the thing people try first.
 
-A decommission playbook that logs into the guest - flushing a queue, deregistering from a cluster, taking a final backup - has to run while the VM is still up. There is no pre-delete hook this service can use ([why](FAQ.md#why-is-there-no-pre-delete-hook)), and Argo does not supply one: `PostDelete` runs after the VM is already destroyed, and there is no `PreDelete`.
+A decommission playbook that logs into the guest - flushing a queue, deregistering from a cluster, taking a final backup - has to run while the VM is still up. There is no pre-delete hook this service can use ([why](FAQ.md#why-is-there-no-pre-delete-hook)), and Argo's `PostDelete` runs after the VM is already destroyed. Newer Argo CD documents a `PreDelete` hook that fires early enough; it is [not pinned or tested here](#decommissioning-postdelete-is-too-late), so what follows is the version-independent form, which is also what [`examples/argocd/external-teardown/`](examples/argocd/external-teardown/) implements.
 
 What does **not** work:
 
@@ -607,7 +615,12 @@ This is a genuine regression from what `Cloud.Ansible.Tower` could do with `temp
 
 Deleting the application deletes the CRs, and each one's finalizer blocks until AWX confirms the inventory hosts it created are gone. That is deliberate ([why](README.md#ansiblebinding)) and it means an app delete can sit in `Terminating` while AWX is unreachable, rather than leaking a host whose IP AWX may later hand to an unrelated VM.
 
-If AWX is gone for good and you need the app to finish deleting, set `cleanupPolicy: Retain` on the CRs - it is honoured even while they are terminating - and sync before deleting. Do not strip finalizers; that leaves hosts behind with no record of them. The FAQ has [how to find hosts a supervisor left behind](FAQ.md#how-do-i-find-awx-hosts-a-supervisor-left-behind).
+If AWX is gone for good and you need the app to finish deleting, the lever depends on the kind:
+
+- An `AnsibleBinding` has a mutable spec, so `cleanupPolicy: Retain` can be set on it and is honoured even while it is terminating. Sync before deleting.
+- An `AnsibleRun` does **not**: its spec is immutable, and patching `cleanupPolicy` on one is rejected by the API server. What releases it is removing what it cleans up *through* - delete the `AWXConnection` it names, or the `Secret` holding the token. A run that can no longer reach AWX at all abandons its hosts, logs which ids it left behind, and releases its finalizer. A run whose AWX is merely erroring keeps retrying, which is the intended difference.
+
+Either way, do not strip finalizers; that leaves hosts behind with no record of them. The FAQ has [how to find hosts a supervisor left behind](FAQ.md#how-do-i-find-awx-hosts-a-supervisor-left-behind).
 
 Order matters on the way out. Argo deletes in reverse sync-wave order, so putting the `AWXConnection` and its `Secret` in an earlier wave than anything that uses them means they are deleted *last* - which is what the finalizers need. Better still, keep the connection out of the application entirely, per [one-time setup](#2-create-the-awxconnection-out-of-band).
 
@@ -619,5 +632,5 @@ Order matters on the way out. Argo deletes in reverse sync-wave order, so puttin
 | Sync hangs `Progressing` forever | A run stuck `Pending`: a `varsFrom` reference that never resolves, a VM with no IP, AWX unreachable. `status.message` says which. Set `activeDeadlineSeconds` so it eventually fails instead |
 | `spec is immutable` on sync | Something patched a tracked run. Move the varying value into `metadata.name`, or make it a hook. Do not use `Replace=true` |
 | App flips `OutOfSync` after a run finishes, then re-runs it | `ttlSecondsAfterFinished` set on a tracked resource. [Unset it](#never-set-a-ttl-on-a-run-argo-tracks) |
-| `inventory host ... is already owned by another ansible-supervisor binding` | [The regenerated-name trap](#explicit-hosts-and-the-regenerated-name-trap) |
-| App stuck `Terminating` | A finalizer waiting on AWX. Check `status.hosts[].pendingCleanup` and whether the `AWXConnection` still resolves |
+| `inventory host ... already exists and is not this run's to change` | The run asked to write an `address` or `variables` onto a host it does not own. [What a run may write](#explicit-hosts-and-what-a-run-may-write) |
+| App stuck `Terminating` | A finalizer waiting on AWX. Check `status.hosts[]` for what it still has to delete, `status.jobID` with `status.cancelRequestedAt` for a job it is waiting to see stop, and whether the `AWXConnection` still resolves. The controller log names the run and what it is retrying |

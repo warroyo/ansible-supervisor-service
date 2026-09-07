@@ -89,6 +89,11 @@ host_deleted() {  # host_deleted <addr> <host id> -> true if AWX deleted it
     | python3 -c "import json,sys; sys.exit(0 if int(sys.argv[1]) in json.load(sys.stdin) else 1)" "$2"
 }
 
+job_canceled() {  # job_canceled <addr> <job id> -> true if AWX was asked to stop it
+  curl -sf "http://$1/_test/canceled-jobs" \
+    | python3 -c "import json,sys; sys.exit(0 if int(sys.argv[1]) in json.load(sys.stdin) else 1)" "$2"
+}
+
 # Deleted hosts keep their name in the fake's store, so a host that was
 # deleted and recreated appears twice - and the store is a map, so which
 # one comes back first is luck. Only the live one is the answer.
@@ -1521,7 +1526,36 @@ if kubectl patch ansiblerun e2e-standalone -n "$TEST_NS" --type=merge \
   exit 1
 fi
 log "spec edit rejected"
+
+# --- spec cannot be removed either ---
+# A CEL transition rule is not evaluated when the field it guards is added
+# or removed, so an optional spec could be dropped in one update and
+# reintroduced with different contents in the next - a second execution
+# from a resource whose spec is documented as immutable. The schema
+# requires spec at the root to close that.
+log "removing a run's spec, expecting the API server to reject it"
+if kubectl patch ansiblerun e2e-standalone -n "$TEST_NS" --type=merge \
+     -p '{"spec":null}' >/dev/null 2>&1; then
+  echo "spec was removable; the immutability rule can be stepped around"
+  exit 1
+fi
+log "spec removal rejected"
 kubectl delete ansiblerun e2e-standalone -n "$TEST_NS" --timeout=30s >/dev/null
+
+log "creating an AnsibleRun with no spec, expecting the API server to reject it"
+if kubectl apply -f - >/dev/null 2>&1 <<EOF
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-nospec
+  namespace: ${TEST_NS}
+EOF
+then
+  echo "a spec-less AnsibleRun was accepted"
+  kubectl delete ansiblerun e2e-nospec -n "$TEST_NS" --timeout=30s >/dev/null 2>&1 || true
+  exit 1
+fi
+log "spec-less run rejected"
 
 # --- varsFrom off a ConfigMap: the pure external-API case ---
 # A DNS/CMDB playbook runs on localhost and needs the record as variables,
@@ -1671,8 +1705,8 @@ spec:
 EOF
 log "Secret refused"
 
-log "checking varsFrom refuses an API group outside vars_from_api_groups"
-run_must_fail_without_launching e2e-varsfrom-group "vars_from_api_groups" <<EOF
+log "checking varsFrom refuses a kind in a group vars_from_resources does not name"
+run_must_fail_without_launching e2e-varsfrom-group "not permitted to read anything in" <<EOF
 apiVersion: field.vmware.com/v1
 kind: AnsibleRun
 metadata:
@@ -1692,6 +1726,34 @@ spec:
         url: "{.spec.url}"
 EOF
 log "disallowed group refused"
+
+# The core group is the one that cannot be granted by wildcard: a
+# Supervisor's ValidatingAdmissionPolicy refuses a service ClusterRole
+# that names resources: ["*"] on it, so config/deploy.yml grants core one
+# resource at a time and hands the controller the same list. A core kind
+# outside that list has to be refused with an explanation rather than
+# sent as a read the ClusterRole never granted.
+log "checking varsFrom refuses a kind vars_from_resources does not name, in a group it does"
+run_must_fail_without_launching e2e-varsfrom-core "core/services" <<EOF
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-varsfrom-core
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  varsFrom:
+    - resource:
+        apiVersion: v1
+        kind: Service
+        name: kubernetes
+      vars:
+        ip: "{.spec.clusterIP}"
+EOF
+log "core resource outside the grant refused"
 
 log "checking a varsFrom key colliding with extraVars is refused"
 run_must_fail_without_launching e2e-varsfrom-clash "already set in spec.extraVars" <<EOF
@@ -1839,6 +1901,48 @@ if host_deleted "$AWX_ADDR" "$SEEDED_RUN_ID"; then
 fi
 log "cleanup removed only the created host, leaving the adopted one"
 
+# --- an existing host is borrowed, not written to ---
+# Executing a playbook against a machine is not ownership of the record
+# that describes it. Host writes the run cannot apply are refused rather
+# than dropped, or the playbook would run with values AWX never saw.
+log "targeting an existing host with an address, expecting a refusal rather than a silent drop"
+curl -sf -X POST "http://${AWX_ADDR}/_test/hosts" \
+  -d '{"inventory":1,"name":"db-prod-09","variables":"{\"ansible_host\":\"10.20.5.19\"}"}' >/dev/null
+LAUNCHES_BEFORE_REFUSAL=$(launch_count)
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-hostwrite
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  hosts:
+    - name: db-prod-09
+      address: 10.20.5.99
+EOF
+
+wait_for "the run refuses to write onto a host it does not own" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-hostwrite -n ${TEST_NS} -o jsonpath='{.status.state}') == Failed ]]"
+REFUSAL=$(kubectl get ansiblerun e2e-hostwrite -n "$TEST_NS" -o jsonpath='{.status.failureReason}')
+if [[ "$REFUSAL" != *"spec.extraVars"* ]]; then
+  echo "the refusal should point at launch variables as the way to do this: $REFUSAL"
+  exit 1
+fi
+if [[ "$(host_field "$AWX_ADDR" db-prod-09 variables)" != *"10.20.5.19"* ]]; then
+  echo "the existing host's address was overwritten anyway"
+  exit 1
+fi
+if [[ "$(launch_count)" != "$LAUNCHES_BEFORE_REFUSAL" ]]; then
+  echo "launched a job it could not set up correctly"
+  exit 1
+fi
+log "host writes on a borrowed host refused, inventory untouched, nothing launched"
+kubectl delete ansiblerun e2e-hostwrite -n "$TEST_NS" --timeout=30s >/dev/null
+
 # --- inline host names are literals: hostNamePrefix must not touch them ---
 # Prefixing a name the user typed would match nothing in the inventory,
 # create a duplicate, and run the playbook against the wrong machine.
@@ -1906,6 +2010,98 @@ if [[ "$(host_field "$AWX_ADDR" sup-c-run-vm variables)" != *"10.0.0.77"* ]]; th
 fi
 log "vmRef built host sup-c-run-vm from the VM's reported IP and scoped the run to it"
 kubectl delete ansiblerun e2e-vmref -n "$TEST_NS" --timeout=30s >/dev/null
+
+# --- a one-off run against a host an AnsibleBinding manages ---
+# The case the whole ownership split exists for: a smoke test against a
+# VM the binding provisioned. Same host, same id, no inventory writes,
+# and the binding keeps it when the run goes.
+log "binding the VM, then running a one-off AnsibleRun against the host it manages"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleBinding
+metadata:
+  name: e2e-shared
+  namespace: ${TEST_NS}
+spec:
+  vmSelector:
+    app: runtarget
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  hostVariables:
+    tier: gold
+EOF
+
+wait_for "the binding provisions its host" 90 bash -c \
+  "[[ -n \$(host_field ${AWX_ADDR} sup-c-run-vm id) ]]"
+SHARED_ID=$(host_field "$AWX_ADDR" sup-c-run-vm id)
+SHARED_DESC=$(host_field "$AWX_ADDR" sup-c-run-vm description)
+SHARED_VARS=$(host_field "$AWX_ADDR" sup-c-run-vm variables)
+
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-shared-run
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  vmRef:
+    name: run-vm
+  extraVars:
+    tier: platinum
+EOF
+
+wait_for "the run against the binding's host reaches Ready" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-shared-run -n ${TEST_NS} -o jsonpath='{.status.state}') == Ready ]]"
+SHARED_JOB=$(kubectl get ansiblerun e2e-shared-run -n "$TEST_NS" -o jsonpath='{.status.jobID}')
+if [[ "$(launch_limit "$AWX_ADDR" "$SHARED_JOB")" != "sup-c-run-vm" ]]; then
+  echo "expected the run scoped to the binding's host, got '$(launch_limit "$AWX_ADDR" "$SHARED_JOB")'"
+  exit 1
+fi
+RUN_HOST_ID=$(kubectl get ansiblerun e2e-shared-run -n "$TEST_NS" -o jsonpath='{.status.hosts[0].awxHostID}')
+if [[ "$RUN_HOST_ID" != "$SHARED_ID" ]]; then
+  echo "the run made its own host $RUN_HOST_ID instead of using the binding's $SHARED_ID"
+  exit 1
+fi
+RUN_OWNS=$(kubectl get ansiblerun e2e-shared-run -n "$TEST_NS" -o json | python3 -c \
+  "import json,sys; print(json.load(sys.stdin)['status']['hosts'][0].get('awxHostCreated', False))")
+if [[ "$RUN_OWNS" != "False" ]]; then
+  echo "the run recorded a borrowed host as its own to delete"
+  exit 1
+fi
+if [[ "$(host_field "$AWX_ADDR" sup-c-run-vm description)" != "$SHARED_DESC" ]]; then
+  echo "the run took over the binding's ownership marker"
+  exit 1
+fi
+if [[ "$(host_field "$AWX_ADDR" sup-c-run-vm variables)" != "$SHARED_VARS" ]]; then
+  echo "the run changed the binding's host variables: $(host_field "$AWX_ADDR" sup-c-run-vm variables)"
+  exit 1
+fi
+# The run's own value went to the job, where it overrides the inventory
+# for that execution only.
+if [[ "$(launch_var "$AWX_ADDR" "$SHARED_JOB" tier)" != "platinum" ]]; then
+  echo "the run's extraVars did not reach the launch"
+  exit 1
+fi
+if [[ "$SHARED_VARS" != *"gold"* ]]; then
+  echo "expected the binding's own variable to still read gold: $SHARED_VARS"
+  exit 1
+fi
+log "the run used the binding's host $SHARED_ID unchanged, with its own value in the job"
+
+kubectl delete ansiblerun e2e-shared-run -n "$TEST_NS" --timeout=30s >/dev/null
+if host_deleted "$AWX_ADDR" "$SHARED_ID"; then
+  echo "deleting the run deleted the binding's host"
+  exit 1
+fi
+log "the binding kept its host when the run was deleted"
+kubectl delete ansiblebinding e2e-shared -n "$TEST_NS" --timeout=60s >/dev/null
+
 kubectl patch awxconnection e2e-awx -n "$TEST_NS" --type=merge -p '{"spec":{"hostNamePrefix":""}}' >/dev/null
 
 # --- a template that would silently drop the limit must be refused ---
@@ -1968,6 +2164,135 @@ if [[ -z "$(kubectl get ansiblerun e2e-deadline -n "$TEST_NS" -o jsonpath='{.sta
 fi
 log "deadline expiry ended the run: $DEADLINE_MSG"
 kubectl delete ansiblerun e2e-deadline -n "$TEST_NS" --timeout=30s >/dev/null
+
+# --- a deadline that expires stops the job, it does not just relabel it ---
+# A Kubernetes Job terminates its pods when activeDeadlineSeconds elapses.
+# A run that marked itself Failed and left the playbook executing would be
+# reporting an end state for work still changing machines. "Deregister
+# Host" is the held template, so its jobs stay running until released.
+log "applying a run against a held job with a short deadline"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-deadline-cancel
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Deregister Host"
+    type: JobTemplate
+  activeDeadlineSeconds: 5
+  hosts:
+    - name: deadline-host-01
+      address: 10.20.9.31
+EOF
+
+wait_for "the held run records its job" 60 bash -c \
+  "[[ -n \$(kubectl get ansiblerun e2e-deadline-cancel -n ${TEST_NS} -o jsonpath='{.status.jobID}') ]]"
+HELD_JOB=$(kubectl get ansiblerun e2e-deadline-cancel -n "$TEST_NS" -o jsonpath='{.status.jobID}')
+wait_for "the deadline expires" 60 bash -c \
+  "[[ \$(kubectl get ansiblerun e2e-deadline-cancel -n ${TEST_NS} -o jsonpath='{.status.state}') == Failed ]]"
+if ! job_canceled "$AWX_ADDR" "$HELD_JOB"; then
+  echo "the deadline expired but AWX job $HELD_JOB was left running"
+  exit 1
+fi
+CANCEL_MSG=$(kubectl get ansiblerun e2e-deadline-cancel -n "$TEST_NS" -o jsonpath='{.status.message}')
+if [[ "$CANCEL_MSG" != *"canceled"* ]]; then
+  echo "expected the message to say what became of the job, got: $CANCEL_MSG"
+  exit 1
+fi
+log "deadline expiry canceled job $HELD_JOB: $CANCEL_MSG"
+kubectl delete ansiblerun e2e-deadline-cancel -n "$TEST_NS" --timeout=30s >/dev/null
+
+# --- deleting a run stops the job it started ---
+# Deleting a Kubernetes Job deletes its pods. Leaving the playbook running
+# with the object that asked for it gone leaves nothing pointing at the job.
+log "deleting a run whose job is still running"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-delete-cancel
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Deregister Host"
+    type: JobTemplate
+  hosts:
+    - name: delete-host-01
+      address: 10.20.9.32
+EOF
+
+wait_for "the run records its job" 60 bash -c \
+  "[[ -n \$(kubectl get ansiblerun e2e-delete-cancel -n ${TEST_NS} -o jsonpath='{.status.jobID}') ]]"
+DELETE_JOB=$(kubectl get ansiblerun e2e-delete-cancel -n "$TEST_NS" -o jsonpath='{.status.jobID}')
+DELETE_HOST_ID=$(kubectl get ansiblerun e2e-delete-cancel -n "$TEST_NS" \
+  -o jsonpath='{range .status.hosts[?(@.name=="delete-host-01")]}{.awxHostID}{end}')
+kubectl delete ansiblerun e2e-delete-cancel -n "$TEST_NS" --timeout=60s >/dev/null
+if ! job_canceled "$AWX_ADDR" "$DELETE_JOB"; then
+  echo "the run was deleted but AWX job $DELETE_JOB was left running"
+  exit 1
+fi
+if ! host_deleted "$AWX_ADDR" "$DELETE_HOST_ID"; then
+  echo "the host the deleted run created was left behind"
+  exit 1
+fi
+log "deleting the run canceled job $DELETE_JOB and removed its host"
+
+# --- and it waits for AWX to say the job actually stopped ---
+# AWX answers a cancel with 202 Accepted: it has taken the request, not
+# stopped the playbook. Deleting the inventory host on the strength of
+# that answer races the work being torn down.
+log "deleting a run whose job accepts the cancel but does not stop"
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: e2e-delete-hang
+  namespace: ${TEST_NS}
+spec:
+  awxConnectionRef: e2e-awx
+  template:
+    name: "Deregister Host"
+    type: JobTemplate
+  hosts:
+    - name: hang-host-01
+      address: 10.20.9.33
+EOF
+
+wait_for "the hanging run records its job" 60 bash -c \
+  "[[ -n \$(kubectl get ansiblerun e2e-delete-hang -n ${TEST_NS} -o jsonpath='{.status.jobID}') ]]"
+HANG_JOB=$(kubectl get ansiblerun e2e-delete-hang -n "$TEST_NS" -o jsonpath='{.status.jobID}')
+HANG_HOST_ID=$(kubectl get ansiblerun e2e-delete-hang -n "$TEST_NS" \
+  -o jsonpath='{range .status.hosts[?(@.name=="hang-host-01")]}{.awxHostID}{end}')
+curl -sf -X POST "http://${AWX_ADDR}/_test/hang-cancel?id=${HANG_JOB}" >/dev/null
+
+kubectl delete ansiblerun e2e-delete-hang -n "$TEST_NS" --wait=false >/dev/null
+sleep 8
+if ! kubectl get ansiblerun e2e-delete-hang -n "$TEST_NS" >/dev/null 2>&1; then
+  echo "the run released its finalizer before AWX confirmed job $HANG_JOB had stopped"
+  exit 1
+fi
+if host_deleted "$AWX_ADDR" "$HANG_HOST_ID"; then
+  echo "deleted the inventory host job $HANG_JOB may still be running against"
+  exit 1
+fi
+if [[ -z "$(kubectl get ansiblerun e2e-delete-hang -n "$TEST_NS" -o jsonpath='{.status.cancelRequestedAt}')" ]]; then
+  echo "the cancel request was not recorded, so nothing bounds the wait for it"
+  exit 1
+fi
+
+# AWX finishes stopping it.
+curl -sf -X POST "http://${AWX_ADDR}/_test/finish-job?id=${HANG_JOB}" >/dev/null
+wait_for "the run finishes deleting once its job has stopped" 60 bash -c \
+  "! kubectl get ansiblerun e2e-delete-hang -n ${TEST_NS} >/dev/null 2>&1"
+if ! host_deleted "$AWX_ADDR" "$HANG_HOST_ID"; then
+  echo "the host was left behind once the run finally released"
+  exit 1
+fi
+log "deletion held the finalizer until job $HANG_JOB stopped, then removed its host"
 
 # --- ttlSecondsAfterFinished collects the run and its hosts ---
 log "applying a run with a short TTL, expecting it to delete itself"

@@ -18,7 +18,19 @@ import (
 )
 
 func TestApplyAnsibleRunReturnsWrittenStatusToEngine(t *testing.T) {
+	u := fixtureObject(t, AnsibleRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "expired", Namespace: "ns", CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute))},
+		Spec:       &AnsibleRunSpec{ActiveDeadlineSeconds: 1},
+	}, "AnsibleRun")
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Every pass re-reads the run before acting on it, so the
+		// informer's copy can never authorize a launch.
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(u.Object)
+			return
+		}
 		if r.Method != http.MethodPatch || !strings.HasSuffix(r.URL.Path, "/status") {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusBadRequest)
@@ -28,7 +40,6 @@ func TestApplyAnsibleRunReturnsWrittenStatusToEngine(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 			t.Error(err)
 		}
-		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(patch)
 	}))
 	defer server.Close()
@@ -36,10 +47,6 @@ func TestApplyAnsibleRunReturnsWrittenStatusToEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u := fixtureObject(t, AnsibleRun{
-		ObjectMeta: metav1.ObjectMeta{Name: "expired", Namespace: "ns", CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute))},
-		Spec:       &AnsibleRunSpec{ActiveDeadlineSeconds: 1},
-	}, "AnsibleRun")
 	result, err := applyAnsibleRun(context.Background(), client, u)
 	if err != nil {
 		t.Fatal(err)

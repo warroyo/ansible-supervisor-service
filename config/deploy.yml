@@ -1,9 +1,30 @@
 #@ load("@ytt:data", "data")
+#@ load("@ytt:assert", "assert")
 
 #! "core" is how the core API group is spelled in values, since "" is not a
 #! legible thing to put in a config list. RBAC wants the empty string back.
-#@ def vars_from_groups():
-#@   return [("" if g == "core" else g) for g in data.values.vars_from_api_groups]
+#!
+#! vars_from_resources names "<group>/<resource>" pairs, and this turns them
+#! into one RBAC rule per group. Never a wildcard: a Supervisor's
+#! appplatform-clusterrole-policy refuses `resources: ["*"]` on the core group
+#! outright, and for every other group a wildcard would grant the controller -
+#! which reads with its own identity - get on kinds nobody asked for.
+#@ def vars_from_rules():
+#@   grouped = {}
+#@   order = []
+#@   for entry in data.values.vars_from_resources:
+#@     parts = entry.split("/")
+#@     if len(parts) != 2 or parts[1] == "":
+#@       assert.fail("vars_from_resources entries are \"<group>/<resource>\", e.g. core/configmaps; got " + entry)
+#@     end
+#@     group = "" if parts[0] == "core" else parts[0]
+#@     if group not in grouped:
+#@       grouped[group] = []
+#@       order.append(group)
+#@     end
+#@     grouped[group].append(parts[1])
+#@   end
+#@   return [{"apiGroups": [g], "resources": grouped[g], "verbs": ["get"]} for g in order]
 #@ end
 ---
 apiVersion: apps/v1
@@ -45,7 +66,7 @@ spec:
         - #@ "--supervisor-id=" + data.values.supervisor_id
         #! passed as well as granted, so the controller refuses a varsFrom
         #! read it has no RBAC for with an explanation instead of a Forbidden.
-        - #@ "--vars-from-api-groups=" + ",".join(data.values.vars_from_api_groups)
+        - #@ "--vars-from-resources=" + ",".join(data.values.vars_from_resources)
         - #@ "--host-check-period=" + data.values.host_check_period
         - #@ "--api-qps=" + data.values.api_qps
         - #@ "--api-burst=" + data.values.api_burst
@@ -120,15 +141,15 @@ rules:
   - apiGroups: ["field.vmware.com"]
     resources: ["ansibleruns"]
     verbs: ["delete"]
-  #! get only, and only in the groups vars_from_api_groups names: this is
+  #! get only, and only the exact kinds vars_from_resources names: this is
   #! what an AnsibleRun's spec.varsFrom reads fields out of. list/watch are
   #! deliberately absent - varsFrom names one object at a time, so the
   #! controller never needs to enumerate a namespace. Secrets are refused in
   #! code regardless of what the core group grants here, since extra
   #! variables are visible in AWX job output.
-  - apiGroups: #@ vars_from_groups()
-    resources: ["*"]
-    verbs: ["get"]
+  #@ for rule in vars_from_rules():
+  - #@ rule
+  #@ end
   #! An AnsibleBinding creates and deletes one AnsibleBindingVM per matched
   #! VM, so this kind alone needs create and delete. Kept as its own rule
   #! rather than widening the verbs above, which would also let the

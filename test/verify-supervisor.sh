@@ -6,7 +6,9 @@
 # so it never exercises the built image, the Carvel package, the pinned
 # digest, the in-cluster RBAC, or a real vm-operator. Everything listed
 # under "What the suite can't cover" in CONTRIBUTING.md is checked here
-# instead, plus that an idle binding really does stop writing.
+# instead, plus that an idle binding really does stop writing and that a
+# one-off AnsibleRun borrows a managed inventory host rather than taking
+# it over.
 #
 # Deliberately not a GitHub Action: it needs a Supervisor and an AWX
 # instance reachable on the same network, which a hosted runner has no
@@ -102,6 +104,13 @@ RETAIN_FIXTURE_CREATED=0
 # one-claim-per-VM rule live. It never owns a child, so it needs no host
 # cleanup of its own - just deleting the object.
 CONFLICT_BINDING=""
+# Phase 3b's one-off AnsibleRuns, and the inventory host the second one
+# creates for itself. Tracked from here so a failure part-way through
+# still takes them back out: a run left behind holds a finalizer, and a
+# host it created is one nothing else in this namespace will remove.
+BORROW_RUN=""
+OWNED_RUN=""
+OWNED_RUN_HOST_ID=""
 
 log()  { echo "[verify] $*"; }
 fail() { echo "[verify] FAILED: $*" >&2; exit 1; }
@@ -121,12 +130,26 @@ cleanup() {
     kubectl logs -n "$CTRL_NS" -l app=ansible-supervisor --tail=200 2>/dev/null || true
     echo "=== binding status ==="
     kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o yaml 2>/dev/null || true
+    if [[ -n "$BORROW_RUN$OWNED_RUN" ]]; then
+      echo "=== AnsibleRun status ==="
+      kubectl get ansiblerun -n "$SUPERVISOR_NS" -o yaml 2>/dev/null || true
+    fi
   fi
 
   # Always take our own objects back out, even on failure: this runs in a
   # real tenant namespace, and a leaked binding keeps launching jobs.
   if [[ $CREATED -eq 1 && $KEEP -eq 0 ]]; then
     log "cleaning up"
+    # Runs first: a run finalizes by talking to AWX through the same
+    # AWXConnection the binding uses, so deleting that out from under one
+    # would leave it wedged on a connection it cannot resolve.
+    [[ -n "$BORROW_RUN" ]] && kubectl delete ansiblerun "$BORROW_RUN" -n "$SUPERVISOR_NS" --timeout=120s >/dev/null 2>&1 || true
+    [[ -n "$OWNED_RUN" ]] && kubectl delete ansiblerun "$OWNED_RUN" -n "$SUPERVISOR_NS" --timeout=120s >/dev/null 2>&1 || true
+    # Only reached if the run did not delete its own host, which is a
+    # failure the phase reports - but the entry still has to go.
+    if [[ -n "$OWNED_RUN_HOST_ID" && -n "${AWX_BASE:-}" ]]; then
+      awx_delete "/hosts/${OWNED_RUN_HOST_ID}/" >/dev/null 2>&1 || true
+    fi
     kubectl delete ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" --timeout=120s >/dev/null 2>&1 || true
     # Retain means the controller deliberately leaves this host in the
     # inventory, so the harness is the only thing that will remove it.
@@ -188,6 +211,19 @@ host_variables() {  # host_variables <host id>
   awx "/hosts/$1/" | jqp "json.dumps(json.loads(d.get('variables') or '{}'))"
 }
 
+# What a job was actually launched with, read back out of AWX: status
+# says what the controller meant to send, this says what the instance
+# got. A workflow's job lives under a different collection.
+job_field() {  # job_field <job id> <python expression over `d`>
+  local path="jobs"
+  [[ "$TEMPLATE_TYPE" == "WorkflowTemplate" ]] && path="workflow_jobs"
+  awx "/${path}/$1/" | jqp "$2"
+}
+
+job_extra_var() {  # job_extra_var <job id> <name>
+  job_field "$1" "json.loads(d.get('extra_vars') or '{}').get('$2','')"
+}
+
 jqp() {  # jqp <python expression over `d`> ; reads JSON on stdin
   python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"
 }
@@ -244,10 +280,19 @@ TMPL_INFO="$(template_info "$AWX_TEMPLATE" "$TEMPLATE_TYPE")" \
   || fail "template '$AWX_TEMPLATE' not found in AWX, or the name is ambiguous"
 TMPL_ID="$(echo "$TMPL_INFO" | sed -n 1p)"
 TMPL_ASK_LIMIT="$(echo "$TMPL_INFO" | sed -n 2p)"
+TMPL_ASK_VARS="$(echo "$TMPL_INFO" | sed -n 3p)"
 TMPL_INVENTORY="$(echo "$TMPL_INFO" | sed -n 4p)"
 [[ "$TMPL_ASK_LIMIT" == "True" ]] || fail "template '$AWX_TEMPLATE' does not have Prompt on Launch enabled for Limit - the controller will refuse to launch it"
 [[ -n "$TMPL_INVENTORY" ]] || fail "template '$AWX_TEMPLATE' has no inventory, so no host is created and there is nothing to assert"
 log "template '$AWX_TEMPLATE' id=$TMPL_ID inventory=$TMPL_INVENTORY, Prompt on Launch for Limit is on"
+# Not required: a binding sends no extra vars unless it is asked to, so
+# only the AnsibleRun checks in phase 3b need this, and they narrow
+# themselves rather than failing a lab whose template does not prompt.
+if [[ "$TMPL_ASK_VARS" == "True" ]]; then
+  log "template '$AWX_TEMPLATE' also prompts for Variables: phase 3b will check extraVars and varsFrom"
+else
+  log "template '$AWX_TEMPLATE' does not prompt for Variables: phase 3b will check targeting only, not extraVars or varsFrom"
+fi
 
 # --- the onDeleted hook, if there is one to check ---------------------
 # The hook fires only for a VM that is really gone, so checking it live
@@ -326,7 +371,8 @@ if [[ -n "$EXPECT_IMAGE" ]]; then
   log "installed image matches the release under test"
 fi
 
-for crd in awxconnections.field.vmware.com ansiblebindings.field.vmware.com; do
+for crd in awxconnections.field.vmware.com ansiblebindings.field.vmware.com \
+         ansiblebindingvms.field.vmware.com ansibleruns.field.vmware.com; do
   kubectl wait --for=condition=Established --timeout=60s "crd/$crd" >/dev/null \
     || fail "CRD $crd is not Established"
 done
@@ -548,6 +594,210 @@ if [[ "$HOST_CHECK_PERIOD" -gt "$(( RESYNC * 2 ))" && "$CHECKS_BEFORE" != "$CHEC
   fail "the host check ran during the idle window: lastHostCheck $CHECKS_BEFORE -> $CHECKS_AFTER, with a ${HOST_CHECK_PERIOD}s period"
 fi
 log "child host check stayed on its ${HOST_CHECK_PERIOD}s period across the idle window (${CHILD_CHECKS} distinct timestamp(s))"
+
+# --- phase 3b: a one-off AnsibleRun against the live environment -------
+# AnsibleRun is the other half of this API and, until this phase, the
+# live gate never created one: the installed ClusterRole's ansibleruns
+# rules, the CRD as the package ships it, and varsFrom reading a real
+# vm-operator VirtualMachine through the negotiated API version were all
+# exercised only against kind and a stand-in CRD.
+#
+# It runs here, between the idle check and the delete, because both
+# shapes need the fixture VM alive and the binding still holding its
+# host: phase 4 destroys the first and phase 5 the second.
+
+log "phase 3b: a one-off AnsibleRun against $VM_NAME"
+
+BORROW_RUN="${PREFIX}-borrow"
+# The API version this supervisor actually serves, read off the live
+# object rather than pinned: varsFrom names apiVersion explicitly, and a
+# supervisor serving v1alpha5 would reject a manifest asking for v1alpha1.
+VM_APIVERSION="$(kubectl get virtualmachine "$VM_NAME" -n "$SUPERVISOR_NS" -o jsonpath='{.apiVersion}')"
+[[ -n "$VM_APIVERSION" ]] || fail "could not read the served apiVersion off VirtualMachine $VM_NAME"
+
+# The binding's host, as it stands before the run touches anything. A
+# run targeting a VM another object manages must borrow the entry, not
+# take it over, so these are what the assertions below compare against.
+HOST_NAME_BEFORE="$(child_field "$VM_NAME" awxHostName)"
+[[ -n "$HOST_NAME_BEFORE" ]] || fail "no awxHostName recorded for $VM_NAME, so there is nothing for a run to borrow"
+HOST_MOD_BEFORE="$(awx "/hosts/${HOST_ID}/" | jqp "d.get('modified','')")"
+HOST_VARS_BEFORE="$(host_variables "$HOST_ID")"
+BINDING_RV_BEFORE="$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o jsonpath='{.metadata.resourceVersion}')"
+SCAN_BEFORE="$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o jsonpath='{.status.lastOrphanScan}')"
+
+# varsFrom and extraVars both need Prompt on Launch for Variables. A lab
+# whose provisioning template does not prompt still gets the targeting
+# and ownership checks, which are the ones that need a real API server.
+RUN_VARS=""
+if [[ "$TMPL_ASK_VARS" == "True" ]]; then
+  RUN_VARS="$(printf '  extraVars:\n    asr_probe: "%s"\n  varsFrom:\n    - resource:\n        apiVersion: %s\n        kind: VirtualMachine\n        name: %s\n      vars:\n        probe_vm_ip: "{.status.network.primaryIP4}"\n        probe_vm_name: "{.metadata.name}"' \
+    "$PREFIX" "$VM_APIVERSION" "$VM_NAME")"
+fi
+
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: ${BORROW_RUN}
+  namespace: ${SUPERVISOR_NS}
+spec:
+  awxConnectionRef: ${CONN}
+  template:
+    name: "${AWX_TEMPLATE}"
+    type: ${TEMPLATE_TYPE}
+  vmRef:
+    name: ${VM_NAME}
+${RUN_VARS}
+  activeDeadlineSeconds: 1800
+EOF
+
+# Same playbook, same VM, same SSH as phase 2: minutes, not seconds.
+wait_for "the one-off run completes" 900 bash -c \
+  "[[ \$(kubectl get ansiblerun $BORROW_RUN -n $SUPERVISOR_NS -o jsonpath='{.status.state}') == Ready ]]"
+
+RUN_JOB="$(kubectl get ansiblerun "$BORROW_RUN" -n "$SUPERVISOR_NS" -o jsonpath='{.status.jobID}')"
+[[ -n "$RUN_JOB" ]] || fail "the run reached Ready without recording a jobID"
+RUN_JOB_STATUS="$(kubectl get ansiblerun "$BORROW_RUN" -n "$SUPERVISOR_NS" -o jsonpath='{.status.jobStatus}')"
+[[ "$RUN_JOB_STATUS" == "successful" ]] \
+  || fail "the run is Ready but its job finished '$RUN_JOB_STATUS' - Ready must mean the requested execution succeeded"
+log "run $BORROW_RUN completed as AWX job $RUN_JOB"
+
+# One host, and it must be the binding's. Unit tests arbitrate this
+# against a fake client; here a real AWX holds the entry and a real API
+# server holds the AnsibleBindingVM that owns it.
+RUN_HOST_JSON="$(kubectl get ansiblerun "$BORROW_RUN" -n "$SUPERVISOR_NS" -o json)"
+RUN_HOST_COUNT="$(echo "$RUN_HOST_JSON" | jqp "len(d.get('status',{}).get('hosts',[]))")"
+[[ "$RUN_HOST_COUNT" == "1" ]] || fail "expected the run to record exactly 1 host, got $RUN_HOST_COUNT"
+RUN_HOST_ID="$(echo "$RUN_HOST_JSON" | jqp "d['status']['hosts'][0].get('awxHostID','')")"
+[[ "$RUN_HOST_ID" == "$HOST_ID" ]] \
+  || fail "the run used AWX host $RUN_HOST_ID, but the binding's host for $VM_NAME is $HOST_ID - it made its own instead of borrowing"
+RUN_HOST_CREATED="$(echo "$RUN_HOST_JSON" | jqp "d['status']['hosts'][0].get('awxHostCreated', False)")"
+[[ "$RUN_HOST_CREATED" == "False" ]] \
+  || fail "the run recorded the binding's host as one it created, which would delete it on cleanup"
+
+RUN_LIMIT="$(job_field "$RUN_JOB" "d.get('limit','')")"
+[[ "$RUN_LIMIT" == "$HOST_NAME_BEFORE" ]] \
+  || fail "the run launched with limit '$RUN_LIMIT', expected the borrowed host '$HOST_NAME_BEFORE'"
+log "the run borrowed the binding's host $HOST_ID and scoped its job to $RUN_LIMIT"
+
+# Borrowed means read-only. AWX's own modified timestamp is the check
+# that survives a controller that writes back what it just read.
+HOST_MOD_AFTER="$(awx "/hosts/${HOST_ID}/" | jqp "d.get('modified','')")"
+[[ "$HOST_MOD_BEFORE" == "$HOST_MOD_AFTER" ]] \
+  || fail "the run wrote to the binding's host $HOST_ID: modified $HOST_MOD_BEFORE -> $HOST_MOD_AFTER"
+HOST_VARS_AFTER="$(host_variables "$HOST_ID")"
+[[ "$HOST_VARS_BEFORE" == "$HOST_VARS_AFTER" ]] \
+  || fail "the run changed the borrowed host's variables: $HOST_VARS_BEFORE -> $HOST_VARS_AFTER"
+log "the borrowed host is byte-for-byte what it was: no writes, no ownership takeover"
+
+if [[ "$TMPL_ASK_VARS" == "True" ]]; then
+  # The live half of varsFrom: the value is read off a real vm-operator
+  # VirtualMachine, through whichever API version this supervisor
+  # serves, with the controller's own RBAC. e2e reads a stand-in CRD.
+  PROBE_IP="$(job_extra_var "$RUN_JOB" probe_vm_ip)"
+  [[ "$PROBE_IP" == "$VM_IP" ]] \
+    || fail "varsFrom put probe_vm_ip='$PROBE_IP' in the launch, but the live VM reports '$VM_IP'"
+  PROBE_NAME="$(job_extra_var "$RUN_JOB" probe_vm_name)"
+  [[ "$PROBE_NAME" == "$VM_NAME" ]] \
+    || fail "varsFrom put probe_vm_name='$PROBE_NAME' in the launch, expected '$VM_NAME'"
+  [[ "$(job_extra_var "$RUN_JOB" asr_probe)" == "$PREFIX" ]] \
+    || fail "spec.extraVars did not reach the launch alongside varsFrom"
+  RESOLVED="$(kubectl get ansiblerun "$BORROW_RUN" -n "$SUPERVISOR_NS" -o jsonpath='{.status.resolvedVars}')"
+  log "varsFrom read the live VirtualMachine through $VM_APIVERSION: probe_vm_ip=$PROBE_IP, status.resolvedVars=$RESOLVED"
+fi
+
+# The binding must not have noticed any of this.
+BINDING_STATE="$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o jsonpath='{.status.state}')"
+[[ "$BINDING_STATE" == "Ready" ]] \
+  || fail "the binding went to '$BINDING_STATE' while a run targeted the VM it owns"
+[[ "$(child_field "$VM_NAME" phase)" == "Succeeded" ]] \
+  || fail "the binding's child for $VM_NAME left Succeeded while a run borrowed its host"
+
+kubectl delete ansiblerun "$BORROW_RUN" -n "$SUPERVISOR_NS" --timeout=120s >/dev/null \
+  || fail "the run did not delete cleanly - its finalizer never released"
+BORROW_RUN=""
+awx "/hosts/${HOST_ID}/" >/dev/null 2>&1 \
+  || fail "deleting the run took the binding's host $HOST_ID with it"
+[[ "$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o jsonpath='{.status.summary.total}/{.status.summary.succeeded}')" == "${VM_COUNT}/${VM_COUNT}" ]] \
+  || fail "the binding's rollup regressed after the run was deleted"
+log "the run released cleanly and the binding kept its host"
+
+# --- and a run that owns its host must take it away again -------------
+# The other ownership case: a host this run creates is this run's to
+# delete. Pointed at the fixture VM's address so the playbook really
+# runs, rather than at an address nothing answers on.
+
+OWNED_RUN="${PREFIX}-owned"
+OWNED_HOST_NAME="${PREFIX}-oneoff"
+
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: ${OWNED_RUN}
+  namespace: ${SUPERVISOR_NS}
+spec:
+  awxConnectionRef: ${CONN}
+  template:
+    name: "${AWX_TEMPLATE}"
+    type: ${TEMPLATE_TYPE}
+  hosts:
+    - name: ${OWNED_HOST_NAME}
+      address: ${VM_IP}
+  cleanupPolicy: Delete
+  activeDeadlineSeconds: 1800
+EOF
+
+wait_for "the host-creating run completes" 900 bash -c \
+  "[[ \$(kubectl get ansiblerun $OWNED_RUN -n $SUPERVISOR_NS -o jsonpath='{.status.state}') == Ready ]]"
+
+OWNED_JSON="$(kubectl get ansiblerun "$OWNED_RUN" -n "$SUPERVISOR_NS" -o json)"
+OWNED_RUN_HOST_ID="$(echo "$OWNED_JSON" | jqp "d['status']['hosts'][0].get('awxHostID','')")"
+[[ -n "$OWNED_RUN_HOST_ID" ]] || fail "the run recorded no AWX host id for $OWNED_HOST_NAME"
+[[ "$(echo "$OWNED_JSON" | jqp "d['status']['hosts'][0].get('awxHostCreated', False)")" == "True" ]] \
+  || fail "the run did not record $OWNED_HOST_NAME as a host it created, so cleanup would leave it behind"
+[[ "$OWNED_RUN_HOST_ID" != "$HOST_ID" ]] \
+  || fail "the run reused the binding's host instead of creating $OWNED_HOST_NAME"
+
+# Read it back out of AWX: an inline host is a literal name, and the
+# address given is what ansible_host has to hold.
+OWNED_HOST_JSON="$(awx "/hosts/${OWNED_RUN_HOST_ID}/")" || fail "AWX has no host $OWNED_RUN_HOST_ID, but the run's status says it created one"
+[[ "$(echo "$OWNED_HOST_JSON" | jqp "d.get('name','')")" == "$OWNED_HOST_NAME" ]] \
+  || fail "the created host is named '$(echo "$OWNED_HOST_JSON" | jqp "d.get('name','')")', expected the literal '$OWNED_HOST_NAME'"
+[[ "$(echo "$OWNED_HOST_JSON" | jqp "json.loads(d.get('variables') or '{}').get('ansible_host','')")" == "$VM_IP" ]] \
+  || fail "the created host's ansible_host is not the address the run gave it"
+OWNED_JOB="$(echo "$OWNED_JSON" | jqp "d['status'].get('jobID','')")"
+[[ "$(job_field "$OWNED_JOB" "d.get('limit','')")" == "$OWNED_HOST_NAME" ]] \
+  || fail "the run did not scope its job to the host it created"
+[[ "$(echo "$OWNED_JSON" | jqp "d['status'].get('jobStatus','')")" == "successful" ]] \
+  || fail "the run against its own host is Ready but its job did not finish successfully"
+log "the run created host $OWNED_RUN_HOST_ID ($OWNED_HOST_NAME) at $VM_IP and ran against it"
+
+kubectl delete ansiblerun "$OWNED_RUN" -n "$SUPERVISOR_NS" --timeout=120s >/dev/null \
+  || fail "the host-creating run did not delete cleanly"
+OWNED_RUN=""
+if awx "/hosts/${OWNED_RUN_HOST_ID}/" >/dev/null 2>&1; then
+  fail "AWX host $OWNED_RUN_HOST_ID was created by the run but survived its deletion"
+fi
+OWNED_RUN_HOST_ID=""
+log "the created host went with the run that owned it"
+
+# The binding must still be quiet after all of that: two runs came and
+# went against the VM it manages, and neither is any of its business.
+# The one write allowed here is the orphan scan's own timestamp, which
+# falls due on a 4x host-check period this phase can outlast - it is a
+# scheduled scan finding nothing, not the binding reacting to the runs.
+BINDING_RV_AFTER="$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o jsonpath='{.metadata.resourceVersion}')"
+if [[ "$BINDING_RV_AFTER" == "$BINDING_RV_BEFORE" ]]; then
+  log "the binding never wrote once across both runs"
+else
+  SCAN_AFTER="$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o jsonpath='{.status.lastOrphanScan}')"
+  [[ -n "$SCAN_AFTER" && "$SCAN_AFTER" != "$SCAN_BEFORE" ]] \
+    || fail "the binding was written to while runs came and went against its VM: resourceVersion $BINDING_RV_BEFORE -> $BINDING_RV_AFTER, with lastOrphanScan unchanged"
+  [[ "$(kubectl get ansiblebinding "$BINDING" -n "$SUPERVISOR_NS" -o jsonpath='{.status.summary.total}/{.status.summary.succeeded}')" == "${VM_COUNT}/${VM_COUNT}" ]] \
+    || fail "the binding's rollup changed while runs ran against its VM"
+  log "the binding's only write across both runs was its due orphan scan ($SCAN_BEFORE -> $SCAN_AFTER)"
+fi
 
 # --- phase 4: deleting a VM runs its onDeleted hook -------------------
 # The one path e2e.sh can only fake. Here the VirtualMachine is really

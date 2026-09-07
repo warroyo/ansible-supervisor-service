@@ -1,0 +1,22 @@
+# The standing half: an AnsibleBinding configures every VM matching the
+# selector, and owns the AWX inventory host it creates for each one.
+#
+# The smoke test in ansiblerun.yml runs against that same host on every sync
+# without touching it. This file is here so the example is runnable on its
+# own; in a real repo the binding usually lives with the VM it configures.
+apiVersion: field.vmware.com/v1
+kind: AnsibleBinding
+metadata:
+  name: webservers
+  namespace: my-namespace
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  vmSelector:
+    app: web
+  awxConnectionRef: awx
+  template:
+    name: "Configure Webserver"
+    type: JobTemplate
+  hostVariables:
+    tier: gold

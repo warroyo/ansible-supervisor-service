@@ -32,8 +32,8 @@ func main() {
 	resync := flag.Int("resync-period", 60, "reconcile resync interval, in seconds")
 	reconcileTimeoutFlag := flag.Int("reconcile-timeout", 300, "maximum time one reconcile of one resource may take, in seconds, so a slow AWX cannot pin a worker indefinitely")
 	supervisorIDFlag := flag.String("supervisor-id", "", "identity stamped on AWX inventory hosts this supervisor owns, so one AWX instance can be shared by several supervisors (default: the kube-system namespace UID)")
-	varsFromGroupsFlag := flag.String("vars-from-api-groups", coreGroupAlias+","+vmGroup,
-		"comma-separated API groups an AnsibleRun's spec.varsFrom may read, with \""+coreGroupAlias+"\" for the core group. Must match the RBAC this controller is granted")
+	varsFromResourcesFlag := flag.String("vars-from-resources", defaultVarsFromResources,
+		"the exact kinds spec.varsFrom may read, comma separated, each \"<group>/<resource>\" with \"core\" meaning the core group. Never a wildcard, and it must match what the ClusterRole grants - a kind outside it is refused with an explanation instead of coming back Forbidden")
 	hostCheckFlag := flag.Int("host-check-period", 600, "how often, in seconds, each VM's AWX inventory host is reconciled against AWX itself - the worst case for repairing a host deleted or edited by hand in the AWX UI, and what sets the steady-state AWX request rate")
 	logLevelFlag := flag.String("log-level", "info", "info logs launches, terminal outcomes and errors; debug adds a line per reconcile pass, which at teardown scale is a great many")
 	apiQPSFlag := flag.Float64("api-qps", 50, "sustained requests per second this controller makes to the Kubernetes API server")
@@ -139,8 +139,8 @@ func main() {
 	// so a CRD installed after this process started resolves on a reset
 	// rather than never.
 	varsFromRESTMapper = restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
-	allowedVarsFromGroups = parseVarsFromGroups(*varsFromGroupsFlag)
-	fmt.Printf("varsFrom api groups: %s\n", strings.Join(groupLabelList(), ", "))
+	allowedVarsFromResources = parseVarsFromResources(*varsFromResourcesFlag)
+	fmt.Printf("varsFrom resources: %s\n", strings.Join(varsFromResourceList(), ", "))
 	// Before any worker runs and before a single AWX request goes out:
 	// this version's claim scheme cannot coexist with children from the
 	// previous one, and the check is worth nothing once reconciles have

@@ -82,11 +82,13 @@ AWX host names are unique per inventory, and AWX Hosts have no labels or tags - 
 
 The controller records ownership in the AWX host's **description** field: `ansible-supervisor:<supervisor_id>:<namespace>/<name>`. Description is the only free-text field on an AWX Host, and unlike host variables it never leaks into playbooks. Because that marker lives in AWX rather than only in CR status, it survives a binding being deleted and recreated. On a name collision the controller then:
 
-| Existing host | Behavior |
+| Existing host | Behavior for an `AnsibleBinding` |
 |---|---|
 | Marked as **this** binding's | Updated and owned - including a host left behind by an earlier incarnation of the same binding (so `cleanupPolicy: Retain` → delete → recreate reclaims it rather than orphaning it forever) |
 | Marked by **another** supervisor or binding | **Refused.** Nothing is written, no job is launched, and the `AnsibleBinding` goes `Failed` naming the other owner |
 | **Unmarked** (created by hand in AWX) | Adopted: variables merged, description left alone, never deleted |
+
+An `AnsibleRun` reads the same markers but answers differently, because it is one execution rather than standing state: it **executes against** any host it can resolve - a binding's, another run's, an unmarked one - and writes to none of them. Only a host it creates itself is written to, owned, and deleted with the run. Values that would otherwise have gone onto the host go in `spec.extraVars`/`spec.varsFrom` instead, where AWX applies them to that job alone. A run asking to write onto a host it does not own is refused before it launches.
 
 Set `supervisor_id` at install time to something readable (e.g. `sup-lab-01`); left empty it's derived from the `kube-system` namespace UID, which works but makes the inventory hard to read.
 
@@ -197,7 +199,7 @@ So this is a real regression from VM Apps rather than a thing we chose not to bu
 
 ## Why does varsFrom refuse to read a Secret?
 
-Because `extra_vars` are not a private channel. AWX echoes them in job output and keeps them in the job's stored launch parameters, so anything read this way is visible to everyone who can see that job - long after the run. Sourcing a password through it would be a credential leak with extra steps, so the refusal is unconditional: it applies even when the core API group is in `vars_from_api_groups` and the controller could technically read the Secret.
+Because `extra_vars` are not a private channel. AWX echoes them in job output and keeps them in the job's stored launch parameters, so anything read this way is visible to everyone who can see that job - long after the run. Sourcing a password through it would be a credential leak with extra steps, so the refusal is unconditional: it applies even when `vars_from_resources` grants `core/secrets` and the controller could technically read it.
 
 The mechanism for credentials is an AWX Credential attached to the template, exactly as the Machine credential that logs into VMs already is. A custom credential type injecting environment variables covers the API-token case:
 
@@ -222,6 +224,16 @@ There is a window in both: the controller sends a launch to AWX and dies before 
 
 An `AnsibleBinding` relaunches. Its playbooks are convergent configuration - running one twice is how the resource works in the first place, and leaving a VM unconfigured is the worse outcome.
 
-An `AnsibleRun` refuses to. It exists for things that are *not* convergent: opening a ticket, decommissioning a host, sending a notification. Doing one of those twice can be worse than not doing it, and unlike a binding there is no later reconcile that would put things right. So the run records `status.launchAttemptedAt` before sending the launch, and finding that set with no `jobID` fails the run with a message pointing at AWX's recent jobs for that template. If it did not run, create another `AnsibleRun`.
+An `AnsibleRun` does not. It exists for things that are *not* convergent: opening a ticket, decommissioning a host, sending a notification. Doing one of those twice can be worse than not doing it, and unlike a binding there is no later reconcile that would put things right.
+
+So it goes and looks, the way the Kubernetes Job controller finds pods it may have lost. The run writes `status.launchAttemptedAt` before sending the launch, and a later pass that finds it set with no `jobID` reads the template's own recent jobs in AWX, considers those created at or after that timestamp, and matches on the `--limit` they ran with:
+
+- **one match** - that is this run's job. It is adopted: its ID, URL and status are recorded and the run polls it from there as if the answer had never been lost.
+- **more than one match** - the run will not guess. It fails, naming the candidate job IDs so a human can decide.
+- **no match, and the launch was over a minute ago** - the run fails too, saying when the launch was sent and which template to check.
+
+That last one is the case worth being clear about. Recognising a job proves one exists; failing to recognise one proves nothing. The job list is a single page, AWX history can be trimmed, jobs can be hidden by permissions, and a job created by an AWX whose clock is behind looks older than the launch that made it. Every one of those reads as "nothing ran", and a run that launched again on the strength of it would be the second decommission this whole mechanism exists to prevent. So the run ends where a human can see it, with the timestamp to search on.
+
+There is one case where nothing has to be guessed at all: if AWX answered the launch with a 4xx it refused the request and made nothing, so the run simply launches again. Only an answer that never arrived, or a 5xx, is ambiguous.
 
 This is also why `AnsibleRun` never launches twice for any other reason: its spec is immutable, and the re-run annotation an `AnsibleBinding` responds to is ignored.

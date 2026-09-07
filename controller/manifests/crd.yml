@@ -573,6 +573,14 @@ spec:
       schema:
         openAPIV3Schema:
           type: object
+          # spec is required so its immutability rule is always evaluated.
+          # A transition rule on an optional field is skipped when that
+          # field is added or removed, so an optional spec could be
+          # dropped in one update and reintroduced with different
+          # contents in the next - launching a second execution from a
+          # resource whose spec is documented as immutable.
+          required:
+            - spec
           properties:
             spec:
               type: object
@@ -727,7 +735,14 @@ spec:
                 launchAttemptedAt:
                   type: string
                   format: date-time
-                  description: written before the launch request goes out. set with no jobID means the controller died between the request and recording its result, so the run is failed rather than launched a second time
+                  description: written before the launch request goes out. set with no jobID means the launch's outcome was never recorded, and the controller looks the job up in AWX and adopts it rather than launching a second one
+                cancelRequestedAt:
+                  type: string
+                  format: date-time
+                  description: when AWX accepted a request to cancel this run's job. AWX answers a cancel with 202 Accepted, so this records that cancellation was asked for, not that the job has stopped - finalization waits for a terminal jobStatus before deleting the hosts that job may still be running against
+                awxEndpoint:
+                  type: string
+                  description: fingerprint of the AWX instance every id in this status was issued by. an id means nothing on another instance, so a connection repointed elsewhere stops the run rather than polling, canceling or deleting whatever holds those ids there
                 failureReason:
                   type: string
                   description: why a terminal failure happened, kept here because status.message is rewritten from scratch on every pass
@@ -753,8 +768,6 @@ spec:
                       awxHostCreated:
                         type: boolean
                         description: whether this run created the host. hosts that already existed are adopted and never deleted
-                      pendingCleanup:
-                        type: boolean
       subresources:
         status: {}
       additionalPrinterColumns:

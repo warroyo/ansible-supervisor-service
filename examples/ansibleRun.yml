@@ -79,9 +79,13 @@ spec:
 #    hostNamePrefix is deliberately NOT applied, because these commonly name
 #    hosts that already exist in the AWX inventory.
 #
-#    A host that already exists is adopted, not hijacked: its variables are
-#    merged into rather than overwritten, and it is never deleted at cleanup.
-#    Only hosts this run created are.
+#    A host that already exists is borrowed, not claimed: the run resolves it,
+#    scopes the job to it, and changes nothing about the inventory entry - so
+#    address and variables may only be given for a host this run creates.
+#    Supplying them for one that already exists is refused before anything
+#    launches; put per-run values in extraVars instead, which AWX applies to
+#    the job and Ansible ranks above inventory variables. Cleanup deletes only
+#    the hosts this run created.
 #
 #    The template needs Prompt on Launch for Limit, since the run is scoped.
 apiVersion: field.vmware.com/v1
@@ -104,13 +108,18 @@ spec:
   extraVars:
     package_name: openssl
     service_name: postgresql
-  cleanupPolicy: Delete           # deletes db-prod-02, never the adopted db-prod-01
+  cleanupPolicy: Delete           # deletes db-prod-02, never the borrowed db-prod-01
   activeDeadlineSeconds: 1800
   ttlSecondsAfterFinished: 86400  # keep a day, as a change record
 
 ---
-# 4. One Supervisor VM. An inventory host is built from the VM's reported IP
-#    and the run is scoped to it - the AnsibleBinding experience, once.
+# 4. One Supervisor VM. The run targets that VM's inventory host and scopes
+#    the job to it - the AnsibleBinding experience, once.
+#
+#    If an AnsibleBinding already manages this VM, its host is used exactly as
+#    it stands: same host id, no writes, and the binding keeps it when the run
+#    is deleted. Only if no host is there yet does the run create one, from the
+#    VM's reported IP, and own it.
 #
 #    Typically created by a day-2 action that then deletes the VM: run the
 #    decommission playbook while the guest is still up, then destroy. There is
@@ -129,6 +138,7 @@ spec:
   vmRef:
     name: sample-vm               # a VirtualMachine in this namespace
   hostName: ""                    # optional override for the derived host name
-  hostVariables: {}               # optional, e.g. reach it at a FQDN instead
+  hostVariables: {}               # only applied to a host this run creates;
+                                  # refused on one that already exists
   activeDeadlineSeconds: 900
   ttlSecondsAfterFinished: 3600

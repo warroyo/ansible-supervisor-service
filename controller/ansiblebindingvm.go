@@ -248,7 +248,7 @@ func applyAnsibleBindingVM(ctx context.Context, client *dynamic.DynamicClient, o
 	// this is where the launch actually happens: a template edited in
 	// AWX between the parent's pass and this one must not quietly widen
 	// the run to the whole inventory.
-	if err := checkTemplateLaunchFields(tmpl, child.Spec.Template.Name, targetsHost, len(child.Spec.ExtraVars) > 0); err != nil {
+	if err := checkTemplateAcceptsLaunchFields(tmpl, child.Spec.Template.Name, targetsHost, len(child.Spec.ExtraVars) > 0, useDefaultLimitRemedy); err != nil {
 		recordErr(err)
 		return finish()
 	}
@@ -539,21 +539,11 @@ func resolveTemplate(ctx context.Context, awxClient *AWXClient, ref TemplateRef)
 	return tmpl, nil
 }
 
-// checkTemplateLaunchFields refuses a launch AWX would silently narrow
-// or widen. A dropped limit means the template runs against its ENTIRE
-// inventory rather than the targeted VM.
-func checkTemplateLaunchFields(tmpl *AWXTemplate, name string, targetsHost, hasExtraVars bool) error {
-	if targetsHost && !tmpl.AskLimitOnLaunch {
-		return fmt.Errorf("template %q does not accept a limit at launch time (ask_limit_on_launch is false), "+
-			"so AWX would ignore the per-VM limit and run against the whole inventory: enable Prompt on Launch for Limit in AWX, "+
-			"or set spec.useDefaultLimit: true to accept the template's own scope", name)
-	}
-	if hasExtraVars && !tmpl.AskVariablesOnLaunch {
-		return fmt.Errorf("template %q does not accept extra variables at launch time (ask_variables_on_launch is false), "+
-			"so AWX would ignore spec.extraVars: enable Prompt on Launch for Variables in AWX, or remove spec.extraVars", name)
-	}
-	return nil
-}
+// useDefaultLimitRemedy is how a binding's VM stops targeting a host, and
+// so the way out this kind offers when its template will not take a
+// limit. Every kind that launches names its own; the check itself is
+// shared.
+const useDefaultLimitRemedy = "set spec.useDefaultLimit: true to accept the template's own scope"
 
 // priorVMState is the status this pass builds on.
 func priorVMState(child *AnsibleBindingVM) AnsibleBindingVMStatus {

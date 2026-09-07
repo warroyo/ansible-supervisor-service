@@ -8,6 +8,173 @@ builds anything.
 Versions follow [semver](https://semver.org). Unreleased work collects
 under the top heading and is renamed to the version when the tag is cut.
 
+## [1.3.0] - 2026-09-07
+
+### Changed
+- **An `AnsibleRun` no longer takes over the AWX inventory host it targets.**
+  A host that already exists - made by hand, by an `AnsibleBindingVM`, or
+  by an earlier run - is resolved and executed against, and nothing about
+  the inventory entry is written: not its variables, not its address, not
+  its ownership marker. Only a host the run itself creates is written to,
+  and only that one is deleted with the run.
+
+  This is what a one-off run against a managed VM needed. Previously a run
+  with `spec.vmRef` pointed at a VM an `AnsibleBinding` manages was refused
+  outright - `already owned by another ansible-supervisor binding` - which
+  made the ordinary case of "smoke-test this machine" impossible.
+
+  It is a behaviour change for `spec.hosts[].address`,
+  `spec.hosts[].variables` and `spec.hostVariables`: earlier versions
+  merged those into an existing host's variable document and left them
+  there. They are now **refused before anything launches** when the host
+  already exists, rather than silently applied or silently dropped. Put
+  per-execution values in `spec.extraVars`/`spec.varsFrom` instead - AWX
+  passes those as the job's `extra_vars`, which Ansible ranks above
+  inventory variables, so they apply to that job and leave the inventory
+  alone. Variables earlier versions merged into a host are not removed:
+  the controller cannot tell what they were before or who wants them now.
+
+### Added
+- Runnable Argo CD examples under
+  [`examples/argocd/`](examples/argocd/): the platform-side health checks,
+  a tracked once-only run, a `PostSync` smoke test against a binding's
+  host, and externally sequenced teardown. Each directory stands alone,
+  with its prerequisites and expected outcomes.
+- **`AnsibleRun`**: a single execution - one AWX job, launched once,
+  terminal forever. Where an `AnsibleBinding` is standing desired state
+  that re-runs, a run is what an orchestrator creates when something has
+  already happened: register this VM in DNS, patch these two servers
+  tonight, open this ticket. Its spec is immutable, and neither a spec
+  edit nor the re-run annotation starts a second job - re-running means
+  creating another CR.
+  - It targets one `VirtualMachine` (`spec.vmRef`), an explicit list of
+    inventory hosts (`spec.hosts`), or nothing at all, which accepts the
+    template's own scope - the shape a `hosts: localhost` playbook
+    calling an external API needs. Names under `spec.hosts` are literals
+    and never carry the connection's `hostNamePrefix`; a name derived
+    from a VM does.
+  - `spec.varsFrom` reads fields off live objects in the run's own
+    namespace into `extra_vars` by JSONPath, so a DNS or CMDB playbook
+    gets a VM's name and address as variables without an inventory host.
+    Secrets are refused outright - `extra_vars` are visible in AWX job
+    output - and the readable kinds are an operator-set allowlist
+    (`vars_from_resources`), never a wildcard.
+  - `spec.activeDeadlineSeconds` bounds the whole run, and
+    `spec.ttlSecondsAfterFinished` collects the CR once it finishes,
+    taking the AWX inventory hosts it created with it. Hosts that
+    already existed are adopted, never deleted.
+  - A run and a binding sharing a name in one namespace no longer
+    collide over an AWX host: the run's ownership marker carries its
+    kind.
+  - `spec` is required. A CEL transition rule is not evaluated when the
+    field it guards is added or removed, so an optional `spec` could be
+    dropped in one update and reintroduced with different contents in
+    the next - a second execution from a resource documented as
+    immutable.
+- The pre-release live gate (`make verify-supervisor`) now covers
+  `AnsibleRun`, which it had never created: the `ansibleruns` CRD and its
+  `ClusterRole` rules ship in the package and were exercised only against
+  kind until now. Its new phase runs one against the live fixture VM and
+  checks that the binding's inventory host is borrowed unchanged - same
+  id, `modified` timestamp included - that `varsFrom` reads
+  `status.network.primaryIP4` off a real `VirtualMachine` through the API
+  version the Supervisor serves, and that a host the run creates for
+  itself is the only one deleted with it.
+
+### Fixed
+- **The service now installs on a Supervisor again, and its `ClusterRole`
+  no longer wildcards anything.** `varsFrom`'s RBAC asked for
+  `resources: ["*"]` in every allowed API group, and a Supervisor's own
+  `appplatform-clusterrole-policy` admission policy refuses a service
+  `ClusterRole` that wildcards the core group. The install did not
+  degrade - it failed with `ReconcileFailed`, leaving the previous
+  version's Deployment running with no `PackageInstall` behind it.
+
+  `vars_from_api_groups` is replaced by **`vars_from_resources`**, which
+  names the exact kinds `varsFrom` may read as `<group>/<resource>`
+  (default `["core/configmaps", "vmoperator.vmware.com/virtualmachines"]`),
+  and the `ClusterRole` grants precisely those. No group is granted by
+  wildcard now, core or otherwise: the controller reads with its own
+  identity rather than the requesting user's, so a wildcard made every
+  kind in an allowed group readable by anyone who could create an
+  `AnsibleRun`. The same list is passed to the controller, so a kind
+  outside it is refused with what to widen instead of coming back
+  `Forbidden`.
+
+  This is a package-value rename. Anyone who set `vars_from_api_groups`
+  should set `vars_from_resources` instead, spelling out the resources
+  they meant - a group alone is no longer a valid entry.
+- An `AnsibleRun` whose launch answer was lost - the controller died
+  between the request and recording the job id, or the reply never
+  arrived - no longer risks a second job. It reads the template's recent
+  jobs in AWX and adopts the one it started; only AWX refusing the
+  launch outright with a 4xx, which creates nothing, lets the run send
+  it again. Failing to find a job does **not**: a single page of job
+  history, a restricted view or a disagreeing clock all look like
+  "nothing ran", so a run that cannot account for its launch ends
+  `Failed` with the attempt's timestamp to search AWX on, rather than
+  running a decommission twice. More than one candidate fails the run
+  rather than guessing. A job AWX created *before* the attempt was
+  recorded is no longer adopted at all - it cannot be this run's, and
+  adopting it would report another run's outcome here and cancel that
+  job when this run is deleted.
+- A stale read can no longer authorize a second AWX job. Each pass over
+  a run now works from the record as the API server holds it rather than
+  the informer's copy, which can be behind by exactly the write that
+  recorded the launch, and the write that claims the launch carries the
+  resourceVersion that pass read - so anything that landed in between is
+  a conflict to re-decide, not something to overwrite. A run deleted and
+  recreated under the same name is recognised as a different object.
+- Deleting an `AnsibleRun` now waits for AWX to confirm its job actually
+  stopped before removing the inventory hosts that job may still be
+  running against. AWX answers a cancel with `202 Accepted` - it has taken
+  the request, not stopped the playbook - so `status.cancelRequestedAt`
+  records the request and the finalizer polls until the job reaches a
+  terminal status, bounded so a job AWX never stops cannot wedge the
+  object. A cancel that *fails* now holds the hosts as well as the
+  finalizer, instead of carrying on to delete them.
+- Finalization no longer decides there is nothing to clean up from a
+  cached copy of the run. It re-reads the record first, so a run whose job
+  id or last host had not reached the informer yet is cleaned up rather
+  than released with its playbook still running. If the launch answer was
+  never recorded, it takes one last look for the job it may have started
+  and cancels that too.
+- Cleanup checks an inventory host is still this run's before deleting it.
+  The recorded id says the run created it; AWX says what holds that id
+  now, and a host rebuilt by hand or claimed by another owner is left
+  alone.
+- `ttlSecondsAfterFinished` deletes with a UID precondition, so a run
+  collected on its TTL cannot delete a replacement of the same name that
+  has not run yet.
+- `status.hosts` no longer grows an entry per retry. A run whose second
+  inventory host failed re-recorded the first on every pass, which made
+  cleanup delete the same host twice and left the recovery limit reading
+  `db-1,db-1` - matching no job AWX had ever run.
+- A run whose `AWXConnection` is repointed at a different AWX instance
+  now ends with an explanation instead of acting on ids that instance
+  never issued: its cleanup could delete an unrelated host holding the
+  same id, and its polling would follow the wrong job. `status`
+  records which instance the ids came from, as an `AnsibleBindingVM`
+  already did.
+- `spec.activeDeadlineSeconds` expiring now cancels the AWX job, the way
+  a Kubernetes Job terminates its pods on the same event. A run that
+  only relabelled itself `Failed` was reporting an end state while its
+  playbook kept changing machines. If AWX cannot be reached to cancel,
+  the run still finishes and `status.failureReason` says the job may
+  still be running.
+- Deleting an `AnsibleRun` now cancels a job still in flight before
+  removing its inventory hosts. `cleanupPolicy: Retain` keeps the hosts,
+  as it always did, but does not leave the job running.
+- A template lookup that fails because AWX is unreachable or answering
+  5xx is retried instead of failing the run for good. Only a template
+  that is genuinely absent or ambiguous is terminal.
+- A `varsFrom` path whose field is not populated yet - a
+  `VirtualMachine` whose guest has not reported an IP, most often - is
+  retried rather than failing the run permanently, like the referenced
+  object itself being absent. `spec.activeDeadlineSeconds` is what
+  bounds the wait. A path that resolves to something of the wrong shape
+  stays terminal.
+
 ## [1.2.0] - 2026-09-06
 
 ### Added
@@ -213,7 +380,8 @@ Initial release.
 - Carvel package installed as a Supervisor service, with the controller
   image pinned by digest so an install needs no registry re-resolution.
 
-[Unreleased]: https://github.com/warroyo/ansible-supervisor-service/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/warroyo/ansible-supervisor-service/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/warroyo/ansible-supervisor-service/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/warroyo/ansible-supervisor-service/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/warroyo/ansible-supervisor-service/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/warroyo/ansible-supervisor-service/compare/v1.0.0...v1.0.1

@@ -537,6 +537,43 @@ func upsertInventoryHost(ctx context.Context, client *AWXClient, inventoryID int
 	return client.UpsertHost(ctx, inventoryID, hostName, ownerMarker, vars)
 }
 
+// resolveRunHost finds the inventory host a run targets, creating one
+// only when there is nothing there to target.
+//
+// A run is a visitor. The host it points at usually belongs to somebody
+// else - an AnsibleBindingVM that provisioned the VM, or an inventory
+// somebody maintains by hand - and running a playbook against a machine
+// is not the same as owning the record that describes it. So an existing
+// host is resolved and used, never written to and never claimed: its
+// variables, groups, address and ownership marker come out of the run
+// exactly as they went in, and cleanup will not touch it.
+//
+// That leaves nowhere to put per-run values, which is the point. They go
+// in the job's extra_vars, where Ansible gives them precedence over
+// inventory variables for that execution and that execution only. Asking
+// for host writes on a host this run does not own is refused rather than
+// ignored, because silently dropping them would run the playbook with
+// values the spec asked for and AWX never saw.
+//
+// A host this run created on an earlier pass is its own: a retry has to
+// be able to finish what a half-completed pass started.
+func resolveRunHost(ctx context.Context, client *AWXClient, inventoryID int, t runTarget, ownerMarker string) (id int, owned bool, err error) {
+	existing, err := client.FindHost(ctx, inventoryID, t.Name)
+	if err != nil {
+		return 0, false, err
+	}
+	if existing == nil || strings.TrimSpace(existing.Description) == ownerMarker {
+		return upsertInventoryHost(ctx, client, inventoryID, t.Name, ownerMarker, t.Address, t.Overrides)
+	}
+	if t.requestsHostWrites() {
+		return 0, false, terminalf("inventory host %q already exists and is not this run's to change, so the address "+
+			"and host variables this run asked for cannot be written onto it. Pass execution-specific values through "+
+			"spec.extraVars or spec.varsFrom - AWX applies those to the job, which overrides inventory variables for "+
+			"that job alone - or target a host name that does not already exist", t.Name)
+	}
+	return existing.ID, false, nil
+}
+
 func pollJobStatus(ctx context.Context, client *AWXClient, templateType string, jobID int64) (string, error) {
 	if templateType == TemplateTypeWorkflow {
 		return client.GetWorkflowJobStatus(ctx, int(jobID))

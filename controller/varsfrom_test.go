@@ -91,11 +91,22 @@ func newVarsFromClient(objs ...*unstructured.Unstructured) *dynamicfake.FakeDyna
 	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, runtimeObjs...)
 }
 
-func withGroups(t *testing.T, groups ...string) {
+// withVarsFrom sets the allowlist for one test, in the same
+// "<group>/<resource>" form the vars_from_resources package value and the
+// ClusterRole use. Nothing is ever granted by wildcard, so a test that
+// reads a kind has to name it.
+func withVarsFrom(t *testing.T, entries ...string) {
 	t.Helper()
-	previous := allowedVarsFromGroups
-	allowedVarsFromGroups = groups
-	t.Cleanup(func() { allowedVarsFromGroups = previous })
+	previous := allowedVarsFromResources
+	allowedVarsFromResources = parseVarsFromResources(strings.Join(entries, ","))
+	t.Cleanup(func() { allowedVarsFromResources = previous })
+}
+
+// withDefaultVarsFrom grants what a deployed controller is granted out of
+// the box.
+func withDefaultVarsFrom(t *testing.T) {
+	t.Helper()
+	withVarsFrom(t, defaultVarsFromResources)
 }
 
 func source(apiVersion, kind, name string, vars map[string]string) VarsFromSource {
@@ -103,7 +114,7 @@ func source(apiVersion, kind, name string, vars map[string]string) VarsFromSourc
 }
 
 func TestResolveVarsFromReadsFieldsOffALiveObject(t *testing.T) {
-	withGroups(t, "", "vmoperator.vmware.com")
+	withDefaultVarsFrom(t)
 
 	vm := obj("vmoperator.vmware.com/v1alpha5", "VirtualMachine", "web-1", map[string]interface{}{
 		"status": map[string]interface{}{
@@ -133,7 +144,7 @@ func TestResolveVarsFromRefusesSecrets(t *testing.T) {
 	// extra_vars are echoed in AWX job output and kept in the job's stored
 	// launch parameters, so this must be refused even though the core
 	// group is allowed and the controller can technically read the Secret.
-	withGroups(t, "")
+	withDefaultVarsFrom(t)
 
 	client := newVarsFromClient(obj("v1", "Secret", "creds", map[string]interface{}{
 		"data": map[string]interface{}{"password": "aHVudGVyMg=="},
@@ -153,7 +164,7 @@ func TestResolveVarsFromRefusesSecrets(t *testing.T) {
 }
 
 func TestResolveVarsFromEnforcesTheGroupAllowlist(t *testing.T) {
-	withGroups(t, "")
+	withVarsFrom(t, "core/configmaps")
 
 	client := newVarsFromClient(obj("vmoperator.vmware.com/v1alpha5", "VirtualMachine", "web-1", nil))
 
@@ -163,7 +174,7 @@ func TestResolveVarsFromEnforcesTheGroupAllowlist(t *testing.T) {
 	if err == nil || !isTerminalError(err) {
 		t.Fatalf("a group outside the allowlist must be refused terminally, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "vars_from_api_groups") {
+	if !strings.Contains(err.Error(), "vars_from_resources") {
 		t.Errorf("error should name the value that widens it, got: %v", err)
 	}
 }
@@ -171,7 +182,7 @@ func TestResolveVarsFromEnforcesTheGroupAllowlist(t *testing.T) {
 func TestResolveVarsFromRefusesClusterScopedKinds(t *testing.T) {
 	// varsFrom is namespace-pinned so a tenant cannot read a neighbour's
 	// data; a cluster-scoped kind has no namespace to pin it to.
-	withGroups(t, "")
+	withDefaultVarsFrom(t)
 
 	client := newVarsFromClient()
 	mapper := testMapper{clusterScoped: map[string]bool{"Node": true}}
@@ -187,7 +198,7 @@ func TestResolveVarsFromMissingObjectIsRetryable(t *testing.T) {
 	// An orchestrator may create the run before the object it names has
 	// settled. Failing here would make ordering a race;
 	// activeDeadlineSeconds is what bounds the wait instead.
-	withGroups(t, "")
+	withDefaultVarsFrom(t)
 
 	client := newVarsFromClient()
 
@@ -201,8 +212,45 @@ func TestResolveVarsFromMissingObjectIsRetryable(t *testing.T) {
 	}
 }
 
+func TestResolveVarsFromWaitsForAFieldThatIsNotPopulatedYet(t *testing.T) {
+	// The commonest shape of this: a run created alongside the VM it is
+	// about, reading the address the guest has not reported yet. The
+	// object is there, so nothing retries the read; failing the path
+	// made the run permanently unrunnable seconds before the value
+	// appeared. spec.activeDeadlineSeconds is what bounds the wait.
+	withVarsFrom(t, "vmoperator.vmware.com/virtualmachines")
+
+	booting := obj("vmoperator.vmware.com/v1alpha5", "VirtualMachine", "web-1", map[string]interface{}{
+		"status": map[string]interface{}{"powerState": "PoweredOn"},
+	})
+
+	for _, path := range []string{"{.status.network.primaryIP4}", "{.status.network}"} {
+		_, _, err := resolveVarsFrom(context.Background(), newVarsFromClient(booting), testMapper{}, "ns",
+			[]VarsFromSource{source("vmoperator.vmware.com/v1alpha5", "VirtualMachine", "web-1",
+				map[string]string{"ip": path})}, nil)
+		if err == nil {
+			t.Fatalf("%s: a field that is not there yet is still an error to retry", path)
+		}
+		if isTerminalError(err) {
+			t.Errorf("%s: a field its own controller has yet to fill in must stay retryable, got: %v", path, err)
+		}
+	}
+
+	// A path that resolved to something of the wrong shape is a settled
+	// fact about an immutable spec, and stays terminal.
+	shaped := obj("vmoperator.vmware.com/v1alpha5", "VirtualMachine", "web-2", map[string]interface{}{
+		"status": map[string]interface{}{"volumes": []interface{}{map[string]interface{}{"name": "disk"}}},
+	})
+	_, _, err := resolveVarsFrom(context.Background(), newVarsFromClient(shaped), testMapper{}, "ns",
+		[]VarsFromSource{source("vmoperator.vmware.com/v1alpha5", "VirtualMachine", "web-2",
+			map[string]string{"vols": "{.status.volumes}"})}, nil)
+	if err == nil || !isTerminalError(err) {
+		t.Fatalf("a path resolving to a list is a spec error, not something to wait out, got: %v", err)
+	}
+}
+
 func TestResolveVarsFromRejectsCollisions(t *testing.T) {
-	withGroups(t, "")
+	withDefaultVarsFrom(t)
 
 	cm := obj("v1", "ConfigMap", "cfg", map[string]interface{}{
 		"data": map[string]interface{}{"zone": "corp.example.com"},
@@ -285,17 +333,78 @@ func TestEvalJSONPathRejectsNonScalars(t *testing.T) {
 	}
 }
 
-func TestParseVarsFromGroups(t *testing.T) {
+func TestParseVarsFromResources(t *testing.T) {
 	// "core" is the config spelling; RBAC and the API want "".
-	got := parseVarsFromGroups("core, vmoperator.vmware.com ,")
-	if len(got) != 2 || got[0] != "" || got[1] != "vmoperator.vmware.com" {
-		t.Errorf("parseVarsFromGroups = %#v", got)
+	got := parseVarsFromResources(" core/configmaps , vmoperator.vmware.com/virtualmachines ,")
+	want := []varsFromResource{
+		{Group: "", Resource: "configmaps"},
+		{Group: "vmoperator.vmware.com", Resource: "virtualmachines"},
 	}
-	// An empty setting must allow nothing, not silently allow the core
-	// group by way of an empty token.
-	if len(parseVarsFromGroups("")) != 0 {
-		t.Errorf("an empty setting must allow no groups, got %#v", parseVarsFromGroups(""))
+	if len(got) != len(want) {
+		t.Fatalf("parseVarsFromResources = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("parseVarsFromResources = %#v, want %#v", got, want)
+		}
+	}
+	// An empty setting must allow nothing, and an entry naming a group
+	// with no resource must be dropped rather than read as "everything in
+	// that group" - the whole point is that nothing is a wildcard.
+	for _, csv := range []string{"", "core", "core/", "/configmaps"} {
+		if n := len(parseVarsFromResources(csv)); n != 0 {
+			t.Errorf("parseVarsFromResources(%q) allowed %d entries, want none", csv, n)
+		}
 	}
 }
 
 var _ = metav1.GetOptions{}
+
+// Nothing is granted by wildcard: the ClusterRole names every kind
+// varsFrom may read, and the controller is handed the same list. A kind
+// outside it has to be refused here, with an explanation - the read
+// would otherwise go out and come back Forbidden, which says nothing
+// about how to fix it. An allowed group is not enough on its own, which
+// is what this checks: core is allowed, for ConfigMaps only.
+func TestResolveVarsFromEnforcesTheResourceAllowlist(t *testing.T) {
+	withVarsFrom(t, "core/configmaps", "vmoperator.vmware.com/virtualmachines")
+
+	svc := obj("v1", "Service", "web", map[string]interface{}{
+		"spec": map[string]interface{}{"clusterIP": "10.96.0.5"},
+	})
+	client := newVarsFromClient(svc)
+
+	_, _, err := resolveVarsFrom(context.Background(), client, testMapper{}, "ns",
+		[]VarsFromSource{source("v1", "Service", "web", map[string]string{"ip": "{.spec.clusterIP}"})}, nil)
+	if err == nil {
+		t.Fatal("expected a Service read to be refused: the ClusterRole grants core/configmaps, not every core kind")
+	}
+	if !isTerminalError(err) {
+		t.Errorf("a resource this service is not granted is a settled fact, not something to retry: %v", err)
+	}
+	for _, want := range []string{"core/services", "vars_from_resources", "core/configmaps"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("expected the refusal to name %q, got: %v", want, err)
+		}
+	}
+}
+
+// Widening it is what the package value is for, and the gate has to
+// follow the grant rather than a compiled-in list.
+func TestResolveVarsFromReadsAWidenedResource(t *testing.T) {
+	withVarsFrom(t, "core/configmaps", "core/services")
+
+	svc := obj("v1", "Service", "web", map[string]interface{}{
+		"spec": map[string]interface{}{"clusterIP": "10.96.0.5"},
+	})
+	client := newVarsFromClient(svc)
+
+	resolved, _, err := resolveVarsFrom(context.Background(), client, testMapper{}, "ns",
+		[]VarsFromSource{source("v1", "Service", "web", map[string]string{"ip": "{.spec.clusterIP}"})}, nil)
+	if err != nil {
+		t.Fatalf("a kind named in vars_from_resources must be readable: %v", err)
+	}
+	if resolved["ip"] != "10.96.0.5" {
+		t.Errorf("expected ip=10.96.0.5, got %q", resolved["ip"])
+	}
+}

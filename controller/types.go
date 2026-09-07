@@ -343,8 +343,6 @@ type RunHostStatus struct {
 	// AWXHostCreated records whether this run created the host. A host
 	// that already existed is adopted and never deleted.
 	AWXHostCreated bool `json:"awxHostCreated,omitempty"`
-	// PendingCleanup marks a host whose deletion has not succeeded yet.
-	PendingCleanup bool `json:"pendingCleanup,omitempty"`
 }
 
 type AnsibleRunStatus struct {
@@ -362,11 +360,26 @@ type AnsibleRunStatus struct {
 	// counts from. A retryable failure leaves it empty on purpose.
 	FinishedAt string `json:"finishedAt,omitempty"`
 	// LaunchAttemptedAt is written before the launch request goes out.
-	// Finding it set with no JobID means the process died between the
-	// POST and recording its result: the run is failed rather than
-	// launched a second time, since a job that already ran cannot be
-	// un-run.
+	// Finding it set with no JobID means the launch's outcome was never
+	// recorded - the process died between the POST and the write, or the
+	// answer was lost in flight - and the run's recovery path looks the
+	// job up in AWX rather than launching a second one, since a job that
+	// already ran cannot be un-run.
 	LaunchAttemptedAt string `json:"launchAttemptedAt,omitempty"`
+
+	// CancelRequestedAt records when AWX accepted a request to cancel
+	// this run's job. AWX answers a cancel with 202 Accepted - it has
+	// taken the request, not stopped the job - so "asked" and "stopped"
+	// are two states and finalization waits for the second. Without this
+	// there is nothing to bound that wait by, and a job AWX never moves
+	// to a terminal status would hold the finalizer forever.
+	CancelRequestedAt string `json:"cancelRequestedAt,omitempty"`
+
+	// AWXEndpoint fingerprints the AWX instance every id below was
+	// issued by. An id means nothing anywhere else, so a connection
+	// repointed at a different instance must stop this run rather than
+	// let it poll, cancel or delete whatever holds those ids there.
+	AWXEndpoint string `json:"awxEndpoint,omitempty"`
 
 	// FailureReason explains a terminal failure. It is kept in the detail
 	// half of status rather than only in status.message because message

@@ -193,8 +193,10 @@ func templateCacheKey(connKey string, ref TemplateRef) string {
 	return fmt.Sprintf("%s/%s/%s", connKey, ref.Type, ref.Name)
 }
 
-// resolveTemplateCached resolves a template for work that only needs its
-// inventory - the per-VM host check. Launches do not come through here.
+// resolveTemplateCached resolves a template for work that needs its id
+// or its inventory but is not about to launch it: the per-VM host check,
+// and an AnsibleRun looking for the job a lost launch may have started.
+// Launches do not come through here.
 func resolveTemplateCached(ctx context.Context, awxClient *AWXClient, connKey string, ref TemplateRef) (*AWXTemplate, error) {
 	k := templateCacheKey(connKey, ref)
 
@@ -216,7 +218,7 @@ func resolveTemplateCached(ctx context.Context, awxClient *AWXClient, connKey st
 
 // resolveTemplateForLaunch resolves a template the caller is about to
 // launch, always from AWX. Prompt-on-launch can be switched off in the
-// AWX UI at any moment, and checkTemplateLaunchFields is only as good as
+// AWX UI at any moment, and checkTemplateAcceptsLaunchFields is only as good as
 // the flags it is given: a cached template would leave a window in which
 // the controller launched a run AWX would silently widen to the whole
 // inventory.
