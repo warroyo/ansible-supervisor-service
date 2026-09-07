@@ -39,12 +39,25 @@ type jobRec struct {
 	ID       int
 	Workflow bool
 	Polls    int
-	// TemplateID and Body record what was actually launched. Counting
-	// "launched job" log lines proves a run happened; only the body proves
-	// it was scoped the way the CR asked for - that a targetless run sent
-	// no limit at all, or that varsFrom reached extra_vars.
-	TemplateID int
-	Body       map[string]interface{}
+	// Held keeps a job "running" however often it is polled, until
+	// /_test/finish-job releases it. A job that goes terminal on its
+	// second poll is fine for provisioning, but it makes a deprovision
+	// hook finish before a test can observe the window that matters -
+	// the one where the playbook is running and the inventory host it
+	// targets must still exist.
+	Held bool
+}
+
+// launchRec is one launch as it arrived, kept so the e2e suite can
+// assert what a deprovision hook actually asked AWX for - the limit
+// above all, since a hook without one would run against every host in
+// the inventory.
+type launchRec struct {
+	JobID      int    `json:"jobID"`
+	TemplateID int    `json:"templateID"`
+	Workflow   bool   `json:"workflow"`
+	Limit      string `json:"limit"`
+	ExtraVars  string `json:"extraVars"`
 }
 
 type server struct {
@@ -59,21 +72,32 @@ type server struct {
 	// ?name= field lookup (it is not part of the published API schema),
 	// so host lookups come back unfiltered.
 	ignoreNameFilter bool
+	// holdTemplate is a template id whose jobs stay running until
+	// released, so a test can hold a playbook open and look at the world
+	// while it runs. 0 holds nothing.
+	holdTemplate int
 
 	nextHostID int
 	nextJobID  int
+
+	// requests counts API requests by category, so the e2e suite can
+	// assert what an idle steady state costs rather than only that it
+	// eventually converges. Keyed "ping", "hosts", "templates", "jobs".
+	requests map[string]int
 
 	jobTemplates      []templateRec
 	workflowTemplates []templateRec
 	hosts             map[int]*hostRec
 	jobs              map[int]*jobRec
+	launches          []launchRec
 }
 
-func newServer(basePath string, ignoreNameFilter bool) *server {
+func newServer(basePath string, ignoreNameFilter bool, holdTemplate int) *server {
 	inv := 1
 	return &server{
 		basePath:         basePath,
 		ignoreNameFilter: ignoreNameFilter,
+		holdTemplate:     holdTemplate,
 		nextHostID:       100,
 		nextJobID:        1000,
 		jobTemplates: []templateRec{
@@ -82,12 +106,20 @@ func newServer(basePath string, ignoreNameFilter bool) *server {
 			// controller must refuse to launch against this one rather
 			// than let AWX run it against the whole inventory.
 			{ID: 3, Name: "No Prompt Template", Inventory: &inv},
+			// The deprovision hook's template.
+			{ID: 4, Name: "Deregister Host", Inventory: &inv, AskLimitOnLaunch: true, AskVariablesOnLaunch: true},
 		},
 		workflowTemplates: []templateRec{
 			{ID: 2, Name: "Configure Webserver Workflow", Inventory: &inv, AskLimitOnLaunch: true, AskVariablesOnLaunch: true},
+			// A decommissioning workflow whose nodes carry their own
+			// inventories: no top-level inventory of its own, and no
+			// limit to prompt for. Only launchable by a hook with
+			// onDeleted.targeting: Template, which supplies neither.
+			{ID: 5, Name: "Decommission Records", AskVariablesOnLaunch: true},
 		},
-		hosts: map[int]*hostRec{},
-		jobs:  map[int]*jobRec{},
+		hosts:    map[int]*hostRec{},
+		jobs:     map[int]*jobRec{},
+		requests: map[string]int{},
 	}
 }
 
@@ -208,6 +240,16 @@ func (s *server) handleHost(w http.ResponseWriter, r *http.Request, id int) {
 
 	h, ok := s.hosts[id]
 	switch r.Method {
+	case http.MethodGet:
+		// Real AWX serves the host detail here. The controller reads a
+		// host back before deleting it by an id an older version of
+		// itself recorded, to check the ownership marker on the host
+		// rather than trusting the id.
+		if !ok || h.Deleted {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writeJSON(w, 200, h)
 	case http.MethodPatch:
 		if !ok || h.Deleted {
 			w.WriteHeader(http.StatusNotFound)
@@ -258,7 +300,10 @@ func (s *server) handleLaunch(list []templateRec, workflow bool) func(http.Respo
 
 		id := s.nextJobID
 		s.nextJobID++
-		s.jobs[id] = &jobRec{ID: id, Workflow: workflow, TemplateID: templateID, Body: body}
+		s.jobs[id] = &jobRec{ID: id, Workflow: workflow, Held: s.holdTemplate != 0 && templateID == s.holdTemplate}
+		limit, _ := body["limit"].(string)
+		extraVars, _ := body["extra_vars"].(string)
+		s.launches = append(s.launches, launchRec{JobID: id, TemplateID: templateID, Workflow: workflow, Limit: limit, ExtraVars: extraVars})
 		log.Printf("fakeawx: launched job %d (template=%d workflow=%v limit=%v ignored=%v)", id, templateID, workflow, body["limit"], ignored)
 
 		resp := map[string]interface{}{}
@@ -288,7 +333,7 @@ func (s *server) handleJobStatus(w http.ResponseWriter, r *http.Request, id int)
 	}
 	j.Polls++
 	status := "running"
-	if j.Polls >= 2 {
+	if j.Polls >= 2 && !j.Held {
 		status = "successful"
 	}
 	writeJSON(w, 200, map[string]interface{}{"id": id, "status": status})
@@ -326,32 +371,64 @@ func (s *server) handleTestHosts(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// /_test/launches reports what every launch actually asked for, oldest
-// first. The log line proves a job ran; this proves what it ran against.
+// count buckets one API request by what it is for. "hosts" and
+// "templates" are the ones an idle binding must stop making between host
+// checks; "ping" is the AWXConnection validating itself and goes on
+// regardless.
+func (s *server) count(path string) {
+	bucket := "other"
+	switch {
+	case path == "/ping/" || path == "/me/":
+		bucket = "ping"
+	case strings.Contains(path, "hosts/"):
+		bucket = "hosts"
+	case strings.Contains(path, "templates/"):
+		bucket = "templates"
+	case strings.HasPrefix(path, "/jobs/") || strings.HasPrefix(path, "/workflow_jobs/"):
+		bucket = "jobs"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests[bucket]++
+	s.requests["total"]++
+}
+
+func (s *server) handleTestRequestCount(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	counts := map[string]int{}
+	for k, v := range s.requests {
+		counts[k] = v
+	}
+	writeJSON(w, 200, counts)
+}
+
+// /_test/finish-job?id=N releases a held job, so a test controls when a
+// playbook finishes rather than racing the fake's poll counter.
+func (s *server) handleTestFinishJob(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.URL.Query().Get("id"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[id]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	j.Held = false
+	j.Polls = 2
+	log.Printf("fakeawx: released held job %d", id)
+	writeJSON(w, 200, map[string]interface{}{"id": id, "status": "successful"})
+}
+
 func (s *server) handleTestLaunches(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	ids := make([]int, 0, len(s.jobs))
-	for id := range s.jobs {
-		ids = append(ids, id)
-	}
-	sort.Ints(ids)
-
-	launches := make([]map[string]interface{}, 0, len(ids))
-	for _, id := range ids {
-		j := s.jobs[id]
-		body := j.Body
-		if body == nil {
-			body = map[string]interface{}{}
-		}
-		launches = append(launches, map[string]interface{}{
-			"job":      j.ID,
-			"template": j.TemplateID,
-			"workflow": j.Workflow,
-			"body":     body,
-		})
-	}
+	launches := make([]launchRec, len(s.launches))
+	copy(launches, s.launches)
 	writeJSON(w, 200, launches)
 }
 
@@ -388,8 +465,14 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/_test/deleted-hosts":
 		s.handleTestDeletedHosts(w, r)
 		return
+	case "/_test/request-count":
+		s.handleTestRequestCount(w, r)
+		return
 	case "/_test/launches":
 		s.handleTestLaunches(w, r)
+		return
+	case "/_test/finish-job":
+		s.handleTestFinishJob(w, r)
 		return
 	}
 
@@ -398,6 +481,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path = strings.TrimPrefix(path, s.basePath)
+	s.count(path)
 
 	switch {
 	case path == "/ping/":
@@ -459,9 +543,10 @@ func main() {
 	addr := flag.String("addr", ":8756", "listen address")
 	basePath := flag.String("api-base-path", "/api/v2", "API root to serve: /api/v2 like AWX/Tower/AAP<=2.4, or /api/controller/v2 like AAP 2.5+")
 	ignoreNameFilter := flag.Bool("ignore-name-filter", false, "ignore the ?name= host lookup filter, returning every host in the inventory")
+	holdTemplate := flag.Int("hold-template", 0, "template id whose jobs stay running until POST /_test/finish-job?id=N releases them")
 	flag.Parse()
 
-	s := newServer(strings.TrimRight(*basePath, "/"), *ignoreNameFilter)
+	s := newServer(strings.TrimRight(*basePath, "/"), *ignoreNameFilter, *holdTemplate)
 	fmt.Printf("fakeawx listening on %s serving %s\n", *addr, s.basePath)
 	log.Fatal(http.ListenAndServe(*addr, s))
 }

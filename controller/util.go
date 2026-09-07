@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -95,6 +99,23 @@ func resolveVMGVR(d versionDiscoverer) (schema.GroupVersionResource, error) {
 var awxConnGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "awxconnections"}
 var ansBindGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "ansiblebindings"}
 var ansRunGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "ansibleruns"}
+var ansBindVMGVR = schema.GroupVersionResource{Group: "field.vmware.com", Version: "v1", Resource: "ansiblebindingvms"}
+
+// debugLogging turns on the per-pass lines below. They describe a
+// reconcile that is progressing normally, which is exactly what there is
+// most of: one terminating child polling a teardown playbook logs on
+// every pass, so a namespace of a thousand VMs would write hundreds of
+// lines a second saying nothing had changed. Launches, terminal
+// outcomes and errors are never gated on this.
+//
+// Set once at startup from --log-level, before any worker runs.
+var debugLogging bool
+
+func debugf(format string, args ...interface{}) {
+	if debugLogging {
+		log.Printf(format, args...)
+	}
+}
 
 // ReconcileRequestedAtAnnotation is the annotation a user bumps to force
 // a re-run of an AnsibleBinding that's already up to date
@@ -177,6 +198,123 @@ func convertAnsibleRun(u *unstructured.Unstructured) (AnsibleRun, error) {
 	return c, err
 }
 
+func convertAnsibleBindingVM(u *unstructured.Unstructured) (AnsibleBindingVM, error) {
+	var c AnsibleBindingVM
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &c)
+	return c, err
+}
+
+// awxEndpointFingerprint identifies which AWX instance a recorded host
+// id came from. AWX ids are only meaningful on the instance that issued
+// them, so a connection repointed at a different AWX would otherwise
+// leave a child deleting or rewriting whatever host happens to hold that
+// id on the new one. Short because it is only ever compared, never read.
+func awxEndpointFingerprint(url, basePath string) string {
+	sum := sha256.Sum256([]byte(strings.TrimRight(url, "/") + "|" + basePath))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// hostCheckPeriod is how often each child reconciles its AWX inventory
+// host against AWX itself. It is the worst case for repairing a host
+// deleted or edited by hand in the AWX UI, and - since everything else
+// in a steady-state pass is now a cache read - it is also the only thing
+// setting the controller's AWX request rate. Set at startup from
+// --host-check-period.
+var hostCheckPeriod = 10 * time.Minute
+
+// orphanScanPeriod is how often a binding lists the AWX hosts it owns
+// looking for ones no child claims. Deliberately several host-check
+// periods: a leaked host comes from a controller killed mid-cleanup,
+// which is far rarer than a host edited by hand in the AWX UI, and the
+// scan is one AWX request per binding rather than per VM. Derived rather
+// than configured so there is still only one period a user ever sees.
+func orphanScanPeriod() time.Duration { return 4 * hostCheckPeriod }
+
+// dueFor reports whether at least period has elapsed since the RFC3339
+// timestamp ts, and how long is left if it has not. An empty or
+// unparseable timestamp means the work has never been done, which is
+// always due.
+func dueFor(ts string, period time.Duration) (due bool, remaining time.Duration) {
+	if ts == "" {
+		return true, 0
+	}
+	last, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return true, 0
+	}
+	elapsed := time.Since(last)
+	if elapsed >= period {
+		return true, 0
+	}
+	// A clock that has gone backwards (or a timestamp written by a
+	// controller whose clock was ahead) would otherwise park the work
+	// arbitrarily far into the future.
+	if elapsed < 0 {
+		return true, 0
+	}
+	return false, period - elapsed
+}
+
+// Child names are DNS subdomains, so 253 characters is the hard ceiling.
+// Each half gets a bounded share of it and the hash below takes the rest.
+const (
+	childNameHalfLimit = 110
+	childNameHashLen   = 10
+)
+
+// maxLabelValue is the Kubernetes limit on a label value. Object names
+// go up to 253 characters, so a binding name is not necessarily a legal
+// label value - and the label is how children are found.
+const maxLabelValue = 63
+
+// bindingLabelValue is what goes in the BindingLabel on a child.
+//
+// The full name is kept in spec.bindingName, which has no such limit and
+// is what ownership is actually decided on; this only has to be a stable
+// handle to list by. A binding name over 63 characters would otherwise
+// make every child it creates invalid - the API server rejects the label
+// - while childName goes to some trouble to support long names.
+func bindingLabelValue(name string) string {
+	if len(name) <= maxLabelValue {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	return clipNameSegment(name[:maxLabelValue-childNameHashLen-1]) + "-" + hex.EncodeToString(sum[:])[:childNameHashLen]
+}
+
+// childName is the name of the AnsibleBindingVM that claims one
+// VirtualMachine. It depends on the VM alone, so within a namespace
+// every binding that selects a VM computes the same name for it - which
+// is what makes the claim exclusive: Kubernetes will only let one object
+// hold a name, so the create that wins is the arbitration and no lease,
+// lock or extra CRD is needed to decide it.
+//
+// Deterministic so the parent can create it blind rather than listing
+// first and racing with its own previous pass. The VM name is clipped
+// for legibility and the hash is of the whole name, so two VMs that
+// differ only past the clip still get different children rather than one
+// binding silently reconciling the other's VM.
+//
+// Keyed on the name and not the VM's UID on purpose: a VM deleted and
+// recreated under the same name maps to the same AWX inventory host, and
+// the claim has to hold that slot across the replacement until the old
+// VM's cleanup has finished. The owner reference carries the UID, which
+// is what stops the old child being treated as the new VM's.
+func childName(vmName string) string {
+	sum := sha256.Sum256([]byte(vmName))
+	suffix := hex.EncodeToString(sum[:])[:childNameHashLen]
+	return "vm-" + clipNameSegment(vmName) + "-" + suffix
+}
+
+// clipNameSegment bounds one half of a child name and makes sure the
+// truncation cannot leave a character a DNS subdomain may not end on.
+func clipNameSegment(s string) string {
+	if len(s) > childNameHalfLimit {
+		s = s[:childNameHalfLimit]
+	}
+	return strings.TrimRight(s, "-.")
+}
+
 // getSecretValue reads a base64-encoded key out of a Secret's data map.
 // Read via the dynamic client, Secret data values arrive base64-encoded
 // as-is (unlike the typed corev1.Secret client, which decodes them for
@@ -211,16 +349,56 @@ func getSecretValue(ctx context.Context, client *dynamic.DynamicClient, namespac
 
 // structToMap round-trips v through JSON so it can be embedded in an
 // unstructured status patch.
+//
+// Whole numbers come back as int64, not the float64 encoding/json would
+// hand back by default. An unstructured object is meant to hold int64,
+// and the accessors enforce it: a float64 in status.lastJobID reads back
+// as zero through NestedInt64, and makes the runtime converter refuse
+// the object outright.
 func structToMap(v interface{}) (map[string]interface{}, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
 	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
 	var m map[string]interface{}
-	if err := json.Unmarshal(b, &m); err != nil {
+	if err := dec.Decode(&m); err != nil {
 		return nil, err
 	}
-	return m, nil
+	normalized, ok := normalizeJSONNumbers(m).(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("encoding %T: expected a JSON object", v)
+	}
+	return normalized, nil
+}
+
+// normalizeJSONNumbers walks a decoded JSON value turning every
+// json.Number into the int64 or float64 an unstructured object may hold.
+func normalizeJSONNumbers(v interface{}) interface{} {
+	switch typed := v.(type) {
+	case map[string]interface{}:
+		for k, inner := range typed {
+			typed[k] = normalizeJSONNumbers(inner)
+		}
+		return typed
+	case []interface{}:
+		for i, inner := range typed {
+			typed[i] = normalizeJSONNumbers(inner)
+		}
+		return typed
+	case json.Number:
+		if i, err := typed.Int64(); err == nil {
+			return i
+		}
+		f, err := typed.Float64()
+		if err != nil {
+			return typed.String()
+		}
+		return f
+	default:
+		return v
+	}
 }
 
 func listVirtualMachines(ctx context.Context, client *dynamic.DynamicClient, namespace string, selector map[string]string) ([]unstructured.Unstructured, error) {

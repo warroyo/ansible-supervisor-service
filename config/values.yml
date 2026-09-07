@@ -2,7 +2,30 @@
 ---
 
 resync_period: "60"
+#! maximum time one reconcile of one resource may take, in seconds. the AWX
+#! client's own timeout is per request, so without a bound a binding matching
+#! many VMs can hold one of the controller's workers for a long time against a
+#! slow AWX, delaying every other resource.
+reconcile_timeout: "300"
 namespace: ""
+#! how often, in seconds, each VM's AWX inventory host is reconciled against AWX
+#! itself. everything else in an idle pass is served from the controller's own
+#! informer caches, so this is what sets the steady-state AWX request rate - and
+#! it is the worst case for repairing a host deleted or edited by hand in the AWX
+#! UI.
+host_check_period: "600"
+#! sustained requests per second, and burst above it, this controller makes to
+#! the Kubernetes API server. client-go's own defaults (5/10) are an
+#! interactive kubectl's budget, not a controller's: one pass over a binding
+#! matching hundreds of VMs would spend minutes inside the client's rate
+#! limiter. The API server's priority-and-fairness protection is what actually
+#! bounds this.
+api_qps: "50"
+api_burst: "100"
+#! "info" logs launches, terminal outcomes and errors. "debug" adds a line per
+#! reconcile pass, which is a great many during a large teardown: every
+#! terminating VM polling a deprovision hook would log on every pass.
+log_level: "info"
 #! identity stamped on AWX inventory hosts this supervisor owns, so one AWX
 #! instance can be shared by several supervisors without them fighting over
 #! host entries. leave empty to derive it from the kube-system namespace UID.

@@ -34,9 +34,11 @@ Confirm the CRDs landed:
 ```bash
 kubectl get crd | grep field.vmware.com
 # ansiblebindings.field.vmware.com
-# ansibleruns.field.vmware.com
+# ansiblebindingvms.field.vmware.com
 # awxconnections.field.vmware.com
 ```
+
+Three, not two: `AnsibleBindingVM` is the per-VM child the controller creates and deletes itself. You never write one - see [CRD status](README.md#crd-status).
 
 ## 2. Prepare the AWX template
 
@@ -154,21 +156,21 @@ That's the whole thing. The controller creates an AWX inventory host pointed at 
 
 ```bash
 kubectl get ansiblebinding webserver-config -n my-namespace -w
-# NAME               READY   STATE     AGE
-# webserver-config   false   Pending   2s
-# webserver-config   false   Running   8s
-# webserver-config   true    Ready     54s
+# NAME               READY   STATE     VMS   FAILED   AGE
+# webserver-config   false   Pending   1              2s
+# webserver-config   false   Running   1              8s
+# webserver-config   true    Ready     1              54s
 ```
 
 `Ready` means the playbook completed successfully against every matched VM. To see the run in AWX:
 
 ```bash
-kubectl get ansiblebinding webserver-config -n my-namespace \
-  -o jsonpath='{range .status.vms[*]}{.name}{"\t"}{.phase}{"\t"}{.lastJobURL}{"\n"}{end}'
+kubectl get ansiblebindingvm -n my-namespace -l field.vmware.com/binding=webserver-config \
+  -o jsonpath='{range .items[*]}{.spec.vmName}{"\t"}{.status.phase}{"\t"}{.status.lastJobURL}{"\n"}{end}'
 # sample-webserver  Succeeded  https://awx.example.com/#/jobs/playbook/412
 ```
 
-One binding fans out: every VM the selector matches gets its own inventory host, its own run, and its own entry in `status.vms`. Label a second VM `app: webserver` and it's picked up on the next resync - no edit to the binding needed.
+One binding fans out: every VM the selector matches gets its own inventory host, its own run, and its own `AnsibleBindingVM`. Label a second VM `app: webserver` and it's picked up on the next resync - no edit to the binding needed.
 
 ## Re-running
 
@@ -188,6 +190,7 @@ Editing `spec` does the same thing without the annotation, since it bumps `.meta
 | `AWXConnection` not `Ready` | Wrong URL, bad token, or TLS. Read `.status.message` |
 | Binding stuck `Pending` | No VM matches the selector, or the matched VM is powered off / has no reported IP yet. Clears on its own once a matching VM reports an IP - no need to re-apply the binding |
 | Binding `Failed` before any job ran | Prompt on Launch for Limit is off on the template, or the inventory host name collides with one another supervisor owns. `.status.message` names which |
+| Binding `Conflict` | Another `AnsibleBinding` already owns one of the VMs this one selects - only one binding may own a VM. `.status.summary.conflictedVMs` names the VM and its owner. Narrow this selector, or [put both playbooks in one AWX workflow](FAQ.md#can-two-bindings-target-the-same-vm) |
 | Binding `Failed` with a job URL | AWX ran it and the playbook failed. Open `lastJobURL` |
 | Job fails `unreachable` | AWX can't SSH in: wrong user or key in the Machine credential, no route to the VM's IP, or the VM booted without the key. If AWX must reach the VM at a different address than `status.network.primaryIP4`, set `hostVariables: {ansible_host: ...}` on the binding |
 

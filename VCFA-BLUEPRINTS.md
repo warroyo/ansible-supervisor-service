@@ -110,10 +110,13 @@ outputs:
     type: string
     title: Ansible state
     value: ${resource.Webserver_Ansible.object.status.state}
-  ansibleJobUrl:
+  ansibleDetail:
     type: string
-    title: AWX job
-    value: ${resource.Webserver_Ansible.object.status.vms[0].lastJobURL}
+    title: Ansible detail
+    # Per-VM job URLs live on the AnsibleBindingVM children, which a
+    # blueprint cannot reference. status.message carries the rollup,
+    # including the reason when a VM has failed.
+    value: ${resource.Webserver_Ansible.object.status.message}
 
 resources:
 
@@ -285,7 +288,7 @@ Give it a `title` that says so on the request form. Consumers read "Configuratio
 
 ## Multiple VMs
 
-One binding fans out to every VM its selector matches, so a blueprint that provisions several VMs of the same role needs exactly one `AnsibleBinding` for all of them. Label each VM with the same `app` and `deployment` pair and leave the binding as-is: each VM gets its own AWX inventory host, its own run, and its own entry in `status.vms`, and the binding is `Ready` only once all of them have succeeded.
+One binding fans out to every VM its selector matches, so a blueprint that provisions several VMs of the same role needs exactly one `AnsibleBinding` for all of them. Label each VM with the same `app` and `deployment` pair and leave the binding as-is: each VM gets its own AWX inventory host, its own run, and its own `AnsibleBindingVM`, and the binding is `Ready` only once all of them have succeeded.
 
 Different roles get different bindings pointed at different templates - `app: webserver` at one, `app: database` at another - each with the same per-deployment label, and each with its own `wait` if the deployment should block on it.
 
@@ -455,6 +458,10 @@ Deleting the deployment deletes the `AnsibleBinding`, whose finalizer blocks unt
 
 Set `cleanupPolicy: Retain` on a binding or run if you want the AWX host entries kept after the deployment is gone - for run history or audit. They are then yours to clean up.
 
+**Running a playbook on the way out.** `spec.onDeleted` on the binding launches a template when a VM in the deployment is deleted, before its inventory host goes - the deregistration half of what `Cloud.Ansible.Tower`'s `templates.de-provision[]` did in a VM Apps organization. Deleting the deployment deletes both the VMs and the binding, and each VM's hook runs before the binding finishes, so a deployment teardown takes as long as the slowest deregistration playbook rather than a second or two. Budget for that, or bound it with `timeoutSeconds` - past which the finalizer is released regardless, so a hung playbook cannot leave a deployment stuck deleting.
+
+The hook cannot reach inside the guest: vm-operator has destroyed the machine by the time it runs. Anything that needs a live guest has to happen while the deployment still exists, as a day-2 action against the binding rather than as part of the teardown.
+
 ## Troubleshooting
 
 Everything here is visible with `kubectl` against the project's Supervisor namespace, which is generally faster than reading it out of the deployment view.
@@ -469,12 +476,13 @@ Everything here is visible with `kubectl` against the project's Supervisor names
 | Job fails `unreachable` | The cloud-init public key does not match the AWX Machine credential's private key, or AWX has no route to the VM's IP |
 | Second deployment fails where the first succeeded | Resource names are not per-deployment. Add `${env.shortDeploymentId}` to the VM name |
 | Playbook ran against VMs from another deployment | The selector is not scoped per deployment. See [Scope the selector to the deployment](#scope-the-selector-to-the-deployment) |
+| Deployment times out, state `Conflict` | Another deployment's binding already owns one of these VMs - only one `AnsibleBinding` may own a VM. Almost always an unscoped selector matching the other deployment's machines: see [Scope the selector to the deployment](#scope-the-selector-to-the-deployment). `.status.summary.conflictedVMs` names the VM and the binding holding it |
 
 ```bash
 kubectl get ansiblebinding -n <project-supervisor-namespace>
 kubectl get ansiblebinding <name> -n <project-supervisor-namespace> -o jsonpath='{.status.message}'
-kubectl get ansiblebinding <name> -n <project-supervisor-namespace> \
-  -o jsonpath='{range .status.vms[*]}{.name}{"\t"}{.phase}{"\t"}{.lastJobURL}{"\n"}{end}'
+kubectl get ansiblebindingvm -n <project-supervisor-namespace> -l field.vmware.com/binding=<name> \
+  -o jsonpath='{range .items[*]}{.spec.vmName}{"\t"}{.status.phase}{"\t"}{.status.lastJobURL}{"\n"}{end}'
 ```
 
 Full CRD reference in the [README](README.md), edge cases in the [FAQ](FAQ.md).

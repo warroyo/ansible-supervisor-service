@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -9,7 +13,48 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 )
+
+func TestApplyAnsibleRunReturnsWrittenStatusToEngine(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || !strings.HasSuffix(r.URL.Path, "/status") {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var patch map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+			t.Error(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(patch)
+	}))
+	defer server.Close()
+	client, err := dynamic.NewForConfig(&rest.Config{Host: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := fixtureObject(t, AnsibleRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "expired", Namespace: "ns", CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute))},
+		Spec:       &AnsibleRunSpec{ActiveDeadlineSeconds: 1},
+	}, "AnsibleRun")
+	result, err := applyAnsibleRun(context.Background(), client, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Object == nil {
+		t.Fatal("the engine needs the newly written status without waiting for the informer")
+	}
+	state := updateAnsibleRunStatus(result.Object, true, nil)
+	if state["state"] != "Failed" || !strings.Contains(state["message"].(string), "activeDeadlineSeconds") {
+		t.Fatalf("engine received stale status: %v", state)
+	}
+	if _, found := u.Object["status"]; found {
+		t.Fatal("reconciliation mutated its input object")
+	}
+}
 
 // runWith builds the unstructured form of an AnsibleRun the way the API
 // server hands one back, so status conversion is exercised for real

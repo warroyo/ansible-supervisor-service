@@ -54,34 +54,45 @@ func isTerminalError(err error) bool {
 // one-way trip: launch at most one AWX job, poll it to a terminal
 // status, then stop. A spec change cannot re-trigger it (the CRD makes
 // spec immutable) and neither can the re-run annotation.
-func applyAnsibleRun(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) error {
+func applyAnsibleRun(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) (Result, error) {
 	u, err := toUnstructured(obj)
 	if err != nil {
-		return err
+		return Result{}, err
 	}
 	run, err := convertAnsibleRun(u)
 	if err != nil {
-		return fmt.Errorf("decoding AnsibleRun: %w", err)
+		return Result{}, fmt.Errorf("decoding AnsibleRun: %w", err)
 	}
 	if run.Spec == nil {
-		return fmt.Errorf("spec is required")
+		return Result{}, fmt.Errorf("spec is required")
 	}
 	status := AnsibleRunStatus{}
 	if run.Status != nil {
 		status = *run.Status
 	}
 
+	// Return the status written in this pass; the informer may still be behind.
+	finish := func(reconcileErr error) (Result, error) {
+		updated := u.DeepCopy()
+		data, err := structToMap(&status)
+		if err != nil {
+			return Result{}, err
+		}
+		updated.Object["status"] = data
+		return Result{Object: updated}, reconcileErr
+	}
+
 	// Already finished: nothing left but to collect it when its TTL is up.
 	if status.FinishedAt != "" {
-		return collectFinishedRun(ctx, client, &run, status)
+		return finish(collectFinishedRun(ctx, client, &run, status))
 	}
 
 	// The deadline is checked before anything else so a run wedged on a
 	// retryable condition - AWX down, a referenced object that never
 	// appears, a job stuck non-terminal - still reaches an end state.
 	if deadlineExceeded(&run) {
-		return failRun(ctx, client, u, &status, fmt.Sprintf(
-			"Run exceeded spec.activeDeadlineSeconds (%ds) before finishing.", run.Spec.ActiveDeadlineSeconds))
+		return finish(failRun(ctx, client, u, &status, fmt.Sprintf(
+			"Run exceeded spec.activeDeadlineSeconds (%ds) before finishing.", run.Spec.ActiveDeadlineSeconds)))
 	}
 
 	// A launch was attempted but no job ID came back, which means this
@@ -91,10 +102,10 @@ func applyAnsibleRun(ctx context.Context, client *dynamic.DynamicClient, obj int
 	// at AWX instead. An AnsibleBinding resolves the same window the other
 	// way, because relaunching a convergent configuration run is safe.
 	if status.LaunchAttemptedAt != "" && status.JobID == 0 {
-		return failRun(ctx, client, u, &status, fmt.Sprintf(
+		return finish(failRun(ctx, client, u, &status, fmt.Sprintf(
 			"A launch was sent at %s but its result was never recorded, so this run may or may not have started "+
 				"in AWX. Check the template's recent jobs there, and create a new AnsibleRun if it did not run.",
-			status.LaunchAttemptedAt))
+			status.LaunchAttemptedAt)))
 	}
 
 	// Everything below can fail terminally from several layers down, so
@@ -102,9 +113,9 @@ func applyAnsibleRun(ctx context.Context, client *dynamic.DynamicClient, obj int
 	// finishedAt and the reason, and is not retried.
 	rErr := reconcileRun(ctx, client, u, &run, &status)
 	if isTerminalError(rErr) {
-		return failRun(ctx, client, u, &status, rErr.Error())
+		return finish(failRun(ctx, client, u, &status, rErr.Error()))
 	}
-	return rErr
+	return finish(rErr)
 }
 
 // reconcileRun polls an in-flight job, or does everything up to and
@@ -468,17 +479,17 @@ func runStatusDetails(status *AnsibleRunStatus) AnsibleRunStatus {
 // cleanup: only hosts we created, never adopted ones, retried rather
 // than leaked, and abandoned only when there is genuinely no way left to
 // reach AWX.
-func cleanupAnsibleRun(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) error {
+func cleanupAnsibleRun(ctx context.Context, client *dynamic.DynamicClient, obj interface{}) (CleanupResult, error) {
 	u, err := toUnstructured(obj)
 	if err != nil {
-		return nil
+		return CleanupResult{Done: true}, nil
 	}
 	run, err := convertAnsibleRun(u)
 	if err != nil || run.Spec == nil || run.Status == nil {
-		return nil
+		return CleanupResult{Done: true}, nil
 	}
 	if run.Spec.CleanupPolicy == CleanupPolicyRetain {
-		return nil
+		return CleanupResult{Done: true}, nil
 	}
 
 	var toDelete []RunHostStatus
@@ -488,7 +499,7 @@ func cleanupAnsibleRun(ctx context.Context, client *dynamic.DynamicClient, obj i
 		}
 	}
 	if len(toDelete) == 0 {
-		return nil
+		return CleanupResult{Done: true}, nil
 	}
 
 	abandon := func(reason string, err error) {
@@ -499,27 +510,27 @@ func cleanupAnsibleRun(ctx context.Context, client *dynamic.DynamicClient, obj i
 	connObj, err := client.Resource(awxConnGVR).Namespace(run.Namespace).Get(ctx, run.Spec.AWXConnectionRef, metav1.GetOptions{})
 	if err != nil {
 		if !isPermanent(err) {
-			return fmt.Errorf("fetching AWXConnection %q to clean up %d AWX host(s): %w", run.Spec.AWXConnectionRef, len(toDelete), err)
+			return CleanupResult{}, fmt.Errorf("fetching AWXConnection %q to clean up %d AWX host(s): %w", run.Spec.AWXConnectionRef, len(toDelete), err)
 		}
 		abandon(fmt.Sprintf("AWXConnection %q is gone", run.Spec.AWXConnectionRef), err)
-		return nil
+		return CleanupResult{Done: true}, nil
 	}
 	conn, err := convertAWXConnection(connObj)
 	if err != nil || conn.Spec == nil {
 		abandon(fmt.Sprintf("AWXConnection %q is malformed", run.Spec.AWXConnectionRef), err)
-		return nil
+		return CleanupResult{Done: true}, nil
 	}
 	token, err := getSecretValue(ctx, client, run.Namespace, conn.Spec.SecretRef, "token")
 	if err != nil {
 		if !isPermanent(err) {
-			return fmt.Errorf("reading the AWX token to clean up %d AWX host(s): %w", len(toDelete), err)
+			return CleanupResult{}, fmt.Errorf("reading the AWX token to clean up %d AWX host(s): %w", len(toDelete), err)
 		}
 		abandon("the AWX token is gone", err)
-		return nil
+		return CleanupResult{Done: true}, nil
 	}
 	awxClient, _, err := awxClientFor(ctx, client, conn, token)
 	if err != nil {
-		return fmt.Errorf("resolving the AWX API base path to clean up %d AWX host(s) "+
+		return CleanupResult{}, fmt.Errorf("resolving the AWX API base path to clean up %d AWX host(s) "+
 			"(set spec.cleanupPolicy: Retain to release this run and leave them in place): %w", len(toDelete), err)
 	}
 
@@ -532,7 +543,7 @@ func cleanupAnsibleRun(ctx context.Context, client *dynamic.DynamicClient, obj i
 			}
 		}
 	}
-	return firstErr
+	return CleanupResult{Done: firstErr == nil}, firstErr
 }
 
 // updateAnsibleRunStatus derives the run's aggregate state from what the

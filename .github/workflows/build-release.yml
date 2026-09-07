@@ -19,6 +19,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set Version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            echo "VERSION=${TAG#v}" >> $GITHUB_ENV
+          else
+            echo "VERSION=latest" >> $GITHUB_ENV
+          fi
+
+      # Before anything is built or pushed: a tag with no CHANGELOG.md
+      # section fails here rather than publishing a release with an empty
+      # body, which is what every release before this one shipped with.
+      - name: Release Notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: make release-notes VERSION="$VERSION" > release-notes.md
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -47,15 +63,6 @@ jobs:
           install_carvel kbld carvel-dev/kbld v0.47.1 0950151615895b6a699085ba216a321aec35e4808672277281b94fc58cc0686b
           kctrl version
 
-      - name: Set Version
-        run: |
-          if [[ $GITHUB_REF == refs/tags/* ]]; then
-            TAG=${GITHUB_REF#refs/tags/}
-            echo "VERSION=${TAG#v}" >> $GITHUB_ENV
-          else
-            echo "VERSION=latest" >> $GITHUB_ENV
-          fi
-
       - name: Build Controller
         run: make build-controller
 
@@ -72,4 +79,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: ansible-supervisor.yml
+          body_path: release-notes.md
+          # Appended below the hand-written notes: the compare link, and
+          # any contributors GitHub can attribute.
           generate_release_notes: true

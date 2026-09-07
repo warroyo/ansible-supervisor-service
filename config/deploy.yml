@@ -41,10 +41,15 @@ spec:
         image: controller
         args:
         - #@ "--resync-period=" + data.values.resync_period
+        - #@ "--reconcile-timeout=" + data.values.reconcile_timeout
         - #@ "--supervisor-id=" + data.values.supervisor_id
         #! passed as well as granted, so the controller refuses a varsFrom
         #! read it has no RBAC for with an explanation instead of a Forbidden.
         - #@ "--vars-from-api-groups=" + ",".join(data.values.vars_from_api_groups)
+        - #@ "--host-check-period=" + data.values.host_check_period
+        - #@ "--api-qps=" + data.values.api_qps
+        - #@ "--api-burst=" + data.values.api_burst
+        - #@ "--log-level=" + data.values.log_level
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -82,6 +87,13 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get"]
+  #! create only: a deprovision hook releases its finalizer and the child
+  #! is then deleted, taking the status that described the teardown with
+  #! it. An Event on the parent binding is what is left for whoever ran
+  #! kubectl delete. Nothing here reads or edits anyone else's events.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
   - apiGroups: ["vmoperator.vmware.com"]
     resources: ["virtualmachines"]
     verbs: ["get", "list", "watch"]
@@ -101,10 +113,10 @@ rules:
       - awxconnections/status
       - ansiblebindings/status
       - ansibleruns/status
+      - ansiblebindingvms/status
     verbs: ["get", "list", "watch", "update", "patch"]
-  #! delete, on ansibleruns only: a finished run collects itself once
-  #! ttlSecondsAfterFinished elapses. Nothing else here is ever deleted by
-  #! the controller.
+  #! A finished run collects itself once ttlSecondsAfterFinished elapses.
+  #! Keep this delete grant separate from bindings and connections.
   - apiGroups: ["field.vmware.com"]
     resources: ["ansibleruns"]
     verbs: ["delete"]
@@ -117,6 +129,13 @@ rules:
   - apiGroups: #@ vars_from_groups()
     resources: ["*"]
     verbs: ["get"]
+  #! An AnsibleBinding creates and deletes one AnsibleBindingVM per matched
+  #! VM, so this kind alone needs create and delete. Kept as its own rule
+  #! rather than widening the verbs above, which would also let the
+  #! controller create and delete the user's bindings and connections.
+  - apiGroups: ["field.vmware.com"]
+    resources: ["ansiblebindingvms"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -148,6 +167,12 @@ rules:
 - apiGroups: ["field.vmware.com"]
   resources: ["awxconnections", "ansiblebindings", "ansibleruns"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+#! Children are created by the controller, not by users. Readable so a
+#! tenant can see why one VM under a binding is failing, but not writable:
+#! editing one would be undone on the binding's next pass.
+- apiGroups: ["field.vmware.com"]
+  resources: ["ansiblebindingvms"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -157,5 +182,5 @@ metadata:
     rbac.authorization.k8s.io/aggregate-to-view: "true"
 rules:
 - apiGroups: ["field.vmware.com"]
-  resources: ["awxconnections", "ansiblebindings", "ansibleruns"]
+  resources: ["awxconnections", "ansiblebindings", "ansiblebindingvms", "ansibleruns"]
   verbs: ["get", "list", "watch"]

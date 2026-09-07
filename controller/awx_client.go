@@ -319,7 +319,7 @@ func (c *AWXClient) findTemplate(ctx context.Context, listPath, kind, name strin
 		}
 	}
 	if len(exact) == 0 {
-		return nil, fmt.Errorf("%s %q not found", kind, name)
+		return nil, fmt.Errorf("%s %q not found: %w", kind, name, errPermanentConfig)
 	}
 	if len(exact) > 1 {
 		ids := make([]string, 0, len(exact))
@@ -328,7 +328,7 @@ func (c *AWXClient) findTemplate(ctx context.Context, listPath, kind, name strin
 		}
 		return nil, fmt.Errorf("%s %q is ambiguous: %d templates share that name (IDs %s), "+
 			"most likely in different AWX organizations. Rename one, or point this binding at an "+
-			"instance where the name is unique", kind, name, len(exact), strings.Join(ids, ", "))
+			"instance where the name is unique: %w", kind, name, len(exact), strings.Join(ids, ", "), errPermanentConfig)
 	}
 	r := exact[0]
 	return &AWXTemplate{
@@ -380,7 +380,55 @@ func findHostByName(results []hostResult, hostname string) *hostResult {
 
 type listHostsResponse struct {
 	Count   int          `json:"count"`
+	Next    string       `json:"next"`
 	Results []hostResult `json:"results"`
+}
+
+// maxHostListPages bounds pagination so a filter an instance ignored, or
+// a "next" link that loops, cannot spin forever. At AWX's maximum page
+// size this is 20,000 hosts, far past the point where the status object
+// holding them would already have hit etcd's size limit.
+const maxHostListPages = 100
+
+// ListOwnedHosts returns every host in the inventory whose description is
+// exactly ownerMarker, keyed by host name.
+//
+// One call replaces the per-host lookup UpsertHost would otherwise make
+// for each VM, which is what dominated a binding's AWX traffic: the
+// steady state for a binding matching N VMs goes from N requests to one.
+// Drift detection is unchanged - this still reads AWX itself rather than
+// trusting status, so a host deleted or edited in the AWX UI is still
+// seen. A host missing from the result is simply not one we own yet, and
+// the caller falls back to the per-host path that adopts it.
+func (c *AWXClient) ListOwnedHosts(ctx context.Context, inventoryID int, ownerMarker string) (map[string]hostResult, error) {
+	owned := map[string]hostResult{}
+	// page_size is capped by the instance's own max_page_size (200 by
+	// default); asking for more than it allows is clamped, not rejected.
+	path := fmt.Sprintf("%s/inventories/%d/hosts/?description=%s&page_size=200",
+		c.basePath, inventoryID, url.QueryEscape(ownerMarker))
+
+	for pages := 0; path != "" && pages < maxHostListPages; pages++ {
+		var lr listHostsResponse
+		if err := c.do(ctx, http.MethodGet, path, nil, &lr); err != nil {
+			return nil, fmt.Errorf("listing AWX hosts owned by %q: %w", ownerMarker, err)
+		}
+		for _, h := range lr.Results {
+			// Re-checked for the same reason findHostByName re-checks the
+			// name: ?description= is field-lookup filtering, not published
+			// API, so an instance that ignored it would hand back every
+			// host in the inventory and we would claim all of them.
+			if strings.TrimSpace(h.Description) == ownerMarker {
+				owned[h.Name] = h
+			}
+		}
+		// AWX returns "next" as a path on this same host. Anything else is
+		// not something to follow blindly with our own credentials.
+		if !strings.HasPrefix(lr.Next, "/") {
+			break
+		}
+		path = lr.Next
+	}
+	return owned, nil
 }
 
 // mergeHostVariables merges ours into an existing AWX host variables
@@ -400,11 +448,33 @@ func mergeHostVariables(existing string, ours map[string]string) (string, error)
 		return "", fmt.Errorf("existing host variables are not a JSON object this controller can merge into; "+
 			"remove the conflicting host in AWX or point spec.hostName elsewhere: %w", err)
 	}
+	// JSON null is a valid empty YAML document in AWX, but unmarshals
+	// into a nil map in Go.
+	if current == nil {
+		current = make(map[string]interface{})
+	}
 	for k, v := range ours {
 		current[k] = v
 	}
 	b, err := json.Marshal(current)
 	return string(b), err
+}
+
+// FindHost looks one host up by name in an inventory, returning nil if
+// there is none.
+//
+// The name is re-checked against what came back: ?name= is a field
+// lookup rather than published API, so an instance that ignores it would
+// hand back every host in the inventory and the first result would be an
+// unrelated machine. Callers that intend to delete must still check the
+// ownership marker on what they get.
+func (c *AWXClient) FindHost(ctx context.Context, inventoryID int, hostname string) (*hostResult, error) {
+	var lr listHostsResponse
+	listPath := fmt.Sprintf("%s/inventories/%d/hosts/?name=%s", c.basePath, inventoryID, url.QueryEscape(hostname))
+	if err := c.do(ctx, http.MethodGet, listPath, nil, &lr); err != nil {
+		return nil, fmt.Errorf("looking up host %q: %w", hostname, err)
+	}
+	return findHostByName(lr.Results, hostname), nil
 }
 
 // UpsertHost creates or updates a host named hostname in the given
@@ -421,13 +491,12 @@ func mergeHostVariables(existing string, ours map[string]string) (string, error)
 //   - unmarked (pre-existing, someone made it by hand) -> adopted:
 //     variables merged, description left alone, never deleted
 func (c *AWXClient) UpsertHost(ctx context.Context, inventoryID int, hostname, ownerMarker string, vars map[string]string) (id int, owned bool, err error) {
-	var lr listHostsResponse
-	listPath := fmt.Sprintf("%s/inventories/%d/hosts/?name=%s", c.basePath, inventoryID, url.QueryEscape(hostname))
-	if err := c.do(ctx, http.MethodGet, listPath, nil, &lr); err != nil {
-		return 0, false, fmt.Errorf("looking up host %q: %w", hostname, err)
+	existing, err := c.FindHost(ctx, inventoryID, hostname)
+	if err != nil {
+		return 0, false, err
 	}
 
-	if existing := findHostByName(lr.Results, hostname); existing != nil {
+	if existing != nil {
 		existingMarker := strings.TrimSpace(existing.Description)
 
 		if existingMarker != ownerMarker && strings.HasPrefix(existingMarker, hostMarkerPrefix) {
@@ -473,6 +542,103 @@ func (c *AWXClient) UpsertHost(ctx context.Context, inventoryID int, hostname, o
 	return createdHost.ID, true, nil
 }
 
+// SetHostVariables merges vars into an existing host's variables,
+// leaving the rest of them - and the ownership marker in the description
+// - alone. Nothing is created: a host that is not there is not an error
+// worth failing a teardown over.
+//
+// This is what pins a deprovision playbook to the control node.
+// ansible_connection: local makes the run execute where AWX is rather
+// than over SSH, and by the time a deprovision hook fires the guest is
+// destroyed and its address may already have been re-leased by IPAM to
+// somebody else's machine. A playbook that forgets delegate_to would
+// otherwise connect to whatever now answers on that address.
+func (c *AWXClient) SetHostVariables(ctx context.Context, host *hostResult, vars map[string]string) error {
+	if host == nil || len(vars) == 0 {
+		return nil
+	}
+	merged, err := mergeHostVariables(host.Variables, vars)
+	if err != nil {
+		return fmt.Errorf("updating variables on host %q: %w", host.Name, err)
+	}
+	if merged == strings.TrimSpace(host.Variables) {
+		return nil
+	}
+	body := map[string]interface{}{"variables": merged}
+	if err := c.do(ctx, http.MethodPatch, fmt.Sprintf("%s/hosts/%d/", c.basePath, host.ID), body, nil); err != nil {
+		return fmt.Errorf("updating variables on host %q: %w", host.Name, err)
+	}
+	host.Variables = merged
+	return nil
+}
+
+// HostVariable reads one variable off a host, reporting whether it was
+// set at all. An unparseable variables document is treated as unset:
+// nothing here is worth failing a teardown over, and SetHostVariables
+// refuses that document separately.
+func hostVariable(host *hostResult, key string) (string, bool) {
+	if host == nil {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(host.Variables)
+	if trimmed == "" || trimmed == "---" {
+		return "", false
+	}
+	var current map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &current); err != nil {
+		return "", false
+	}
+	v, ok := current[key]
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(string)
+	return s, ok
+}
+
+// RestoreHostVariable puts one variable back to what it was: prior nil
+// removes it, a prior value sets it.
+//
+// A merge cannot express removal, which is the whole reason this exists
+// - a deprovision hook pins ansible_connection on a host that may
+// outlive it, and leaving that pin behind would send the next
+// provisioning run to the AWX control node instead of the machine.
+func (c *AWXClient) RestoreHostVariable(ctx context.Context, host *hostResult, key string, prior *string) error {
+	if host == nil {
+		return nil
+	}
+	current := map[string]interface{}{}
+	if trimmed := strings.TrimSpace(host.Variables); trimmed != "" && trimmed != "---" {
+		if err := json.Unmarshal([]byte(trimmed), &current); err != nil {
+			return fmt.Errorf("restoring %s on host %q: existing variables are not a JSON object: %w", key, host.Name, err)
+		}
+		if current == nil {
+			current = map[string]interface{}{}
+		}
+	}
+	if prior == nil {
+		if _, present := current[key]; !present {
+			return nil
+		}
+		delete(current, key)
+	} else {
+		if existing, ok := current[key].(string); ok && existing == *prior {
+			return nil
+		}
+		current[key] = *prior
+	}
+	b, err := json.Marshal(current)
+	if err != nil {
+		return fmt.Errorf("restoring %s on host %q: %w", key, host.Name, err)
+	}
+	body := map[string]interface{}{"variables": string(b)}
+	if err := c.do(ctx, http.MethodPatch, fmt.Sprintf("%s/hosts/%d/", c.basePath, host.ID), body, nil); err != nil {
+		return fmt.Errorf("restoring %s on host %q: %w", key, host.Name, err)
+	}
+	host.Variables = string(b)
+	return nil
+}
+
 // DeleteHost removes a host by ID. A 404 is treated as success: the host
 // is already gone, which is the desired end state.
 func (c *AWXClient) DeleteHost(ctx context.Context, id int) error {
@@ -511,9 +677,28 @@ func launchBody(limit string, extraVars map[string]string) (map[string]interface
 }
 
 type launchResponse struct {
+	// AWX answers a launch with the job it created. Which field carries
+	// the id has varied - "job" on a job template, "workflow_job" on a
+	// workflow, and "id" on the job serializer itself - so all three are
+	// read and jobIDFrom picks whichever is present. An id that cannot be
+	// found is an error rather than a zero, because a launch that is not
+	// recorded is relaunched on the next pass, and the pass after that.
+	ID            int                        `json:"id"`
 	Job           int                        `json:"job"`
 	WorkflowJob   int                        `json:"workflow_job"`
 	IgnoredFields map[string]json.RawMessage `json:"ignored_fields"`
+}
+
+// jobIDFrom returns the launched job's id, preferring the field that
+// names the kind of job that was launched.
+func jobIDFrom(out launchResponse, preferred int) (int, error) {
+	for _, candidate := range []int{preferred, out.ID} {
+		if candidate != 0 {
+			return candidate, nil
+		}
+	}
+	return 0, fmt.Errorf("AWX accepted the launch but its response carried no job id, so the run cannot be tracked "+
+		"and would be launched again on the next pass: %w", errPermanentConfig)
 }
 
 // ignoredFieldsError reports fields AWX accepted the launch *without*.
@@ -546,7 +731,11 @@ func (c *AWXClient) LaunchJobTemplate(ctx context.Context, id int, limit string,
 	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("%s/job_templates/%d/launch/", c.basePath, id), body, &out); err != nil {
 		return 0, fmt.Errorf("launching job template %d: %w", id, err)
 	}
-	return out.Job, ignoredFieldsError(out.Job, out.IgnoredFields)
+	jobID, idErr := jobIDFrom(out, out.Job)
+	if idErr != nil {
+		return 0, fmt.Errorf("launching job template %d: %w", id, idErr)
+	}
+	return jobID, ignoredFieldsError(jobID, out.IgnoredFields)
 }
 
 // LaunchWorkflowJobTemplate launches a Workflow Template run, with the
@@ -560,7 +749,11 @@ func (c *AWXClient) LaunchWorkflowJobTemplate(ctx context.Context, id int, limit
 	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("%s/workflow_job_templates/%d/launch/", c.basePath, id), body, &out); err != nil {
 		return 0, fmt.Errorf("launching workflow job template %d: %w", id, err)
 	}
-	return out.WorkflowJob, ignoredFieldsError(out.WorkflowJob, out.IgnoredFields)
+	jobID, idErr := jobIDFrom(out, out.WorkflowJob)
+	if idErr != nil {
+		return 0, fmt.Errorf("launching workflow job template %d: %w", id, idErr)
+	}
+	return jobID, ignoredFieldsError(jobID, out.IgnoredFields)
 }
 
 type jobStatusResponse struct {

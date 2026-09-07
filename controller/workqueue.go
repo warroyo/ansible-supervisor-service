@@ -5,9 +5,8 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -16,6 +15,15 @@ import (
 // up again, so a permanently broken resource stops spinning without
 // being forgotten for good.
 const maxReconcileRetries = 10
+
+// reconcileTimeout bounds one pass over one resource. The AWX client's
+// timeout is per request, so without this a binding matching many VMs
+// can hold a worker for that timeout multiplied by the number of VMs -
+// and there are only numWorkers of them, shared by every resource in the
+// cluster. Cancelling mid-pass is safe: the reconcile returns an error
+// and is retried, and finalization is never abandoned either way.
+// Set at startup from --reconcile-timeout.
+var reconcileTimeout = 5 * time.Minute
 
 func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	// Get() blocks until an item is available.
@@ -54,22 +62,29 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	return true
 }
 
-// reconcileByKey re-fetches the object from the API before reconciling it,
-// rather than trusting the (possibly stale) object handed to the informer
-// callback, so reconciliation is level-triggered.
+// reconcileByKey reads the object from this kind's informer store and
+// reconciles whatever it currently says, rather than replaying whichever
+// event put the key on the queue. That is what makes the pass
+// level-triggered - not where the read comes from. The informer holds
+// every object of this kind already, kept current by watch, so fetching
+// each one again from the API server was a round trip per resource per
+// pass for a copy the process was handed anyway.
 func (c *Controller) reconcileByKey(ctx context.Context, key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return fmt.Errorf("invalid resource key: %s", key)
 	}
 
-	u, err := c.client.Resource(c.gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancel()
+
+	u, err := c.cachedGet(ctx, namespace, name)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			// Resource is gone; nothing left to reconcile.
-			return nil
-		}
 		return fmt.Errorf("failed to fetch resource %s: %w", key, err)
+	}
+	if u == nil {
+		// Resource is gone; nothing left to reconcile.
+		return nil
 	}
 
 	return c.Reconcile(ctx, u)
