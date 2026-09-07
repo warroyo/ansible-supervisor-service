@@ -1,0 +1,35 @@
+# The decommission run, applied by the teardown script - NOT by Argo.
+#
+# It has to execute while the VM is still up, which means before the
+# Application that owns the VM is deleted. Argo's PostDelete hook runs after
+# its resources are gone, so the guest is already destroyed by then. Newer
+# Argo CD documents a PreDelete hook that would fire early enough; this repo
+# neither pins a version for it nor tests it, so this is the form that works
+# on every version.
+#
+# metadata.name carries a timestamp, filled in by teardown.sh. A fresh name
+# is a fresh object, which is a fresh execution: a decommission left over
+# from a previous attempt must never be mistaken for this one's success.
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  name: decommission-web-1-TIMESTAMP
+  namespace: my-namespace
+spec:
+  awxConnectionRef: awx
+  template:
+    name: "Decommission Guest"
+    type: JobTemplate
+  # The guest is still running, so this targets it properly: the run resolves
+  # the inventory host the binding manages and scopes the job to it. No
+  # address, no hostVariables - the host already has everything it needs, and
+  # a run does not write to a host it did not create.
+  vmRef:
+    name: web-1
+  extraVars:
+    drain_timeout: "300"
+    take_final_backup: "true"
+  # The whole point is that this finishes before the VM is destroyed, so it
+  # must reach an end state on its own. On expiry the AWX job is canceled and
+  # the run goes Failed, which is what stops the script.
+  activeDeadlineSeconds: 1800

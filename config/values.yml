@@ -30,3 +30,23 @@ log_level: "info"
 #! instance can be shared by several supervisors without them fighting over
 #! host entries. leave empty to derive it from the kube-system namespace UID.
 supervisor_id: ""
+#! the exact resources an AnsibleRun's spec.varsFrom may read fields from,
+#! each written "<group>/<plural resource>" with "core" meaning the core group.
+#! this both grants the controller RBAC and gates what it will read, so the two
+#! can never drift apart.
+#!
+#! nothing here is ever a wildcard. `resources: ["*"]` on the core group is
+#! refused outright by a Supervisor's own admission policy
+#! (appplatform-clusterrole-policy) and the install fails rather than
+#! degrading - but the reason to name resources one by one is the same for
+#! every group: the controller reads with its own identity, not the requesting
+#! user's, so a wildcard makes anything of any kind in the AnsibleRun's
+#! namespace readable by anyone who can create an AnsibleRun there. Listing
+#! the kinds is what keeps that blast radius the size of this list.
+#!
+#! Secrets are refused in code whatever this says. widen it deliberately.
+#! the single item below only declares the element type; the real default is
+#! the annotation, because in a ytt schema an array's default is always empty.
+#@schema/default ["core/configmaps", "vmoperator.vmware.com/virtualmachines"]
+vars_from_resources:
+  - ""

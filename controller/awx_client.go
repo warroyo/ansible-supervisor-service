@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -234,6 +235,37 @@ func DetectAPIBasePath(ctx context.Context, baseURL string, opts TLSOptions) (st
 		trimmed, strings.Join(attempts, ", "))
 }
 
+// awxStatusError is a non-2xx answer from AWX, carrying the status code
+// rather than only its rendering.
+//
+// The distinction it exists for is a launch that failed. AWX answering
+// 400 or 403 means it refused the request and started nothing, so
+// retrying is safe. A 5xx, or a connection that dropped before any
+// answer arrived, means nothing of the kind: AWX may have created the
+// job and lost the reply on the way back, and a caller that treats the
+// two alike runs a playbook twice.
+type awxStatusError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Body       string
+}
+
+func (e *awxStatusError) Error() string {
+	return fmt.Sprintf("awx request %s %s: status %d: %s", e.Method, e.Path, e.StatusCode, truncate(e.Body, maxErrorBodyChars))
+}
+
+// awxStatusCode returns the HTTP status AWX answered with, and whether
+// it answered at all. A transport error has no status, which is exactly
+// the case a caller must not read as a refusal.
+func awxStatusCode(err error) (int, bool) {
+	var se *awxStatusError
+	if errors.As(err, &se) {
+		return se.StatusCode, true
+	}
+	return 0, false
+}
+
 func (c *AWXClient) do(ctx context.Context, method, path string, body, out interface{}) error {
 	var reader io.Reader
 	if body != nil {
@@ -260,7 +292,7 @@ func (c *AWXClient) do(ctx context.Context, method, path string, body, out inter
 
 	respBody := readCappedBody(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("awx request %s %s: status %d: %s", method, path, resp.StatusCode, truncate(string(respBody), maxErrorBodyChars))
+		return &awxStatusError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 	if out != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, out); err != nil {
@@ -639,6 +671,27 @@ func (c *AWXClient) RestoreHostVariable(ctx context.Context, host *hostResult, k
 	return nil
 }
 
+// GetHostByID reads one host by id, reporting nil when it is no longer
+// there.
+//
+// It is what a cleanup checks before deleting an id it recorded earlier.
+// AWX assigns host ids from a sequence and a deleted id is not handed
+// out again, but the host behind a recorded id can still have been
+// deleted and rebuilt by hand, or be a host this controller never owned
+// if the record itself is wrong. Reading the description back is the
+// only way to be sure the thing about to be deleted is the thing that
+// was created.
+func (c *AWXClient) GetHostByID(ctx context.Context, id int) (*hostResult, error) {
+	var h hostResult
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("%s/hosts/%d/", c.basePath, id), nil, &h); err != nil {
+		if code, answered := awxStatusCode(err); answered && code == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading host %d: %w", id, err)
+	}
+	return &h, nil
+}
+
 // DeleteHost removes a host by ID. A 404 is treated as success: the host
 // is already gone, which is the desired end state.
 func (c *AWXClient) DeleteHost(ctx context.Context, id int) error {
@@ -764,7 +817,7 @@ type jobStatusResponse struct {
 // "running", "successful", "failed").
 func (c *AWXClient) GetJobStatus(ctx context.Context, id int) (string, error) {
 	var out jobStatusResponse
-	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("%s/jobs/%d/", c.basePath, id), nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, jobResourcePath(c.basePath, id, false), nil, &out); err != nil {
 		return "", fmt.Errorf("getting job %d status: %w", id, err)
 	}
 	return out.Status, nil
@@ -773,10 +826,93 @@ func (c *AWXClient) GetJobStatus(ctx context.Context, id int) (string, error) {
 // GetWorkflowJobStatus is GetJobStatus for workflow job runs.
 func (c *AWXClient) GetWorkflowJobStatus(ctx context.Context, id int) (string, error) {
 	var out jobStatusResponse
-	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("%s/workflow_jobs/%d/", c.basePath, id), nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, jobResourcePath(c.basePath, id, true), nil, &out); err != nil {
 		return "", fmt.Errorf("getting workflow job %d status: %w", id, err)
 	}
 	return out.Status, nil
+}
+
+// jobResourcePath is where one launched job lives. A job and a workflow
+// job are different objects, and the same number names a different one
+// under each.
+func jobResourcePath(basePath string, id int, isWorkflow bool) string {
+	if isWorkflow {
+		return fmt.Sprintf("%s/workflow_jobs/%d/", basePath, id)
+	}
+	return fmt.Sprintf("%s/jobs/%d/", basePath, id)
+}
+
+// CancelJob asks AWX to stop a job, the way deleting a Kubernetes Job
+// stops the pods it made.
+//
+// A job that cannot be canceled is not a failure: AWX answers 405 once
+// a job has reached a terminal status and 404 once it has been deleted
+// outright, and both mean the thing this call exists to bring about -
+// that the job is not still running - is already true.
+func (c *AWXClient) CancelJob(ctx context.Context, id int, isWorkflow bool) error {
+	err := c.do(ctx, http.MethodPost, jobResourcePath(c.basePath, id, isWorkflow)+"cancel/", map[string]interface{}{}, nil)
+	if code, answered := awxStatusCode(err); answered && (code == http.StatusNotFound || code == http.StatusMethodNotAllowed) {
+		return nil
+	}
+	return err
+}
+
+// AWXJob is one job a template produced, as the recent-jobs list reports
+// it. Limit is what the job actually ran with, which is what makes a
+// job attributable to a launch whose answer was lost.
+type AWXJob struct {
+	ID      int
+	Created time.Time
+	Limit   string
+	Status  string
+}
+
+type jobListResult struct {
+	ID      int    `json:"id"`
+	Created string `json:"created"`
+	Limit   string `json:"limit"`
+	Status  string `json:"status"`
+}
+
+type listJobsResponse struct {
+	Results []jobListResult `json:"results"`
+}
+
+// recentJobsPageSize bounds the recent-jobs read. It only ever has to
+// cover the jobs one template produced in the seconds around a single
+// lost launch, so a page is generous and a second one would be looking
+// far further back than the window can reach.
+const recentJobsPageSize = 50
+
+// RecentTemplateJobs lists the jobs a template most recently produced,
+// newest first.
+//
+// This is how a launch whose answer never arrived is recovered. AWX has
+// no idempotency key to launch with, so the job cannot be tagged on the
+// way out and has to be recognised on the way back: by the template that
+// made it, when it was made, and the limit it ran with.
+func (c *AWXClient) RecentTemplateJobs(ctx context.Context, templateID int, isWorkflow bool) ([]AWXJob, error) {
+	path := fmt.Sprintf("%s/job_templates/%d/jobs/", c.basePath, templateID)
+	if isWorkflow {
+		path = fmt.Sprintf("%s/workflow_job_templates/%d/workflow_jobs/", c.basePath, templateID)
+	}
+	var out listJobsResponse
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("%s?order_by=-created&page_size=%d", path, recentJobsPageSize), nil, &out); err != nil {
+		return nil, fmt.Errorf("listing recent jobs for template %d: %w", templateID, err)
+	}
+	jobs := make([]AWXJob, 0, len(out.Results))
+	for _, r := range out.Results {
+		job := AWXJob{ID: r.ID, Limit: r.Limit, Status: r.Status}
+		// A job whose timestamp will not parse is kept with a zero
+		// Created rather than dropped: the caller's window check then
+		// excludes it, which is the safe direction - it can refuse to
+		// adopt, never adopt the wrong job.
+		if t, err := time.Parse(time.RFC3339, r.Created); err == nil {
+			job.Created = t
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, nil
 }
 
 // JobURL builds a link to the run's output in the AWX UI. The exact path

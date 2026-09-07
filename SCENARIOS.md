@@ -6,7 +6,10 @@ What actually happens, step by step, when something changes. The [README](README
 - [Creates](#creates)
 - [Updates](#updates)
 - [Deletes](#deletes)
+- [One-off runs](#one-off-runs)
 - [How long each of these takes](#how-long-each-of-these-takes)
+
+Everything from [Creates](#creates) to [Deletes](#deletes) is about an `AnsibleBinding` - standing state that fans out and re-runs. [One-off runs](#one-off-runs) is the other model, `AnsibleRun`, where the whole life of the object is one AWX job.
 
 ## The cast
 
@@ -15,6 +18,7 @@ What actually happens, step by step, when something changes. The [README](README
 | `AWXConnection` | you | where AWX lives, and the `Secret` holding its API token |
 | `AnsibleBinding` | you | a `vmSelector` and the template to launch |
 | `AnsibleBindingVM` | the controller | one matched VM's AWX inventory host and its run |
+| `AnsibleRun` | you | one execution: its own AWX job and whatever inventory hosts it made for it |
 
 Two facts explain most of the behavior below.
 
@@ -181,6 +185,72 @@ Before deleting anything, the candidate list is re-checked against a **fresh lis
 
 The sweep is skipped entirely on any pass that still has child writes outstanding, or that hit an error - the children that would claim those hosts do not exist yet.
 
+## One-off runs
+
+An `AnsibleRun` is not standing state. It launches one AWX job, follows it to a terminal status, and is then over - the spec is immutable and the re-run annotation is ignored, so nothing restarts it. Everything below is about that "once".
+
+### A run is created
+
+The controller resolves the `AWXConnection` and the template, gathers `spec.extraVars` and whatever `spec.varsFrom` reads off live objects, resolves an inventory host for each target (`spec.vmRef`, or each entry in `spec.hosts`, or none at all), writes `status.launchAttemptedAt`, and launches - scoped with `--limit` to the hosts it targeted, or unscoped if it targets none. `state` goes `Pending` → `Running` → `Ready`, or `Failed`.
+
+Resolving a target is not the same as owning it. A host that is already in the inventory is used exactly as it stands; only one that is not there is created, and only a created host is ever written to or deleted. The attempt marker is written with the resourceVersion the pass read, so a stale copy of the run cannot authorize a second launch.
+
+### The host a run targets already exists
+
+Used, not claimed - whoever it belongs to keeps it. Its variables, address, groups and ownership marker are untouched, `status.hosts[].awxHostCreated` records that this run did not create it, and cleanup leaves it alone. This is what lets a one-off run execute against a host an `AnsibleBindingVM` manages without the two contesting it.
+
+Host-level fields for such a host - `spec.hosts[].address`, `spec.hosts[].variables`, `spec.hostVariables` - are refused before anything launches, because the run cannot apply them and running the playbook as though it had would be worse. Per-execution values go in `spec.extraVars`/`spec.varsFrom`, which AWX passes as the job's `extra_vars`; Ansible ranks those above inventory variables, so they apply to that job and nothing else.
+
+### A `varsFrom` object, or a `vmRef` VM, has not appeared yet
+
+Retried, not failed. An orchestrator may well create the run before the object it names has settled, and the same applies to a field that exists but is empty - a `VirtualMachine` whose guest has not reported an address yet is the usual one. The run stays `Pending` with the reason in `status.message`. `spec.activeDeadlineSeconds` is what bounds the wait; without one it waits indefinitely.
+
+A `varsFrom` path that resolves to a list or an object is a different matter: that is a fact about an immutable spec, and it fails the run.
+
+### AWX is unreachable, or answers 5xx
+
+Retried. That includes the template lookup: a template that cannot be resolved *right now* is an outage, and only one that is genuinely absent or ambiguous ends the run.
+
+### The launch is sent and the answer never arrives
+
+The run does not launch again, on the strength of not knowing or of anything else. It reads the template's recent jobs in AWX and matches on the `--limit` each ran with, among those AWX created at or after `launchAttemptedAt`:
+
+- one match - that job is this run's, and it is adopted: its id, URL and status are recorded and polling carries on from there.
+- no match, after AWX has had a minute to show one - the run ends `Failed`, saying when the launch was sent and what to check in AWX. Not finding a job is not proof that none ran: a trimmed job list, a restricted view, or an AWX whose clock disagrees all read the same way, and a second decommission is worse than a run that has to be looked at.
+- more than one match - the run fails rather than guessing, naming the candidates.
+
+AWX refusing the launch outright with a 4xx needs none of that: nothing was created, so the run simply retries.
+
+### The AWX job fails
+
+Terminal. The controller did its job - AWX ran the playbook and the playbook failed - so `state: Failed` with a link to the job's output, and no retry. `finishedAt` is stamped either way, which is what a TTL counts from.
+
+### `activeDeadlineSeconds` expires
+
+The AWX job is **canceled**, then the run goes terminally `Failed`, the way a Kubernetes Job terminates its pods when its own deadline expires. If AWX cannot be reached to cancel it, the run still finishes - that is what the deadline is for - and `status.failureReason` says the job may still be running.
+
+### You repoint the `AWXConnection` while a run is in flight
+
+The run ends with an explanation. Every id it recorded - the job, the hosts - was issued by the old instance and means something else entirely on the new one, and unlike a binding there is no next run to rediscover anything for. Its cleanup will not delete hosts there either. Create a new `AnsibleRun` for the new instance.
+
+### You delete the run
+
+Its finalizer cancels the AWX job if one is still running, **waits for AWX to confirm it stopped**, and only then deletes the inventory hosts the run created. Hosts that were already there are never deleted. `cleanupPolicy: Retain` keeps the created hosts too - but it does not leave the job running, which is not what the policy is about.
+
+The wait matters because AWX answers a cancel with `202 Accepted`: it has taken the request, not stopped the playbook. Deleting the inventory entry a job is running against on the strength of that answer races the work being torn down. `status.cancelRequestedAt` records when the request was accepted, and bounds the wait - a job that has still not reached a terminal status well past that is reported and the run released, rather than wedging the object forever.
+
+A cancel that *fails* holds both the finalizer and the hosts: nothing destructive happens in a pass that could not stop the job.
+
+If the run's launch answer was never recorded, cleanup takes one last look for the job it may have started, under the same matching rules the reconcile path uses, and cancels it if it can be identified. If it cannot, that is logged with the template to check - there is no later state in which it resolves itself, so the run is released rather than wedged.
+
+### `ttlSecondsAfterFinished` elapses
+
+The controller deletes the CR itself, which runs the same finalizer and takes its AWX hosts with it. Granularity is `resync_period`, which is ample for a garbage collector.
+
+### A run and a binding in one namespace share a name
+
+They do not contest the same AWX host. The ownership marker a run writes carries its kind, so the two markers differ. A binding refuses to touch a host marked as a run's; a run does not need to touch a binding's at all - it executes against it and writes nothing.
+
 ## How long each of these takes
 
 | Event | Latency |
@@ -191,5 +261,7 @@ The sweep is skipped entirely on any pass that still has child writes outstandin
 | A VM is deleted, its child is deleted | immediate (garbage collector) |
 | A host deleted or hand-edited in AWX is repaired | up to `host_check_period` (600s) |
 | A leaked host is reaped | up to four host-check periods (2400s) |
+| An `AnsibleRun` is created, or its job's status changes | immediate (watch), then polled each `resync_period` |
+| A finished `AnsibleRun` is collected after its TTL | up to `resync_period` past the TTL |
 
 In a steady state that is one AWX request per VM per host-check period, plus one per binding per sweep. Everything else in an idle pass is served from the informer caches this process already maintains.

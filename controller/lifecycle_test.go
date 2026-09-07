@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,8 +35,12 @@ type reconcileFixture struct {
 	rejectStatus   bool
 	loseHostResult bool
 	failHostSync   bool
-	jobStatus      string
-	launches       int
+	// failHostNamed makes every inventory lookup for one host name
+	// answer 503, so a run targeting several hosts can be made to fail
+	// part-way through with the earlier ones already created.
+	failHostNamed string
+	jobStatus     string
+	launches      int
 
 	// Deprovision-hook plumbing: which flags the hook template reports,
 	// what each launch actually asked AWX for, per-job statuses, the
@@ -53,6 +58,37 @@ type reconcileFixture struct {
 	jobStatusByID map[int]string
 	events        []map[string]interface{}
 	parent        *unstructured.Unstructured
+
+	// AnsibleRun plumbing. runs is the API server's copy of each run,
+	// canceled records which job ids were canceled, and templateJobs is
+	// what AWX reports a template has recently produced - the list a
+	// launch whose answer was lost is recovered from.
+	runs         map[string]*unstructured.Unstructured
+	canceled     map[int]bool
+	templateJobs []map[string]interface{}
+	// templateFail makes every template lookup answer 503, the way an
+	// AWX behind a briefly unhappy load balancer does; templateMissing
+	// makes it answer an empty list, the way one does for a name that is
+	// not there.
+	templateFail    bool
+	templateMissing bool
+	// launchStatus makes AWX refuse a launch with that HTTP status, and
+	// launchGhost makes it start the job anyway and lose the answer on
+	// the way back - the window that decides whether a run may launch
+	// again.
+	launchStatus int
+	launchGhost  bool
+	// cancelHangs makes a canceled job keep reporting the status it had,
+	// the way one wedged in AWX does - so a finalization that waits for
+	// confirmation can be observed waiting.
+	cancelHangs bool
+	// cancelStatus makes AWX refuse a cancel with that HTTP status.
+	cancelStatus int
+	// bumpRunRV names a run whose stored resourceVersion is moved on
+	// once, during a template lookup - after a pass has read the run and
+	// before it claims the launch, which is the window the claim's
+	// precondition exists to close.
+	bumpRunRV string
 }
 
 // launchRecord is one AWX launch as the fixture saw it, so a test can
@@ -90,7 +126,8 @@ func fixtureVM(name, uid string) unstructured.Unstructured {
 func newReconcileFixture(t *testing.T) *reconcileFixture {
 	t.Helper()
 	f := &reconcileFixture{children: map[string]*unstructured.Unstructured{}, hosts: newHostStore(), jobStatus: "running",
-		hookAskLimit: true, hookAskVars: true, hookInventory: 1, jobStatusByID: map[int]string{}}
+		hookAskLimit: true, hookAskVars: true, hookInventory: 1, jobStatusByID: map[int]string{},
+		runs: map[string]*unstructured.Unstructured{}, canceled: map[int]bool{}}
 	f.vms = []unstructured.Unstructured{fixtureVM("web-1", "vm-1")}
 	awx := httptest.NewServer(http.HandlerFunc(f.serveAWX))
 	t.Cleanup(awx.Close)
@@ -147,7 +184,36 @@ func (f *reconcileFixture) serveAWX(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.Contains(r.URL.Path, "/inventories/") && f.failHostSync:
 		http.Error(w, "temporary host-sync failure", http.StatusServiceUnavailable)
+	case f.failHostNamed != "" && strings.Contains(r.URL.Path, "/inventories/") &&
+		r.URL.Query().Get("name") == f.failHostNamed:
+		http.Error(w, "temporary host-sync failure", http.StatusServiceUnavailable)
+	case strings.HasSuffix(r.URL.Path, "/cancel/"):
+		if f.cancelStatus != 0 {
+			http.Error(w, "the cancel did not go through", f.cancelStatus)
+			return
+		}
+		var id int
+		trimmed := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, APIBasePathLegacy), "/workflow")
+		_, _ = fmt.Sscanf(trimmed, "/jobs/%d/cancel/", &id)
+		f.canceled[id] = true
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+	case strings.HasSuffix(r.URL.Path, "/jobs/") || strings.HasSuffix(r.URL.Path, "/workflow_jobs/"):
+		// A template's own recent-jobs sublist, which is how a launch
+		// whose answer was lost is recovered.
+		results := f.templateJobs
+		if results == nil {
+			results = []map[string]interface{}{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"count": len(results), "results": results})
 	case strings.HasSuffix(r.URL.Path, "/job_templates/") || strings.HasSuffix(r.URL.Path, "/workflow_job_templates/"):
+		if f.templateFail {
+			http.Error(w, "temporary template-lookup failure", http.StatusServiceUnavailable)
+			return
+		}
+		if f.templateMissing {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"count": 0, "results": []interface{}{}})
+			return
+		}
 		// Echo whichever template was asked for: the client refuses a
 		// result whose name does not match, and a hook names a different
 		// template from the provisioning run.
@@ -168,6 +234,12 @@ func (f *reconcileFixture) serveAWX(w http.ResponseWriter, r *http.Request) {
 		if inventory < 0 {
 			delete(result, "inventory")
 		}
+		if f.bumpRunRV != "" {
+			if stored := f.runs[f.bumpRunRV]; stored != nil {
+				stored.SetResourceVersion(stored.GetResourceVersion() + "9")
+			}
+			f.bumpRunRV = ""
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"count": 1, "results": []interface{}{result}})
 	case strings.HasSuffix(r.URL.Path, "/launch/"):
 		rec := launchRecord{workflow: strings.Contains(r.URL.Path, "/workflow_job_templates/")}
@@ -186,6 +258,19 @@ func (f *reconcileFixture) serveAWX(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal([]byte(raw), &rec.extraVars)
 		}
 		id := 42 + f.launches
+		if f.launchStatus != 0 {
+			if f.launchGhost {
+				// AWX made the job and then lost the answer on the way
+				// back: the one case a controller must not read as
+				// "nothing started".
+				f.launches++
+				f.launched = append(f.launched, rec)
+				f.templateJobs = append(f.templateJobs, map[string]interface{}{
+					"id": id, "created": time.Now().UTC().Format(time.RFC3339), "limit": rec.limit, "status": "running"})
+			}
+			http.Error(w, "the launch did not complete", f.launchStatus)
+			return
+		}
 		f.launches++
 		f.launched = append(f.launched, rec)
 		response := map[string]interface{}{"id": id}
@@ -200,6 +285,14 @@ func (f *reconcileFixture) serveAWX(w http.ResponseWriter, r *http.Request) {
 		status := f.jobStatus
 		if byID, ok := f.jobStatusByID[id]; ok {
 			status = byID
+		}
+		// A cancel is accepted, not applied: AWX answers 202 and the job
+		// reaches a terminal status a moment later. The fixture models
+		// that gap, so nothing under test may assume the cancel response
+		// itself stopped the job. cancelHangs is the job that never
+		// stops.
+		if f.canceled[id] && !f.cancelHangs {
+			status = "canceled"
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": status})
 	case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/hosts/"):
@@ -254,6 +347,13 @@ func (f *reconcileFixture) serveKube(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			reply(f.parent.Object)
+		case strings.Contains(r.URL.Path, "/ansibleruns/"):
+			name := strings.TrimPrefix(r.URL.Path[strings.Index(r.URL.Path, "/ansibleruns/"):], "/ansibleruns/")
+			if run := f.runs[strings.Split(name, "/")[0]]; run != nil {
+				reply(run.Object)
+				return
+			}
+			fail(404, "NotFound")
 		case strings.Contains(r.URL.Path, "/ansiblebindingvms/"):
 			name := strings.TrimPrefix(r.URL.Path[strings.Index(r.URL.Path, "/ansiblebindingvms/"):], "/ansiblebindingvms/")
 			if child := f.children[name]; child != nil {
@@ -276,6 +376,57 @@ func (f *reconcileFixture) serveKube(w http.ResponseWriter, r *http.Request) {
 		var body map[string]interface{}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		reply(body)
+		return
+	}
+	if strings.Contains(r.URL.Path, "/ansibleruns/") {
+		name := strings.Split(strings.TrimPrefix(r.URL.Path[strings.Index(r.URL.Path, "/ansibleruns/"):], "/ansibleruns/"), "/")[0]
+		u := f.runs[name]
+		if u == nil {
+			fail(404, "NotFound")
+			return
+		}
+		switch {
+		case r.Method == http.MethodDelete:
+			delete(f.runs, name)
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			var body map[string]interface{}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if f.rejectStatus {
+				fail(500, "InternalError")
+				return
+			}
+			// A PUT carries the resourceVersion the writer read, and the
+			// API server refuses it if the object has moved on since.
+			// That is the whole mechanism the launch claim rests on, so
+			// the fixture has to enforce it rather than accept anything.
+			if r.Method == http.MethodPut {
+				sent := &unstructured.Unstructured{Object: body}
+				if sent.GetResourceVersion() != u.GetResourceVersion() {
+					fail(409, "Conflict")
+					return
+				}
+			}
+			// The run controller's field manager owns the detail half of
+			// status and applies it whole, exactly as this replaces it;
+			// the generic four the engine owns are carried across.
+			merged := map[string]interface{}{}
+			if existing, found, _ := unstructured.NestedMap(u.Object, "status"); found {
+				for _, generic := range []string{"state", "message", "ready", "lastUpdated"} {
+					if v, ok := existing[generic]; ok {
+						merged[generic] = v
+					}
+				}
+			}
+			for k, v := range body["status"].(map[string]interface{}) {
+				merged[k] = v
+			}
+			u.Object["status"] = merged
+		default:
+			fail(405, "MethodNotAllowed")
+			return
+		}
+		u.SetResourceVersion(u.GetResourceVersion() + "1")
+		reply(u.Object)
 		return
 	}
 	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/events") {

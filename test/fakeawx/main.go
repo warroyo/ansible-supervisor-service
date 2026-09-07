@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type templateRec struct {
@@ -46,6 +47,22 @@ type jobRec struct {
 	// the one where the playbook is running and the inventory host it
 	// targets must still exist.
 	Held bool
+	// Canceled records that the job was stopped through the cancel
+	// endpoint, which is what an AnsibleRun does to a job its deadline
+	// outlived or its deletion left running.
+	Canceled bool
+	// CancelHangs makes a canceled job keep reporting the status it had.
+	// AWX answers a cancel with 202 Accepted and the job stops a moment
+	// later, so "asked to stop" and "stopped" are two states; this is the
+	// job that never reaches the second one, which is what a finalizer
+	// waiting for confirmation has to be bounded against.
+	// POST /_test/hang-cancel?id=N sets it.
+	CancelHangs bool
+	// TemplateID and Limit are what the recent-jobs sublist reports, so
+	// a launch whose answer was lost can be recognised there.
+	TemplateID int
+	Limit      string
+	Created    time.Time
 }
 
 // launchRec is one launch as it arrived, kept so the e2e suite can
@@ -300,8 +317,9 @@ func (s *server) handleLaunch(list []templateRec, workflow bool) func(http.Respo
 
 		id := s.nextJobID
 		s.nextJobID++
-		s.jobs[id] = &jobRec{ID: id, Workflow: workflow, Held: s.holdTemplate != 0 && templateID == s.holdTemplate}
 		limit, _ := body["limit"].(string)
+		s.jobs[id] = &jobRec{ID: id, Workflow: workflow, Held: s.holdTemplate != 0 && templateID == s.holdTemplate,
+			TemplateID: templateID, Limit: limit, Created: time.Now().UTC()}
 		extraVars, _ := body["extra_vars"].(string)
 		s.launches = append(s.launches, launchRec{JobID: id, TemplateID: templateID, Workflow: workflow, Limit: limit, ExtraVars: extraVars})
 		log.Printf("fakeawx: launched job %d (template=%d workflow=%v limit=%v ignored=%v)", id, templateID, workflow, body["limit"], ignored)
@@ -331,12 +349,77 @@ func (s *server) handleJobStatus(w http.ResponseWriter, r *http.Request, id int)
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	j.Polls++
-	status := "running"
-	if j.Polls >= 2 && !j.Held {
-		status = "successful"
+	writeJSON(w, 200, map[string]interface{}{"id": id, "status": s.jobStatus(j)})
+}
+
+// jobStatus is what a job reports now: "running" on the first poll and
+// "successful" from the second on, so both the in-flight-poll and the
+// terminal reconcile paths are exercised without real async execution -
+// unless it was canceled, which is terminal whatever the poll count.
+func (s *server) jobStatus(j *jobRec) string {
+	if j.Canceled && !j.CancelHangs {
+		return "canceled"
 	}
-	writeJSON(w, 200, map[string]interface{}{"id": id, "status": status})
+	j.Polls++
+	if j.Polls >= 2 && !j.Held {
+		return "successful"
+	}
+	return "running"
+}
+
+// handleCancel is AWX's cancel endpoint. A job that has already finished
+// answers 405 there, exactly as AWX does, so the controller's treatment
+// of "cannot be canceled" as "already not running" is exercised.
+func (s *server) handleCancel(w http.ResponseWriter, r *http.Request, id int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	j, ok := s.jobs[id]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, 200, map[string]interface{}{"can_cancel": !j.Canceled})
+		return
+	}
+	if j.Canceled || (j.Polls >= 2 && !j.Held) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	j.Canceled = true
+	log.Printf("fakeawx: canceled job %d", id)
+	writeJSON(w, 202, map[string]interface{}{})
+}
+
+// handleTemplateJobs is a template's own recent-jobs sublist, newest
+// first - what the controller reads to find the job a launch whose
+// answer never arrived may have started.
+func (s *server) handleTemplateJobs(w http.ResponseWriter, r *http.Request, templateID int, workflow bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := make([]int, 0, len(s.jobs))
+	for id := range s.jobs {
+		ids = append(ids, id)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(ids)))
+
+	results := []map[string]interface{}{}
+	for _, id := range ids {
+		j := s.jobs[id]
+		if j.TemplateID != templateID || j.Workflow != workflow {
+			continue
+		}
+		status := "running"
+		if j.Canceled {
+			status = "canceled"
+		}
+		results = append(results, map[string]interface{}{
+			"id": j.ID, "created": j.Created.Format(time.RFC3339), "limit": j.Limit, "status": status,
+		})
+	}
+	writeJSON(w, 200, map[string]interface{}{"count": len(results), "results": results})
 }
 
 // /_test/hosts lets the e2e script inspect and seed inventory state
@@ -419,6 +502,7 @@ func (s *server) handleTestFinishJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j.Held = false
+	j.CancelHangs = false
 	j.Polls = 2
 	log.Printf("fakeawx: released held job %d", id)
 	writeJSON(w, 200, map[string]interface{}{"id": id, "status": "successful"})
@@ -442,6 +526,42 @@ func (s *server) handleTestDeletedHosts(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	writeJSON(w, 200, deleted)
+}
+
+// /_test/hang-cancel?id=N makes a job accept a cancel without ever
+// reaching a terminal status, the way one wedged in AWX does.
+func (s *server) handleTestHangCancel(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.URL.Query().Get("id"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[id]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	j.CancelHangs = true
+	log.Printf("fakeawx: job %d will not confirm a cancel", id)
+	writeJSON(w, 200, map[string]interface{}{"id": id})
+}
+
+// /_test/canceled-jobs lists the jobs that were stopped through the
+// cancel endpoint, so the e2e suite can assert that a run which expired
+// or was deleted did not leave its playbook executing.
+func (s *server) handleTestCanceledJobs(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	canceled := []int{}
+	for id, j := range s.jobs {
+		if j.Canceled {
+			canceled = append(canceled, id)
+		}
+	}
+	sort.Ints(canceled)
+	writeJSON(w, 200, canceled)
 }
 
 // pathID pulls the numeric id out of "/api/v2/<collection>/<id>/<rest>".
@@ -473,6 +593,12 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/_test/finish-job":
 		s.handleTestFinishJob(w, r)
+		return
+	case "/_test/canceled-jobs":
+		s.handleTestCanceledJobs(w, r)
+		return
+	case "/_test/hang-cancel":
+		s.handleTestHangCancel(w, r)
 		return
 	}
 
@@ -520,6 +646,34 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleHost(w, r, id)
+	case strings.HasPrefix(path, "/job_templates/") && strings.HasSuffix(path, "/jobs/"):
+		id, ok := pathID(path, "/job_templates/", "/jobs/")
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.handleTemplateJobs(w, r, id, false)
+	case strings.HasPrefix(path, "/workflow_job_templates/") && strings.HasSuffix(path, "/workflow_jobs/"):
+		id, ok := pathID(path, "/workflow_job_templates/", "/workflow_jobs/")
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.handleTemplateJobs(w, r, id, true)
+	case strings.HasPrefix(path, "/jobs/") && strings.HasSuffix(path, "/cancel/"):
+		id, ok := pathID(path, "/jobs/", "/cancel/")
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.handleCancel(w, r, id)
+	case strings.HasPrefix(path, "/workflow_jobs/") && strings.HasSuffix(path, "/cancel/"):
+		id, ok := pathID(path, "/workflow_jobs/", "/cancel/")
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.handleCancel(w, r, id)
 	case strings.HasPrefix(path, "/jobs/"):
 		id, ok := pathID(path, "/jobs/", "/")
 		if !ok {

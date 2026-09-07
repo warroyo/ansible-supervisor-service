@@ -1,0 +1,96 @@
+# Health checks for the CRDs this service installs, plus the VirtualMachine
+# a sync wave usually has to wait for.
+#
+# Argo CD has a built-in health check for batch/v1 Job and none for custom
+# resources: an unknown CR is Healthy the moment it is created. Without this
+# ConfigMap a sync wave will not wait for a playbook, a PostSync hook will
+# not gate on one, and the application goes green while the job is still
+# queued in AWX.
+#
+# Applied to the Argo CD installation, not to a tenant namespace - argocd-cm
+# lives in Argo's own namespace, so a tenant cannot install this themselves.
+#
+#   kubectl apply -f argocd-cm.yml     # or merge it into your existing one
+#   kubectl -n argocd rollout restart deploy/argocd-server
+#
+# The state machine these read is documented under CRD status in README.md.
+# It lines up with Argo's health model exactly: Failed is reserved for a
+# terminal outcome, and a run still retrying a transient problem stays
+# Pending or Running with the reason in status.message. That is the
+# difference between Degraded and Progressing, already made for you.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+data:
+  resource.customizations.health.field.vmware.com_AnsibleRun: |
+    local hs = {}
+    if obj.status == nil or obj.status.state == nil then
+      hs.status = "Progressing"
+      hs.message = "Waiting for the controller"
+      return hs
+    end
+    hs.message = obj.status.message or obj.status.state
+    if obj.status.state == "Ready" then
+      hs.status = "Healthy"
+    elseif obj.status.state == "Failed" then
+      -- Terminal only: an AnsibleRun that is still retrying reports
+      -- Pending or Running, so this really does mean the run is over.
+      hs.status = "Degraded"
+    else
+      hs.status = "Progressing"
+    end
+    return hs
+
+  resource.customizations.health.field.vmware.com_AnsibleBinding: |
+    local hs = {}
+    if obj.status == nil or obj.status.state == nil then
+      hs.status = "Progressing"
+      hs.message = "Waiting for the controller"
+      return hs
+    end
+    hs.message = obj.status.message or obj.status.state
+    if obj.status.state == "Ready" then
+      hs.status = "Healthy"
+    elseif obj.status.state == "Failed" then
+      hs.status = "Degraded"
+    else
+      -- Pending is normal and can persist: no VM matches the selector
+      -- yet, or a matched VM is powered off. It is not a failure.
+      hs.status = "Progressing"
+    end
+    return hs
+
+  resource.customizations.health.field.vmware.com_AWXConnection: |
+    local hs = {}
+    if obj.status == nil or obj.status.state == nil then
+      hs.status = "Progressing"
+      hs.message = "Waiting for validation"
+      return hs
+    end
+    hs.message = obj.status.message or obj.status.state
+    if obj.status.ready == true then
+      hs.status = "Healthy"
+    elseif obj.status.state == "Failed" then
+      hs.status = "Degraded"
+    else
+      hs.status = "Progressing"
+    end
+    return hs
+  resource.customizations.health.vmoperator.vmware.com_VirtualMachine: |
+    local hs = {}
+    local ip = nil
+    if obj.status ~= nil then
+      if obj.status.network ~= nil then ip = obj.status.network.primaryIP4 end
+      -- v1alpha1 served this flat, as status.vmIp
+      if ip == nil then ip = obj.status.vmIp end
+    end
+    if ip ~= nil and ip ~= "" then
+      hs.status = "Healthy"
+      hs.message = "IP " .. ip
+    else
+      hs.status = "Progressing"
+      hs.message = "Waiting for a reported IP"
+    end
+    return hs

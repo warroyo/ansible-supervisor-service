@@ -11,6 +11,8 @@ This page is about **All Apps** organizations only. If you are in a **VM Apps** 
 - [Passing blueprint inputs to the playbook](#passing-blueprint-inputs-to-the-playbook)
 - [Re-running the playbook as a day-2 update](#re-running-the-playbook-as-a-day-2-update)
 - [Multiple VMs](#multiple-vms)
+- [One-off actions with AnsibleRun](#one-off-actions-with-ansiblerun)
+- [Decommissioning in the right order](#decommissioning-in-the-right-order)
 - [Teardown](#teardown)
 - [Troubleshooting](#troubleshooting)
 
@@ -292,11 +294,169 @@ Different roles get different bindings pointed at different templates - `app: we
 
 Ordering between roles is `dependsOn` between the binding resources: a `Webserver_Ansible` that `dependsOn: [Database_Ansible]` does not start until the database binding's wait has been satisfied. That is how you get "configure the database, then the app tier" out of a single deployment.
 
+## One-off actions with AnsibleRun
+
+An `AnsibleBinding` is standing state, which is right for "this tier should be configured like this" and wrong for "register this in DNS". A binding for a one-time action has to be created, waited on, and then remembered about forever, because nothing ever finishes it.
+
+`AnsibleRun` is the one-time version: one AWX job, launched once, terminal, and optionally self-deleting. In a blueprint it is another `CCI.Supervisor.Resource`, waited on exactly the same way:
+
+```yaml
+  Webserver_DNS:
+    type: CCI.Supervisor.Resource
+    dependsOn:
+      - Webserver_VM
+    properties:
+      context: ${resource.CCI_Supervisor_Namespace_1.id}
+      manifest:
+        apiVersion: field.vmware.com/v1
+        kind: AnsibleRun
+        metadata:
+          name: dns-${input.vmName}-${env.shortDeploymentId}
+        spec:
+          awxConnectionRef: awx
+          template:
+            name: "Register DNS Record"
+            type: JobTemplate
+          extraVars:
+            zone: ${input.dnsZone}
+            record_state: present
+          varsFrom:
+            - resource:
+                apiVersion: vmoperator.vmware.com/v1alpha5
+                kind: VirtualMachine
+                name: ${input.vmName}-${env.shortDeploymentId}
+              vars:
+                record_name: "{.metadata.name}"
+                record_ip: "{.status.network.primaryIP4}"
+          activeDeadlineSeconds: 600
+      wait:
+        timeoutSeconds: 900
+        jsonPath:
+          - path: '{.status.state}'
+            regex: '^Ready$'
+```
+
+This one is safe in `resources:` because registering DNS *is* something that should happen at provisioning time. Runs that should happen at some other time are a different problem - see [Decommissioning in the right order](#decommissioning-in-the-right-order).
+
+Four things about it are worth understanding rather than copying:
+
+**The playbook does not target the VM.** It runs `hosts: localhost` on the AWX execution node and calls the DNS API, so this run has no `vmRef` and no `hosts` - nothing goes into the AWX inventory and no `--limit` is sent. The VM is *data*, arriving as variables through `varsFrom`. The Infoblox (or nsupdate, or Route53) credential is an AWX Credential on the template, exactly like the Machine credential that logs into VMs; nothing sensitive passes through the blueprint.
+
+**`varsFrom` is what removes the ordering headache.** The alternative is passing `${resource.Webserver_VM.object.status.network.primaryIP4}` as an `extraVars` string, which forces the VM's `wait` block to have already resolved the IP. Reading it off the live object instead means the run simply sits `Pending` and retries until the IP appears - `activeDeadlineSeconds` is what stops that waiting forever. Keeping the `wait` on the VM is still worth it, since it makes the first attempt succeed.
+
+**No `ttlSecondsAfterFinished` on a run the blueprint owns.** A TTL makes the CR delete itself, and VCFA still believes that resource is part of the deployment - so the next update or delete is reconciling against something that has silently vanished. Let the deployment's own lifecycle remove it. Save the TTL for runs created outside VCFA, where nothing else is tracking them.
+
+**A blueprint-owned run must not derive its spec from inputs that change.** An `AnsibleRun`'s spec is immutable: the API server rejects any edit to it. So if `zone` here came from an input and someone updated the deployment with a different zone, VCFA would try to patch the existing run, be refused, and fail the update. Two ways out - keep the spec independent of mutable inputs, or put the varying value in `metadata.name` so a change creates a *new* resource instead of patching the old one:
+
+```yaml
+        metadata:
+          name: dns-${input.vmName}-${input.dnsZone}-${env.shortDeploymentId}
+```
+
+That second form is also how you deliberately get "re-run on input change" out of a resource that otherwise never runs twice.
+
+Use the same shape for anything else that happens once at provisioning: opening a change ticket, registering in a CMDB, notifying a channel, adding the VM to a monitoring group.
+
+## Decommissioning in the right order
+
+There is no pre-delete hook this service can use - the mechanism exists in VM Service but is restricted to privileged accounts, and [the FAQ explains why](FAQ.md#why-is-there-no-pre-delete-hook). So a decommission playbook that needs to log into the guest has to run **while the VM is still up**, and the sequencing belongs to the deployment rather than to this service.
+
+**This is a genuine regression from VM Apps, and worth being straight about.** There, `Cloud.Ansible.Tower` takes both `templates.provision[]` and `templates.de-provision[]`, and the deprovision playbooks run as part of that resource's own teardown - declared in one place, ordered correctly by construction, with nothing for the blueprint author to sequence. All Apps has no typed Ansible resource, and the generic `CCI.Supervisor.Resource` has no lifecycle phase to attach one to, so the ordering becomes the caller's problem.
+
+**The trap is putting the decommission run in the blueprint's `resources:` block.** Everything in there is created when the *deployment* is created, not when it is deleted. A decommission `AnsibleRun` declared alongside the VM runs the teardown playbook at provisioning time - against a VM that probably has no IP yet - and then, being terminal, never runs again. There is no delete-time counterpart to `resources:`, so this has to come from somewhere else.
+
+Two ways to get it, plus one that looks obvious and does not work.
+
+### A separate decommission blueprint
+
+Cleanest, and it puts the action in the catalog where people can find it. A second, tiny blueprint that takes the namespace and VM name as inputs, targets the existing namespace, and contains only the run:
+
+```yaml
+formatVersion: 2
+
+inputs:
+  supervisorNamespace:
+    type: string
+    title: Supervisor namespace
+  vmName:
+    type: string
+    title: VM to decommission
+    description: The VirtualMachine resource name, e.g. webserver-a1b2
+
+resources:
+
+  CCI_Supervisor_Namespace_1:
+    type: CCI.Supervisor.Namespace
+    properties:
+      name: ${input.supervisorNamespace}
+      existing: true
+
+  Decommission:
+    type: CCI.Supervisor.Resource
+    properties:
+      context: ${resource.CCI_Supervisor_Namespace_1.id}
+      manifest:
+        apiVersion: field.vmware.com/v1
+        kind: AnsibleRun
+        metadata:
+          name: decom-${input.vmName}-${env.shortDeploymentId}
+        spec:
+          awxConnectionRef: awx
+          template:
+            name: "Decommission Host"
+            type: JobTemplate
+          vmRef:
+            name: ${input.vmName}      # the guest must still be up
+          activeDeadlineSeconds: 900
+      wait:
+        timeoutSeconds: 1200
+        jsonPath:
+          - path: '{.status.state}'
+            regex: '^Ready$'
+```
+
+Request it, let it reach `Ready`, then delete the original deployment. The decommission deployment itself can be deleted afterwards; its run created no inventory host worth keeping.
+
+### Not: a conditional resource in the same blueprint
+
+Worth ruling out explicitly, because it is the first thing most people try. The idea is an input that decides whether the decommission run exists, flipped on a day-2 update just before deleting. It does not work, and the resource type says so.
+
+`CCI.Supervisor.Resource` has exactly six properties. Read them off your own instance:
+
+```bash
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  https://<vcfa>/deployment/api/resource-types \
+  | jq '.content[] | select(.id=="CCI.Supervisor.Resource") | .schema.properties'
+```
+
+| Property | Notes |
+|---|---|
+| `context` | the namespace resource id; `recreateOnUpdate` |
+| `count` | **`ignoreOnUpdate`** |
+| `existing` | use an existing namespace |
+| `manifest` | the Kubernetes object |
+| `object` | computed - the live object, which is what `${resource.X.object...}` reads |
+| `wait` | the wait block |
+
+`count` is `ignoreOnUpdate`, so changing it on a deployment update is ignored - a run gated behind `count` cannot be made to appear later. And there is no `condition` property at all. Note also that the blueprint validation endpoint accepts unknown resource properties without complaint, so a made-up `condition:` or a `count` expression will happily validate and then do nothing; the resource-type schema is the only reliable answer.
+
+The same list is the reason there is no in-blueprint deprovision hook to reach for. `Cloud.Ansible.Tower` in a VM Apps organization carries `templates.provision[]` **and `templates.de-provision[]`**, because it is a typed resource whose provider implements a deprovision phase. `CCI.Supervisor.Resource` is a generic manifest wrapper with no lifecycle phases - it applies an object on create and deletes it on destroy, and there is nowhere to hang "run this on the way out".
+
+### Out of band
+
+If whatever drives decommission is not VCFA at all - a pipeline, an Orchestrator workflow, a person - it applies the `AnsibleRun` to the namespace directly, waits on `.status.state`, and then removes the deployment. This is the case where `ttlSecondsAfterFinished` earns its keep, because nothing else owns the object.
+
+### Cleanup that doesn't need the guest
+
+Removing a DNS record, closing a CMDB entry, silencing an alert - none of these need the VM alive, so they are not bound by any of the above and can run after the deployment is gone. They cannot use `varsFrom` against the VM at that point, though, because there is no VM left to read: whatever creates the run has to pass the name and address as literal `extraVars`.
+
 ## Teardown
 
 Deleting the deployment deletes the `AnsibleBinding`, whose finalizer blocks until the controller has removed the AWX inventory hosts it created. This is normally invisible - it takes a second or two - but it means **the service must still be running on the Supervisor when deployments are deleted.** If the service is removed first, the bindings hang in `Terminating` and the deployment's delete does not finish. Recovery is to reinstall the service and let it drain them, or strip the finalizers by hand and clean AWX up yourself ([how to find the leftovers](FAQ.md#how-do-i-find-awx-hosts-a-supervisor-left-behind)).
 
-Set `cleanupPolicy: Retain` on the binding if you want the AWX host entries kept after the deployment is gone - for run history or audit. They are then yours to clean up.
+`AnsibleRun` carries the same finalizer and the same caveat, and a blueprint-owned one is deleted with the deployment like any other resource. Don't give it a `ttlSecondsAfterFinished` to try to tidy it up sooner - see [above](#one-off-actions-with-ansiblerun) for why a resource that deletes itself out from under VCFA is worse than one that sticks around.
+
+Set `cleanupPolicy: Retain` on a binding or run if you want the AWX host entries kept after the deployment is gone - for run history or audit. They are then yours to clean up.
 
 **Running a playbook on the way out.** `spec.onDeleted` on the binding launches a template when a VM in the deployment is deleted, before its inventory host goes - the deregistration half of what `Cloud.Ansible.Tower`'s `templates.de-provision[]` did in a VM Apps organization. Deleting the deployment deletes both the VMs and the binding, and each VM's hook runs before the binding finishes, so a deployment teardown takes as long as the slowest deregistration playbook rather than a second or two. Budget for that, or bound it with `timeoutSeconds` - past which the finalizer is released regardless, so a hung playbook cannot leave a deployment stuck deleting.
 

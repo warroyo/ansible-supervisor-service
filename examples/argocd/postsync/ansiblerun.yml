@@ -1,0 +1,44 @@
+# A run as a PostSync hook: a smoke test after every full sync, executed
+# against the inventory host the AnsibleBinding manages.
+#
+# The two things that make this shape work:
+#
+#   generateName        every sync creates a new object, which is a new
+#                       execution. A hook is not tracked by Argo, so this
+#                       does not make the app OutOfSync.
+#
+#   no host writes      the run names its target through vmRef and supplies
+#                       no address and no hostVariables. It resolves the
+#                       binding's host, scopes the job to it, and changes
+#                       nothing about the inventory entry - so two runs and
+#                       a binding coexist on one host with no ownership
+#                       fight, and deleting the hook leaves the host alone.
+#
+# The per-run value goes in extraVars, where AWX passes it as the job's
+# extra_vars. Ansible ranks those above inventory variables, so this job
+# sees smoke_test_suite: quick while the host's own variables - tier: gold,
+# set by the binding - stay exactly as they are, and the binding's next job
+# sees them unchanged.
+apiVersion: field.vmware.com/v1
+kind: AnsibleRun
+metadata:
+  generateName: smoke-test-
+  namespace: my-namespace
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    # HookSucceeded deletes the hook object once it succeeds, so successful
+    # history does not pile up. A FAILED hook is deliberately kept: it is
+    # the record of what went wrong, with a link to the AWX job output.
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+spec:
+  awxConnectionRef: awx
+  template:
+    name: "Smoke Test"
+    type: JobTemplate
+  vmRef:
+    name: web-1
+  extraVars:
+    smoke_test_suite: quick
+  # No ttlSecondsAfterFinished. hook-delete-policy already governs the
+  # object's lifetime; a TTL would race it.
+  activeDeadlineSeconds: 900

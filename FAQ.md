@@ -9,6 +9,9 @@
 - [How do I find AWX hosts a supervisor left behind?](#how-do-i-find-awx-hosts-a-supervisor-left-behind)
 - [What's different about Workflow Templates?](#whats-different-about-workflow-templates)
 - [What happens to in-flight runs when a VM powers off?](#what-happens-to-in-flight-runs-when-a-vm-powers-off)
+- [Why is there no pre-delete hook?](#why-is-there-no-pre-delete-hook)
+- [Why does varsFrom refuse to read a Secret?](#why-does-varsfrom-refuse-to-read-a-secret)
+- [Why do AnsibleBinding and AnsibleRun handle a lost launch differently?](#why-do-ansiblebinding-and-ansiblerun-handle-a-lost-launch-differently)
 - [Can two bindings target the same VM?](#can-two-bindings-target-the-same-vm)
 - [Can I run a playbook when a VM is deleted?](#can-i-run-a-playbook-when-a-vm-is-deleted)
 
@@ -79,11 +82,13 @@ AWX host names are unique per inventory, and AWX Hosts have no labels or tags - 
 
 The controller records ownership in the AWX host's **description** field: `ansible-supervisor:<supervisor_id>:<namespace>/<name>`. Description is the only free-text field on an AWX Host, and unlike host variables it never leaks into playbooks. Because that marker lives in AWX rather than only in CR status, it survives a binding being deleted and recreated. On a name collision the controller then:
 
-| Existing host | Behavior |
+| Existing host | Behavior for an `AnsibleBinding` |
 |---|---|
 | Marked as **this** binding's | Updated and owned - including a host left behind by an earlier incarnation of the same binding (so `cleanupPolicy: Retain` → delete → recreate reclaims it rather than orphaning it forever) |
 | Marked by **another** supervisor or binding | **Refused.** Nothing is written, no job is launched, and the `AnsibleBinding` goes `Failed` naming the other owner |
 | **Unmarked** (created by hand in AWX) | Adopted: variables merged, description left alone, never deleted |
+
+An `AnsibleRun` reads the same markers but answers differently, because it is one execution rather than standing state: it **executes against** any host it can resolve - a binding's, another run's, an unmarked one - and writes to none of them. Only a host it creates itself is written to, owned, and deleted with the run. Values that would otherwise have gone onto the host go in `spec.extraVars`/`spec.varsFrom` instead, where AWX applies them to that job alone. A run asking to write onto a host it does not own is refused before it launches.
 
 Set `supervisor_id` at install time to something readable (e.g. `sup-lab-01`); left empty it's derived from the `kube-system` namespace UID, which works but makes the inventory hard to read.
 
@@ -167,3 +172,68 @@ The child object carries `status.deprovision` while it exists, so `kubectl get a
 **What if the records are not on the machine?** Set `onDeleted.targeting: Template` and the controller supplies no inventory and no limit, leaving the aiming to the template - a workflow that retires a DNS record, an IPAM lease and a CMDB entry in three different inventories, or a `hosts: localhost` playbook that calls an API. The hook then runs whether or not this VM's inventory host still exists, and the controller neither pins nor edits that host. The default, `ManagedHost`, is unchanged: the run is scoped to this VM's host with a `--limit`.
 
 **Does it fire when I relabel a VM out of the selector?** No. That VM is still running, and a decommission playbook against a live machine is damage, not cleanup. Its inventory host is still cleaned up. The same applies to a VM deleted and recreated under the same name: the hook fires for the UID that went away, not for its replacement.
+
+## Why is there no pre-delete hook?
+
+Because the mechanism exists and this service is not allowed to use it.
+
+VM Service has a real one: annotate a VM with `delete.check.vmoperator.vmware.com/<component>: <reason>` and vm-operator will not destroy it until the annotation is removed. It is stronger than a finalizer, too - vm-operator holds off deleting the *vSphere* VM, not just the Kubernetes object, which is exactly what a decommission playbook needs. There is a sibling `poweron.check.vmoperator.vmware.com/<component>` for power-on.
+
+Both are gated on vm-operator's `IsPrivilegedAccount`: the vm-operator service account, `system:masters`, kube-admin, or an entry in its `PRIVILEGED_USERS` list. That list is an environment variable baked into the vm-operator manager Deployment by VCF. It does support supervisor services - a stock VCF 9.x supervisor has an entry like `system:serviceaccount:svc-configuration-HASH:configuration-service-controller-manager`, whose wildcard matches the `svc-<name>-<5 characters>` namespace shape every supervisor service gets. But a Carvel package cannot add itself to it, so this service's account is not privileged and its annotation would be rejected.
+
+A plain finalizer on the `VirtualMachine` is not a workaround. vm-operator's own finalizer destroys the vSphere VM during its finalization, so ours would only keep a dead API object around and the playbook would SSH into nothing.
+
+`spec.onDeleted` handles external cleanup after deletion, such as DNS and CMDB records. It cannot keep the guest alive for a pre-delete playbook; that requires sequencing the run before deletion.
+
+**And the blueprint cannot cover for it.** In a VM Apps organization, `Cloud.Ansible.Tower` takes `templates.de-provision[]` alongside `templates.provision[]`, so teardown playbooks are declared on the resource and run as part of its own destruction. That works because it is a *typed* resource whose provider implements a deprovision phase. All Apps has no typed Ansible resource, and `CCI.Supervisor.Resource` - the generic manifest wrapper a blueprint uses instead - has exactly six properties (`context`, `count`, `existing`, `manifest`, `object`, `wait`) and no lifecycle phase of any kind. Confirm it against your own instance:
+
+```bash
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  https://<vcfa>/deployment/api/resource-types \
+  | jq '.content[] | select(.id=="CCI.Supervisor.Resource") | .schema.properties'
+```
+
+So this is a real regression from VM Apps rather than a thing we chose not to build, and it is not one a blueprint can paper over.
+
+**What to do instead** is to sequence it from outside: run the playbook, *then* destroy. An `AnsibleRun` with a `vmRef` while the VM is still up, waited on via `.status.state`, then the deletion - see [VCFA blueprints](VCFA-BLUEPRINTS.md#decommissioning-in-the-right-order) for the shapes that work. For cleanup that doesn't need the guest at all (DNS, CMDB, monitoring), an `AnsibleRun` with `varsFrom` works after the VM is gone too, as long as whatever creates it still knows the name and address.
+
+## Why does varsFrom refuse to read a Secret?
+
+Because `extra_vars` are not a private channel. AWX echoes them in job output and keeps them in the job's stored launch parameters, so anything read this way is visible to everyone who can see that job - long after the run. Sourcing a password through it would be a credential leak with extra steps, so the refusal is unconditional: it applies even when `vars_from_resources` grants `core/secrets` and the controller could technically read it.
+
+The mechanism for credentials is an AWX Credential attached to the template, exactly as the Machine credential that logs into VMs already is. A custom credential type injecting environment variables covers the API-token case:
+
+```yaml
+# input configuration
+fields:
+  - id: infoblox_host,     type: string, label: Grid Master
+  - id: infoblox_username, type: string, label: Username
+  - id: infoblox_password, type: string, label: Password, secret: true
+# injector configuration
+env:
+  INFOBLOX_HOST:     "{{ infoblox_host }}"
+  INFOBLOX_USERNAME: "{{ infoblox_username }}"
+  INFOBLOX_PASSWORD: "{{ infoblox_password }}"
+```
+
+The playbook then needs no `provider:` block at all, and nothing sensitive passes through this service.
+
+## Why do AnsibleBinding and AnsibleRun handle a lost launch differently?
+
+There is a window in both: the controller sends a launch to AWX and dies before recording the job ID. On the next pass it cannot tell whether the job started.
+
+An `AnsibleBinding` relaunches. Its playbooks are convergent configuration - running one twice is how the resource works in the first place, and leaving a VM unconfigured is the worse outcome.
+
+An `AnsibleRun` does not. It exists for things that are *not* convergent: opening a ticket, decommissioning a host, sending a notification. Doing one of those twice can be worse than not doing it, and unlike a binding there is no later reconcile that would put things right.
+
+So it goes and looks, the way the Kubernetes Job controller finds pods it may have lost. The run writes `status.launchAttemptedAt` before sending the launch, and a later pass that finds it set with no `jobID` reads the template's own recent jobs in AWX, considers those created at or after that timestamp, and matches on the `--limit` they ran with:
+
+- **one match** - that is this run's job. It is adopted: its ID, URL and status are recorded and the run polls it from there as if the answer had never been lost.
+- **more than one match** - the run will not guess. It fails, naming the candidate job IDs so a human can decide.
+- **no match, and the launch was over a minute ago** - the run fails too, saying when the launch was sent and which template to check.
+
+That last one is the case worth being clear about. Recognising a job proves one exists; failing to recognise one proves nothing. The job list is a single page, AWX history can be trimmed, jobs can be hidden by permissions, and a job created by an AWX whose clock is behind looks older than the launch that made it. Every one of those reads as "nothing ran", and a run that launched again on the strength of it would be the second decommission this whole mechanism exists to prevent. So the run ends where a human can see it, with the timestamp to search on.
+
+There is one case where nothing has to be guessed at all: if AWX answered the launch with a 4xx it refused the request and made nothing, so the run simply launches again. Only an answer that never arrived, or a 5xx, is ambiguous.
+
+This is also why `AnsibleRun` never launches twice for any other reason: its spec is immutable, and the re-run annotation an `AnsibleBinding` responds to is ignored.

@@ -7,13 +7,16 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"k8s.io/client-go/discovery"
+	memory "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
@@ -29,6 +32,8 @@ func main() {
 	resync := flag.Int("resync-period", 60, "reconcile resync interval, in seconds")
 	reconcileTimeoutFlag := flag.Int("reconcile-timeout", 300, "maximum time one reconcile of one resource may take, in seconds, so a slow AWX cannot pin a worker indefinitely")
 	supervisorIDFlag := flag.String("supervisor-id", "", "identity stamped on AWX inventory hosts this supervisor owns, so one AWX instance can be shared by several supervisors (default: the kube-system namespace UID)")
+	varsFromResourcesFlag := flag.String("vars-from-resources", defaultVarsFromResources,
+		"the exact kinds spec.varsFrom may read, comma separated, each \"<group>/<resource>\" with \"core\" meaning the core group. Never a wildcard, and it must match what the ClusterRole grants - a kind outside it is refused with an explanation instead of coming back Forbidden")
 	hostCheckFlag := flag.Int("host-check-period", 600, "how often, in seconds, each VM's AWX inventory host is reconciled against AWX itself - the worst case for repairing a host deleted or edited by hand in the AWX UI, and what sets the steady-state AWX request rate")
 	logLevelFlag := flag.String("log-level", "info", "info logs launches, terminal outcomes and errors; debug adds a line per reconcile pass, which at teardown scale is a great many")
 	apiQPSFlag := flag.Float64("api-qps", 50, "sustained requests per second this controller makes to the Kubernetes API server")
@@ -129,6 +134,13 @@ func main() {
 	}
 	fmt.Printf("virtualmachine api: %s\n", vmGVR.GroupVersion())
 
+	// An AnsibleRun's spec.varsFrom names kinds rather than resources, so
+	// they have to be mapped at reconcile time. Deferred and cache-backed
+	// so a CRD installed after this process started resolves on a reset
+	// rather than never.
+	varsFromRESTMapper = restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
+	allowedVarsFromResources = parseVarsFromResources(*varsFromResourcesFlag)
+	fmt.Printf("varsFrom resources: %s\n", strings.Join(varsFromResourceList(), ", "))
 	// Before any worker runs and before a single AWX request goes out:
 	// this version's claim scheme cannot coexist with children from the
 	// previous one, and the check is worth nothing once reconciles have
@@ -163,6 +175,16 @@ func main() {
 		provisionFunc:    applyAnsibleBinding,
 		cleanupFunc:      cleanupAnsibleBinding,
 		updateStatusFunc: updateAnsibleBindingStatus,
+		Queue:            workqueue.NewRateLimitingQueue(newRateLimiter()),
+	}
+
+	ansRunController := &Controller{
+		client:           dynClient,
+		gvr:              ansRunGVR,
+		finalizerName:    "field.vmware.com/ansible-run-cleanup",
+		provisionFunc:    applyAnsibleRun,
+		cleanupFunc:      cleanupAnsibleRun,
+		updateStatusFunc: updateAnsibleRunStatus,
 		Queue:            workqueue.NewRateLimitingQueue(newRateLimiter()),
 	}
 
@@ -207,11 +229,14 @@ func main() {
 	// run finishes.
 	watchChildren(ansBindVMInformer, ansBindController)
 
+	ansRunInformer := setupInformer(ctx, dynClient, ansRunController.gvr, ansRunController, resyncPeriod, nil)
+
+	go ansRunInformer.Run(ctx.Done())
 	go awxConnInformer.Run(ctx.Done())
 	go ansBindInformer.Run(ctx.Done())
 	go ansBindVMInformer.Run(ctx.Done())
 
-	if !cache.WaitForCacheSync(ctx.Done(), awxConnInformer.HasSynced, ansBindInformer.HasSynced, ansBindVMInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), awxConnInformer.HasSynced, ansBindInformer.HasSynced, ansBindVMInformer.HasSynced, ansRunInformer.HasSynced) {
 		fmt.Fprintln(os.Stderr, "error waiting for cache sync")
 		os.Exit(1)
 	}
@@ -220,7 +245,7 @@ func main() {
 	// Each Run returns once its queue has drained, so the process stays
 	// alive until every controller has finished the work in hand.
 	var wg sync.WaitGroup
-	for _, c := range []*Controller{awxConnController, ansBindController, ansBindVMController} {
+	for _, c := range []*Controller{awxConnController, ansBindController, ansBindVMController, ansRunController} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

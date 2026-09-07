@@ -188,6 +188,14 @@ func (s *hostStore) handler() http.Handler {
 			s.hosts[id] = body
 			s.created++
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"id": id})
+		case strings.HasPrefix(path, "/hosts/") && r.Method == http.MethodGet:
+			var id int
+			_, _ = fmt.Sscanf(path, "/hosts/%d/", &id)
+			if h, ok := s.hosts[id]; ok && !s.deleted[id] {
+				_ = json.NewEncoder(w).Encode(h)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
 		case strings.HasPrefix(path, "/hosts/") && r.Method == http.MethodPatch:
 			var id int
 			_, _ = fmt.Sscanf(path, "/hosts/%d/", &id)

@@ -1,4 +1,31 @@
 #@ load("@ytt:data", "data")
+#@ load("@ytt:assert", "assert")
+
+#! "core" is how the core API group is spelled in values, since "" is not a
+#! legible thing to put in a config list. RBAC wants the empty string back.
+#!
+#! vars_from_resources names "<group>/<resource>" pairs, and this turns them
+#! into one RBAC rule per group. Never a wildcard: a Supervisor's
+#! appplatform-clusterrole-policy refuses `resources: ["*"]` on the core group
+#! outright, and for every other group a wildcard would grant the controller -
+#! which reads with its own identity - get on kinds nobody asked for.
+#@ def vars_from_rules():
+#@   grouped = {}
+#@   order = []
+#@   for entry in data.values.vars_from_resources:
+#@     parts = entry.split("/")
+#@     if len(parts) != 2 or parts[1] == "":
+#@       assert.fail("vars_from_resources entries are \"<group>/<resource>\", e.g. core/configmaps; got " + entry)
+#@     end
+#@     group = "" if parts[0] == "core" else parts[0]
+#@     if group not in grouped:
+#@       grouped[group] = []
+#@       order.append(group)
+#@     end
+#@     grouped[group].append(parts[1])
+#@   end
+#@   return [{"apiGroups": [g], "resources": grouped[g], "verbs": ["get"]} for g in order]
+#@ end
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -37,6 +64,9 @@ spec:
         - #@ "--resync-period=" + data.values.resync_period
         - #@ "--reconcile-timeout=" + data.values.reconcile_timeout
         - #@ "--supervisor-id=" + data.values.supervisor_id
+        #! passed as well as granted, so the controller refuses a varsFrom
+        #! read it has no RBAC for with an explanation instead of a Forbidden.
+        - #@ "--vars-from-resources=" + ",".join(data.values.vars_from_resources)
         - #@ "--host-check-period=" + data.values.host_check_period
         - #@ "--api-qps=" + data.values.api_qps
         - #@ "--api-burst=" + data.values.api_burst
@@ -100,10 +130,26 @@ rules:
     resources:
       - awxconnections
       - ansiblebindings
+      - ansibleruns
       - awxconnections/status
       - ansiblebindings/status
+      - ansibleruns/status
       - ansiblebindingvms/status
     verbs: ["get", "list", "watch", "update", "patch"]
+  #! A finished run collects itself once ttlSecondsAfterFinished elapses.
+  #! Keep this delete grant separate from bindings and connections.
+  - apiGroups: ["field.vmware.com"]
+    resources: ["ansibleruns"]
+    verbs: ["delete"]
+  #! get only, and only the exact kinds vars_from_resources names: this is
+  #! what an AnsibleRun's spec.varsFrom reads fields out of. list/watch are
+  #! deliberately absent - varsFrom names one object at a time, so the
+  #! controller never needs to enumerate a namespace. Secrets are refused in
+  #! code regardless of what the core group grants here, since extra
+  #! variables are visible in AWX job output.
+  #@ for rule in vars_from_rules():
+  - #@ rule
+  #@ end
   #! An AnsibleBinding creates and deletes one AnsibleBindingVM per matched
   #! VM, so this kind alone needs create and delete. Kept as its own rule
   #! rather than widening the verbs above, which would also let the
@@ -125,11 +171,12 @@ subjects:
     name: ansible-supervisor
     namespace: #@ data.values.namespace
 ---
-#! Both CRDs are namespace-scoped and tenant-owned - a tenant with edit/admin
-#! on their namespace can manage their own AWXConnections and
-#! AnsibleBindings without any extra grant. Unlike a cross-namespace
-#! credential-sharing CRD, there's no separate "authority" concept needed here:
-#! an AWXConnection's Secret never leaves the namespace it's created in.
+#! Every CRD here is namespace-scoped and tenant-owned - a tenant with
+#! edit/admin on their namespace can manage their own AWXConnections,
+#! AnsibleBindings and AnsibleRuns without any extra grant. Unlike a
+#! cross-namespace credential-sharing CRD, there's no separate "authority"
+#! concept needed here: an AWXConnection's Secret never leaves the namespace
+#! it's created in.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -139,7 +186,7 @@ metadata:
     rbac.authorization.k8s.io/aggregate-to-edit: "true"
 rules:
 - apiGroups: ["field.vmware.com"]
-  resources: ["awxconnections", "ansiblebindings"]
+  resources: ["awxconnections", "ansiblebindings", "ansibleruns"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 #! Children are created by the controller, not by users. Readable so a
 #! tenant can see why one VM under a binding is failing, but not writable:
@@ -156,5 +203,5 @@ metadata:
     rbac.authorization.k8s.io/aggregate-to-view: "true"
 rules:
 - apiGroups: ["field.vmware.com"]
-  resources: ["awxconnections", "ansiblebindings", "ansiblebindingvms"]
+  resources: ["awxconnections", "ansiblebindings", "ansiblebindingvms", "ansibleruns"]
   verbs: ["get", "list", "watch"]
