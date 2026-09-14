@@ -37,7 +37,7 @@ argocd app resources <app> --output tree
 kubectl get ansiblerun -n <namespace>     # READY / STATE / JOB columns
 ```
 
-The key format is `resource.customizations.health.<group>_<Kind>` - group
+The key format is `resource.customizations.health.<group>_<Kind>`: group
 and kind separated by an underscore. Getting it wrong is indistinguishable
 from not installing it at all, which is why the check above is worth doing
 once.

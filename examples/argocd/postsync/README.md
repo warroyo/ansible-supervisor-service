@@ -52,7 +52,7 @@ kubectl create -f ansiblerun.yml
 kubectl get ansiblerun -n my-namespace -w
 ```
 
-`kubectl create`, not `apply` - `generateName` has no name to apply against.
+`kubectl create`, not `apply`: `generateName` has no name to apply against.
 
 ## Cleaning up
 

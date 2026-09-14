@@ -22,9 +22,9 @@ VM is still up.
   it against your own Argo CD before depending on it; the cost of being
   wrong is a guest destroyed with its decommission unexecuted.
 
-So the ordering becomes the caller's problem. That is a genuine regression
+So the ordering becomes the caller's problem. That's a genuine regression
 from what `Cloud.Ansible.Tower` could do with `templates.de-provision[]`,
-and it is worth being straight about.
+and it's worth being straight about.
 
 ## What is here
 
@@ -64,7 +64,7 @@ timeout is a backstop rather than the only thing ending it.
 ## Why the name carries a timestamp
 
 Every teardown creates a fresh object. Reusing a fixed name would either be
-rejected - the object still exists and its spec is immutable - or, worse,
+rejected (the object still exists and its spec is immutable) or, worse,
 find a **successful run left over from an earlier attempt** and read it as
 this attempt's success, authorizing the deletion of a VM that was never
 decommissioned.
