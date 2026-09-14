@@ -1,6 +1,6 @@
 # Architecture
 
-How the pieces fit together. The [README](README.md) says what the CRDs are, and [Scenarios](SCENARIOS.md) walks through what the controller does with them. This page is the shape underneath both: which object owns which, what the process looks like while it runs, and where each piece of state actually lives.
+This page covers how the pieces fit together. The [README](README.md) says what the CRDs are, and [Scenarios](SCENARIOS.md) walks through what the controller does with them. This one is the shape underneath both: which object owns which, what the process looks like while it runs, and where each piece of state actually lives.
 
 - [The objects](#the-objects)
 - [Who owns what](#who-owns-what)
@@ -11,9 +11,9 @@ How the pieces fit together. The [README](README.md) says what the CRDs are, and
 
 ## The objects
 
-Four CRDs, all namespace-scoped, plus the `VirtualMachine`s they select and the AWX objects they reach out to. You write three of them; the controller writes the fourth.
+There are four CRDs, all namespace-scoped, plus the `VirtualMachine`s they select and the AWX objects they reach out to. You write three of them and the controller writes the fourth.
 
-Two of the three you write are alternatives, not layers. An `AnsibleBinding` is standing desired state that fans out and re-runs; an `AnsibleRun` is one execution that happens once and is then over ([which to use](README.md#ansiblebinding-or-ansiblerun)). They share the `AWXConnection`, the ownership marker scheme, and everything below it, and nothing else.
+Two of the three you write are alternatives rather than layers. An `AnsibleBinding` is standing desired state that fans out and re-runs, an `AnsibleRun` is one execution that happens once and is then over ([which to use](README.md#ansiblebinding-or-ansiblerun)). The only things they share are the `AWXConnection`, the ownership marker scheme, and everything below it.
 
 ```mermaid
 flowchart LR
@@ -58,15 +58,15 @@ flowchart LR
 
 Blue is what you write, green is what the controller writes, tan is what it finds or creates elsewhere.
 
-Two edges carry most of the design:
+There are two edges in there that drive most of the design.
 
-**`AnsibleBinding` → `AnsibleBindingVM`** is a fan-out, not a reference. The binding creates one child per matched VM and copies its spec down into each. It's a copy rather than a pointer, because a child has to be able to finalize after its parent is already gone. That's what keeps the binding's own pass O(1) in AWX requests however many VMs match, and lets the children reconcile in parallel across workers.
+**`AnsibleBinding` → `AnsibleBindingVM`** is a fan-out rather than a reference. The binding creates one child per matched VM and copies its spec down into each one. I used a copy rather than a pointer because a child has to be able to finalize after its parent is already gone. That's also what keeps the binding's own pass O(1) in AWX requests however many VMs match, and it lets the children reconcile in parallel across workers.
 
-**`AnsibleBindingVM` → `VirtualMachine`** is an `ownerReference`, so a deleted VM takes its child with it through ordinary garbage collection, with no help from the binding. The reference is by UID, which stops a VM deleted and recreated under the same name from inheriting the old one's child.
+**`AnsibleBindingVM` → `VirtualMachine`** is an `ownerReference`, so a deleted VM takes its child with it through ordinary garbage collection, with no help from the binding. The reference is by UID, which stops a VM that was deleted and recreated under the same name from inheriting the old one's child.
 
-Everything that touches AWX on the binding side (upserting a host, launching a job, polling it, deleting the host) happens on a child. The binding's only direct AWX work is the rare [orphan sweep](SCENARIOS.md#a-host-leaks-because-the-controller-was-killed-mid-cleanup).
+Everything that touches AWX on the binding side, so upserting a host, launching a job, polling it and deleting the host, happens on a child. The binding's only direct AWX work is the rare [orphan sweep](SCENARIOS.md#a-host-leaks-because-the-controller-was-killed-mid-cleanup).
 
-An `AnsibleRun` has no child and needs none. There's nothing to fan out to and nothing to re-run, so it does that same work on itself and then stops. Being one-shot gives it a different attitude to the launch. A binding relaunches when it can't tell whether a job started, because its playbooks are convergent. A run instead records `launchAttemptedAt` before the request goes out; if the answer is lost, it reads the template's recent jobs in AWX and **adopts** the job it started rather than making a second one. That's the same move the Kubernetes Job controller makes when it may have lost a pod. The two part company over what happens when no job can be found: a run never sends the launch again, because an absent job in an AWX job list isn't evidence that none ran, so it ends `Failed` for a human to resolve.
+An `AnsibleRun` has no child and doesn't need one. There's nothing to fan out to and nothing to re-run, so it does that same work on itself and then stops. Being one-shot is also why it treats the launch differently. A binding relaunches when it can't tell whether a job started, because its playbooks are convergent. A run instead records `launchAttemptedAt` before the request goes out, and if the answer is lost it reads the template's recent jobs in AWX and **adopts** the job it started rather than making a second one. That's the same move the Kubernetes Job controller makes when it may have lost a pod. Where the two differ is what happens when no job can be found: a run never sends the launch again, because an absent job in an AWX job list isn't evidence that none ran, so it ends `Failed` for a human to resolve.
 
 ## Who owns what
 
@@ -79,13 +79,13 @@ An `AnsibleRun` has no child and needs none. There's nothing to fan out to and n
 | `AnsibleRun` | you | you, or itself once `ttlSecondsAfterFinished` elapses | `ansible-run-cleanup` | cancels the AWX job if one is still running, waits for AWX to confirm it stopped, then removes the AWX hosts it created |
 | AWX `Host` | a child or a run, or adopted if it already existed | that child's finalizer, unless adopted or `cleanupPolicy: Retain`. A run deletes only hosts it created itself | - | - |
 
-The ordering that matters: a binding's finalizer can't release until each child's has, and a child's can't release until its AWX host is gone or deliberately kept. That's what makes `kubectl delete ansiblebinding` a real teardown rather than a detach, and why deleting the service while bindings still exist wedges them ([uninstall notes](README.md#uninstalling)).
+The important part of that ordering is that a binding's finalizer can't release until each child's has, and a child's can't release until its AWX host is gone or deliberately kept. That's what makes `kubectl delete ansiblebinding` a real teardown rather than a detach, and it's also why deleting the service while bindings still exist wedges them ([uninstall notes](README.md#uninstalling)).
 
 ## The claim
 
-Only one `AnsibleBinding` may own a `VirtualMachine`. There's no lock, no lease, and no claim CRD. The child's **name** is the claim, and Kubernetes' own name uniqueness is the arbitration.
+Only one `AnsibleBinding` may own a `VirtualMachine`. There's no lock, no lease, and no claim CRD. The child's **name** is the claim, and Kubernetes' own name uniqueness is what arbitrates it.
 
-A child is named `vm-<vm name>-<hash of the full VM name>`, built from the VM alone and never from the binding. So every binding that selects a given VM computes the same name for it, and only one `create` can win.
+A child is named `vm-<vm name>-<hash of the full VM name>`, built from the VM alone and never from the binding. Every binding that selects a given VM computes the same name for it, so only one `create` can win.
 
 ```mermaid
 sequenceDiagram
@@ -110,19 +110,19 @@ sequenceDiagram
     Note over B: its other VMs reconcile as normal<br/>and it retries on a jittered ~30s interval
 ```
 
-Three details make it hold:
+There are three details that make that hold up.
 
-**The cache cannot grant ownership.** A cache miss isn't proof a VM is free, so the create is always attempted, and `AlreadyExists` is answered with a **live** read rather than assuming the object found is one of its own from an earlier pass.
+**The cache cannot grant ownership.** A cache miss isn't proof a VM is free, so the create is always attempted, and `AlreadyExists` is answered with a **live** read rather than assuming the object it found is one of its own from an earlier pass.
 
-**Identity is checked, not inferred.** `spec.vmName`, `spec.bindingName`, and `spec.bindingUID` are immutable in the schema, and the child's `ownerReference` must name its own VM. A hand-written child under a different name is refused rather than reconciled, so nothing can talk its way into launching playbooks that nothing would clean up. `bindingUID` is why a binding deleted and recreated under the same name claims its VMs afresh instead of inheriting a live claim.
+**Identity is checked rather than inferred.** `spec.vmName`, `spec.bindingName`, and `spec.bindingUID` are immutable in the schema, and the child's `ownerReference` must name its own VM. A hand-written child under a different name is refused rather than reconciled, so nothing can talk its way into launching playbooks that nothing would clean up. `bindingUID` is why a binding deleted and recreated under the same name claims its VMs afresh instead of inheriting a live claim.
 
-**The claim is held through cleanup.** It's free only once the owning child's finalizer has finished, `onDeleted` hook included. A VM replaced under the same name therefore waits for its predecessor's teardown before the replacement can be claimed, which is exactly the ordering an AWX host keyed to that name needs.
+**The claim is held through cleanup.** It's only free once the owning child's finalizer has finished, `onDeleted` hook included. A VM replaced under the same name therefore waits for its predecessor's teardown before the replacement can be claimed, which is exactly the ordering an AWX host keyed to that name needs.
 
-The trade is that the name scheme changed, so [upgrading needs a drain](README.md#upgrading-to-the-next-release): the controller refuses to start while children from the older, per-binding naming still exist.
+The trade-off is that the name scheme changed, so [upgrading needs a drain](README.md#upgrading-to-the-next-release). The controller refuses to start while children from the older, per-binding naming still exist.
 
 ## The process
 
-One Deployment, one replica, watching cluster-wide. Each CRD gets its own informer, its own workqueue and its own pool of workers.
+It's one Deployment, one replica, watching cluster-wide. Each CRD gets its own informer, its own workqueue and its own pool of workers.
 
 ```mermaid
 flowchart TB
@@ -164,15 +164,15 @@ flowchart TB
   cache --> awxapi
 ```
 
-What the shape buys:
+Here's what that shape gets us.
 
-**`VirtualMachine`s are read, never cached.** There's deliberately no VM informer, because caching every VM on the Supervisor would cost memory proportional to the whole cluster. A binding lists the VMs its selector matches on each pass, and a child reads its own VM from the API server. The cost is latency: a VM that starts matching is picked up within `resync_period` rather than instantly.
+**`VirtualMachine`s are read, never cached.** There's deliberately no VM informer, because caching every VM on the Supervisor would cost memory proportional to the whole cluster. A binding lists the VMs its selector matches on each pass, and a child reads its own VM from the API server. The cost is latency, a VM that starts matching is picked up within `resync_period` rather than instantly.
 
-**A child's status change wakes its binding, and nothing else.** The child informer is indexed by owning binding, so a rollup is recomputed from the cache without listing anything. Bindings *waiting* on a claim aren't woken by another binding's child; that would be a namespace-wide fanout on every status write. So a conflicted binding polls on its own jittered interval instead.
+**A child's status change wakes its binding, and nothing else.** The child informer is indexed by owning binding, so a rollup is recomputed from the cache without listing anything. Bindings that are *waiting* on a claim aren't woken by another binding's child, since that would be a namespace-wide fanout on every status write. A conflicted binding polls on its own jittered interval instead.
 
-**Writes are batched and bounded.** A binding collects every child write it wants, then issues them in parallel batches that double from 1 up to 32 concurrent, capped at 500 writes per pass with the remainder carried to the next. Starting at one keeps a systematic failure (a webhook rejecting everything, or exhausted quota) cheap. Deletes go before creates so exhausted quota can't deadlock.
+**Writes are batched and bounded.** A binding collects every child write it wants, then issues them in parallel batches that double from 1 up to 32 concurrent, capped at 500 writes per pass with the remainder carried to the next. Starting at one keeps a systematic failure cheap, whether that's a webhook rejecting everything or exhausted quota. Deletes go before creates so exhausted quota can't deadlock.
 
-**AWX is talked to on a timer, not on every pass.** The client and its detected API base path are cached for 10 minutes, and a resolved template for 5. The launch path deliberately bypasses the template cache and re-reads from AWX every time, because `ask_limit_on_launch` can be switched off in the UI between passes, and a stale copy of that flag is the difference between one host and a whole inventory. In a steady state, the AWX traffic is one request per VM per `host_check_period`, plus one per binding per orphan sweep.
+**AWX is talked to on a timer rather than on every pass.** The client and its detected API base path are cached for 10 minutes, and a resolved template for 5. The launch path deliberately bypasses the template cache and re-reads from AWX every time, because `ask_limit_on_launch` can be switched off in the UI between passes, and a stale copy of that flag is the difference between one host and a whole inventory. In a steady state, the AWX traffic is one request per VM per `host_check_period`, plus one per binding per orphan sweep.
 
 ## Where state lives
 
@@ -190,13 +190,13 @@ Nothing that matters is held in process memory. Everything a restart needs is de
 | When hosts were last swept | the binding's `lastOrphanScan` | same reason, one binding at a time |
 | What a teardown did, after the child is gone | an Event on the `AnsibleBinding` | the child takes its status with it; the Event is what an operator finds afterwards |
 
-The one thing genuinely not recorded is the instant between AWX accepting a launch and the job id reaching status. That's why execution on a binding is at-least-once and playbooks are expected to be idempotent ([FAQ](FAQ.md#can-a-playbook-run-twice-for-one-request)). An `AnsibleRun` closes that window from the other side, by finding the job afterwards rather than by remembering it ([FAQ](FAQ.md#why-do-ansiblebinding-and-ansiblerun-handle-a-lost-launch-differently)).
+The one thing that genuinely isn't recorded is the instant between AWX accepting a launch and the job id reaching status. That's why execution on a binding is at-least-once and playbooks are expected to be idempotent ([FAQ](FAQ.md#can-a-playbook-run-twice-for-one-request)). An `AnsibleRun` closes that window from the other side, by finding the job afterwards rather than by remembering it ([FAQ](FAQ.md#why-do-ansiblebinding-and-ansiblerun-handle-a-lost-launch-differently)).
 
 ## Deliberate limits
 
-- **One replica, no leader election.** The work is IO-bound against AWX and already parallel across 8 workers per resource. A second replica would need leader election to avoid two controllers launching the same job, and buys nothing until that's the bottleneck.
-- **One binding per VM.** Two bindings on one machine would mean two unordered AWX runs against it, two claims on one inventory host and two teardown playbooks. Several playbooks for one VM belong in one AWX workflow ([FAQ](FAQ.md#can-two-bindings-target-the-same-vm)).
+- **One replica, no leader election.** The work is IO-bound against AWX and already parallel across 8 workers per resource. A second replica would need leader election to avoid two controllers launching the same job, and it buys nothing until that's the bottleneck.
+- **One binding per VM.** Two bindings on one machine would mean two unordered AWX runs against it, two claims on one inventory host and two teardown playbooks. If you need several playbooks for one VM, they belong in one AWX workflow ([FAQ](FAQ.md#can-two-bindings-target-the-same-vm)).
 - **No workflow introspection.** The controller resolves the top-level template and nothing else. What a workflow's nodes target, which inventories they use and in what order they run is AWX's business.
 - **The controller never reaches a VM.** It talks to the Kubernetes API and to AWX's HTTPS API only. AWX does the SSH, so the Supervisor needs no route into a workload network.
-- **An `AnsibleRun` is over when it's over.** Its spec is immutable, the re-run annotation is ignored, and a connection repointed at another AWX instance mid-flight ends it rather than being followed. A job id means nothing on an instance that didn't issue it, and an immutable spec can't be pointed back. Running the same thing again means creating another `AnsibleRun`.
+- **An `AnsibleRun` doesn't restart.** Its spec is immutable, the re-run annotation is ignored, and a connection repointed at another AWX instance mid-flight ends it rather than being followed. A job id means nothing on an instance that didn't issue it, and an immutable spec can't be pointed back. Running the same thing again means creating another `AnsibleRun`.
 - **`onDeleted` cannot reach the guest.** vm-operator destroys the machine during its own finalization, before anything here runs, and both routes to an earlier hook are closed to a Carvel-packaged service. The hook is for the external record ([FAQ](FAQ.md#can-i-run-a-playbook-when-a-vm-is-deleted)).

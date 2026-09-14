@@ -23,10 +23,10 @@ One execution, owned by Argo, tied to the application's own lifecycle.
 ## To run it again
 
 Change `metadata.name`. A new name is a new object, which is a new request,
-which is a new execution. Do not reach for `Replace=true` - a replace is
+which is a new execution. Don't reach for `Replace=true`, since a replace is
 still an update and is rejected the same way, and `Replace=true` plus
 `Force=true` degrades to delete-then-create, which re-runs a playbook that
-already ran. That is fine for a DNS registration and an incident for a
+already ran. That's fine for a DNS registration and an incident for a
 decommission.
 
 If you want "re-run when this input changes", derive the name from the
@@ -52,4 +52,4 @@ kubectl delete ansiblerun register-dns -n my-namespace
 
 Deletion cancels the AWX job if one is still running and waits for AWX to
 confirm it stopped before releasing. This run creates no inventory hosts,
-so there is nothing else to remove.
+so there's nothing else to remove.

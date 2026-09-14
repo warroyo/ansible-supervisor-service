@@ -38,7 +38,7 @@ So if you add `hostVariables` here, the run will refuse to launch:
 inventory host "web-1" already exists and is not this run's to change ...
 ```
 
-That refusal is the point. Silently dropping the values would run the
+That refusal is the whole point. Silently dropping the values would run the
 playbook with a configuration the spec asked for and AWX never saw. Put
 per-execution values in `extraVars`/`varsFrom` instead, which is what this
 example does.
@@ -52,7 +52,8 @@ kubectl create -f ansiblerun.yml
 kubectl get ansiblerun -n my-namespace -w
 ```
 
-`kubectl create`, not `apply`: `generateName` has no name to apply against.
+Use `kubectl create` rather than `apply`, because `generateName` has no name
+to apply against.
 
 ## Cleaning up
 
@@ -62,5 +63,5 @@ kubectl delete ansiblerun smoke-test-xxxxx -n my-namespace
 kubectl delete ansiblebinding webservers -n my-namespace
 ```
 
-Delete the runs first if you want to watch it happen: they leave the host
+Delete the runs first if you want to watch it happen. They leave the host
 where it is, and the binding's own deletion is what finally removes it.

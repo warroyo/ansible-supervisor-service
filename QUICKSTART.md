@@ -1,8 +1,8 @@
 # Quickstart
 
-Shortest path from nothing to a playbook running against a VM Service VM. Five steps, about fifteen minutes if AWX is already up.
+This is the shortest path from nothing to a playbook running against a VM Service VM. It's five steps, and about fifteen minutes if AWX is already up.
 
-Everything here is explained in more depth in the [README](README.md); this page is the copy-paste version. For driving this from a VCF Automation 9.x blueprint instead of `kubectl`, see [Using this from a VCFA 9.x blueprint](VCFA-BLUEPRINTS.md).
+Everything here is explained in more depth in the [README](README.md), this page is the copy-paste version. If you want to drive this from a VCF Automation 9.x blueprint instead of `kubectl`, see [Using this from a VCFA 9.x blueprint](VCFA-BLUEPRINTS.md).
 
 - [Before you start](#before-you-start)
 - [1. Install the service](#1-install-the-service)
@@ -21,13 +21,13 @@ Everything here is explained in more depth in the [README](README.md); this page
 - An AWX / Ansible Tower / AAP instance that can reach your VMs over SSH
 - An SSH keypair whose private half is in an AWX **Machine credential**, and whose public half you'll bake into the VM
 
-The controller never touches a VM. It talks only to Kubernetes and to AWX's HTTPS API, and AWX does the SSH. So the supervisor needs no route into the workload network, but AWX does.
+The controller never touches a VM. It talks only to Kubernetes and to AWX's HTTPS API, and AWX does the SSH. That means the supervisor needs no route into the workload network, but AWX does.
 
 ## 1. Install the service
 
-vCenter → **Workload Management → Services → Add Service**, upload `ansible-supervisor.yml` from the [latest release](https://github.com/warroyo/ansible-supervisor-service/releases), and install. Defaults are fine.
+Go to vCenter -> **Workload Management -> Services -> Add Service**, upload `ansible-supervisor.yml` from the [latest release](https://github.com/warroyo/ansible-supervisor-service/releases), and install it. The defaults are fine.
 
-Set `supervisor_id` to something readable (e.g. `sup-lab-01`) if more than one supervisor will share this AWX instance. Left empty, it's derived from a namespace UID, which works but makes the AWX inventory hard to read.
+Set `supervisor_id` to something readable (e.g. `sup-lab-01`) if more than one supervisor will share this AWX instance. Left empty it's derived from a namespace UID, which works but makes the AWX inventory hard to read.
 
 Confirm the CRDs landed:
 
@@ -38,7 +38,7 @@ kubectl get crd | grep field.vmware.com
 # awxconnections.field.vmware.com
 ```
 
-Three, not two: `AnsibleBindingVM` is the per-VM child the controller creates and deletes itself. You never write one (see [CRD status](README.md#crd-status)).
+That's three rather than two, because `AnsibleBindingVM` is the per-VM child the controller creates and deletes itself. You never write one (see [CRD status](README.md#crd-status)).
 
 ## 2. Prepare the AWX template
 
@@ -48,9 +48,9 @@ In AWX, on the Job Template you want to run:
 - Enable Prompt on Launch for Variables too, if you plan to pass `extraVars`.
 - Attach the **Machine credential** holding the private key. This is what logs into the VM.
 - Note which **inventory** the template uses. That's where the controller creates host entries.
-- **Workflow templates usually have no inventory of their own**, since each node carries one. With no inventory, there's no host for the controller to create and nothing for `--limit` to scope, so the workflow runs against whatever its nodes target (the same as `useDefaultLimit: true`). Use a Job Template if you need the run confined to the selected VM. [More](FAQ.md#whats-different-about-workflow-templates)
+- **Workflow templates usually have no inventory of their own**, since each node carries one. With no inventory there's no host for the controller to create and nothing for `--limit` to scope, so the workflow runs against whatever its nodes target, which is the same as `useDefaultLimit: true`. Use a Job Template if you need the run confined to the selected VM. [More](FAQ.md#whats-different-about-workflow-templates)
 
-Then create an API token (AWX → your user → **Tokens** → Add, scope `write`) and keep it handy.
+Then create an API token (AWX -> your user -> **Tokens** -> Add, scope `write`) and keep it handy.
 
 ## 3. Connect the namespace to AWX
 
@@ -74,7 +74,7 @@ spec:
 EOF
 ```
 
-If AWX is served by a private CA, trust it rather than skipping verification. The bundle goes in a Secret, and the token Secret you just created will do - add the PEM to it under `ca.crt`:
+If AWX is served by a private CA, trust it rather than skipping verification. The bundle goes in a Secret, and the token Secret you just created will do, so add the PEM to it under `ca.crt`:
 
 ```bash
 kubectl create secret generic awx-token -n my-namespace \
@@ -93,9 +93,9 @@ spec:
 
 Delete the local `awx-token` file once the Secret exists.
 
-`insecureSkipVerify: true` and `caBundleSecretRef` together are rejected.
+Setting `insecureSkipVerify: true` and `caBundleSecretRef` together is rejected.
 
-Leave `apiBasePath` unset - the controller probes for `/api/v2` (AWX, Tower, AAP ≤ 2.4) versus `/api/controller/v2` (AAP 2.5+) itself. Within a few seconds:
+Leave `apiBasePath` unset, the controller probes for `/api/v2` (AWX, Tower, AAP ≤ 2.4) versus `/api/controller/v2` (AAP 2.5+) itself. Within a few seconds:
 
 ```bash
 kubectl get awxconnection -n my-namespace
@@ -103,11 +103,11 @@ kubectl get awxconnection -n my-namespace
 # sample-awx   true    Ready   /api/v2   5s
 ```
 
-Anything other than `Ready` here is a bad URL, a bad token, or TLS. Run `kubectl get awxconnection sample-awx -n my-namespace -o jsonpath='{.status.message}'` to see which. Fix it before moving on; nothing downstream will work until this is `Ready`.
+Anything other than `Ready` here is a bad URL, a bad token, or TLS. Run `kubectl get awxconnection sample-awx -n my-namespace -o jsonpath='{.status.message}'` to see which. Fix it before moving on, nothing downstream will work until this is `Ready`.
 
 ## 4. Create a target VM
 
-Nothing gets installed on the VM. It needs exactly two things: a label for the selector to match, and an SSH user matching the AWX Machine credential.
+Nothing gets installed on the VM. It needs exactly two things, a label for the selector to match, and an SSH user matching the AWX Machine credential.
 
 Fill in `className`, `imageName` and `storageClass` from your own namespace (`kubectl get virtualmachineclass,virtualmachineimage,storageclass`) and apply:
 
@@ -115,16 +115,16 @@ Fill in `className`, `imageName` and `storageClass` from your own namespace (`ku
 kubectl apply -n my-namespace -f examples/virtualMachine.yml
 ```
 
-The only line in that file this service cares about is `labels: {app: webserver}`. The rest is an ordinary VM Service VM, and the cloud-init block is just how the public key gets in - use whatever bootstrap you already have.
+The only line in that file this service cares about is `labels: {app: webserver}`. The rest is an ordinary VM Service VM, and the cloud-init block is just how the public key gets in, so use whatever bootstrap you already have.
 
-The example is written against `vmoperator.vmware.com/v1alpha2`, which VCF 9.x Supervisors still serve alongside newer versions. Any served version works (the controller discovers which one to read at startup), so if the apply is rejected, set `apiVersion` to whatever your Supervisor offers:
+The example is written against `vmoperator.vmware.com/v1alpha2`, which VCF 9.x Supervisors still serve alongside newer versions. Any served version works, since the controller discovers which one to read at startup, so if the apply is rejected set `apiVersion` to whatever your Supervisor offers:
 
 ```bash
 kubectl get crd virtualmachines.vmoperator.vmware.com \
   -o jsonpath='{range .spec.versions[?(@.served)]}{.name}{"\n"}{end}'
 ```
 
-No need to wait for the VM to boot before moving on. A VM that's powered off or has no IP yet sits in `Pending`, and the controller starts the run when the IP appears; the reconcile loop re-checks every matched VM on each resync (`-resync-period`, 60s by default). Ordering only matters if you want the binding to go `Ready` promptly.
+There's no need to wait for the VM to boot before moving on. A VM that's powered off or has no IP yet sits in `Pending`, and the controller starts the run when the IP appears, since the reconcile loop re-checks every matched VM on each resync (`-resync-period`, 60s by default). Ordering only matters if you want the binding to go `Ready` promptly.
 
 To watch the VM come up anyway:
 
@@ -170,7 +170,7 @@ kubectl get ansiblebindingvm -n my-namespace -l field.vmware.com/binding=webserv
 # sample-webserver  Succeeded  https://awx.example.com/#/jobs/playbook/412
 ```
 
-One binding fans out: every VM the selector matches gets its own inventory host, its own run, and its own `AnsibleBindingVM`. Label a second VM `app: webserver` and it's picked up on the next resync, with no edit to the binding needed.
+One binding fans out, so every VM the selector matches gets its own inventory host, its own run, and its own `AnsibleBindingVM`. Label a second VM `app: webserver` and it's picked up on the next resync, with no edit to the binding needed.
 
 ## Re-running
 
@@ -194,7 +194,7 @@ Editing `spec` does the same thing without the annotation, since it bumps `.meta
 | Binding `Failed` with a job URL | AWX ran it and the playbook failed. Open `lastJobURL` |
 | Job fails `unreachable` | AWX can't SSH in: wrong user or key in the Machine credential, no route to the VM's IP, or the VM booted without the key. If AWX must reach the VM at a different address than `status.network.primaryIP4`, set `hostVariables: {ansible_host: ...}` on the binding |
 
-Full reference in the [README](README.md), edge cases in the [FAQ](FAQ.md).
+There's a full reference in the [README](README.md), and the edge cases are in the [FAQ](FAQ.md).
 
 ## Cleaning up
 
@@ -208,6 +208,6 @@ Remove the service last, after the bindings are gone.
 
 ## What next
 
-This walkthrough builds an `AnsibleBinding`: standing state that says "these VMs should be configured like this", re-runnable forever.
+This walkthrough builds an `AnsibleBinding`, which is standing state that says "these VMs should be configured like this", re-runnable forever.
 
-The other shape is `AnsibleRun`: one AWX job, launched once, that never runs again. That's what you want for something that has already happened rather than something that should stay true: registering a VM in DNS, patching two servers tonight, running a decommission playbook before a VM is destroyed, or calling an external API with no host involved at all. See [AnsibleBinding or AnsibleRun?](README.md#ansiblebinding-or-ansiblerun) and `examples/ansibleRun.yml`.
+The other shape is `AnsibleRun`, one AWX job, launched once, that never runs again. That's the one you want for something that has already happened rather than something that should stay true, so registering a VM in DNS, patching two servers tonight, running a decommission playbook before a VM is destroyed, or calling an external API with no host involved at all. See [AnsibleBinding or AnsibleRun?](README.md#ansiblebinding-or-ansiblerun) and `examples/ansibleRun.yml`.

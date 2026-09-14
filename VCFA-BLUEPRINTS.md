@@ -1,8 +1,8 @@
 # Using this from a VCF Automation 9.x blueprint (All Apps)
 
-How to get "provision a VM, then configure it with Ansible" out of a **VCF Automation 9.x blueprint in an All Apps organization** - the thing you used to get from the Ansible Automation Platform integration and a `Cloud.Ansible.Tower` resource in a classic Aria Automation cloud template.
+This page covers how to get "provision a VM, then configure it with Ansible" out of a **VCF Automation 9.x blueprint in an All Apps organization**, which is the thing you used to get from the Ansible Automation Platform integration and a `Cloud.Ansible.Tower` resource in a classic Aria Automation cloud template.
 
-This page is about **All Apps** organizations only. If you are in a **VM Apps** organization you are running the classic Aria Automation model, where the built-in Ansible integration and its `Cloud.Ansible.Tower` resource type still exist and none of this is needed.
+This is about **All Apps** organizations only. If you're in a **VM Apps** organization you're running the classic Aria Automation model, where the built-in Ansible integration and its `Cloud.Ansible.Tower` resource type still exist and none of this is needed.
 
 - [What changed from VM Apps](#what-changed-from-vm-apps)
 - [One-time setup](#one-time-setup)
@@ -20,9 +20,9 @@ This page is about **All Apps** organizations only. If you are in a **VM Apps** 
 
 In an All Apps organization, a blueprint isn't an IaaS cloud template. Every resource in it is a Supervisor object: a `CCI.Supervisor.Namespace`, and then `CCI.Supervisor.Resource` entries, each wrapping a Kubernetes manifest that gets applied into that namespace. The `Cloud.Ansible.Tower` resource type isn't available here, and neither is the built-in Ansible integration behind it.
 
-This service puts the capability back where All Apps can reach it: as a CRD on the Supervisor. An `AnsibleBinding` is an ordinary manifest, so a blueprint declares it exactly like it declares a `VirtualMachine`.
+This service puts the capability back where All Apps can reach it, as a CRD on the Supervisor. An `AnsibleBinding` is an ordinary manifest, so a blueprint declares it exactly like it declares a `VirtualMachine`.
 
-The product-level version of this mapping - what replaces the AAP integration regardless of blueprints - is in [the FAQ](FAQ.md#i-used-the-aap-integration-in-classic-aria-automation-what-maps-to-what). The blueprint-specific version:
+The product-level version of this mapping, meaning what replaces the AAP integration regardless of blueprints, is in [the FAQ](FAQ.md#i-used-the-aap-integration-in-classic-aria-automation-what-maps-to-what). Here's the blueprint-specific version:
 
 | | VM Apps / classic Aria Automation | All Apps (VCFA 9.x) |
 |---|---|---|
@@ -33,13 +33,13 @@ The product-level version of this mapping - what replaces the AAP integration re
 | Re-running | Day-2 action on the deployment | Change an input that lands in an annotation, then update the deployment |
 | Deployment waits for the playbook | Built into the resource | `wait` block on the `AnsibleBinding` resource |
 
-The practical difference is the fourth row. `Cloud.Ansible.Tower` was attached to one machine and couldn't target anything else. `AnsibleBinding` is a selector, which is more powerful and less safe: a careless selector reaches every matching VM in the namespace, including VMs belonging to other deployments. [Scope the selector per deployment](#scope-the-selector-to-the-deployment).
+The practical difference is the fourth row. `Cloud.Ansible.Tower` was attached to one machine and couldn't target anything else. `AnsibleBinding` is a selector, which is more powerful and less safe, because a careless selector reaches every matching VM in the namespace, including VMs belonging to other deployments. [Scope the selector per deployment](#scope-the-selector-to-the-deployment).
 
 ## One-time setup
 
-Done once by the platform team, not by every blueprint.
+This is done once by the platform team rather than by every blueprint.
 
-**1. Install the service on the Supervisor.** vCenter → Workload Management → Services → Add Service. See the [Quickstart](QUICKSTART.md#1-install-the-service).
+**1. Install the service on the Supervisor.** vCenter -> Workload Management -> Services -> Add Service. See the [Quickstart](QUICKSTART.md#1-install-the-service).
 
 **2. Create the `AWXConnection` in each project's Supervisor namespace**, by hand or by whatever config management you use for namespaces:
 
@@ -60,7 +60,7 @@ EOF
 
 Keep this out of the blueprint. A blueprint that creates its own `Secret` puts the AWX API token into the deployment's input values, where it's visible to anyone who can read the deployment, and it gets re-created and deleted on every deploy. The connection is namespace infrastructure with a lifecycle of its own, so the blueprint should only reference it by name. Consumers don't need to know the token exists.
 
-If you genuinely need a blueprint-owned connection - a self-service org where each team brings its own AWX - use an `encrypted: true` input for the token and create the `Secret` and `AWXConnection` as two more `CCI.Supervisor.Resource` entries the binding `dependsOn`.
+If you genuinely need a blueprint-owned connection, say a self-service org where each team brings its own AWX, use an `encrypted: true` input for the token and create the `Secret` and `AWXConnection` as two more `CCI.Supervisor.Resource` entries the binding `dependsOn`.
 
 **3. Confirm project users can create the CRs.** The service ships RBAC that aggregates into the standard `edit` and `admin` cluster roles, so a user with edit on the Supervisor namespace can manage `AnsibleBinding`s without an extra grant. Deployments are applied as the requesting user, so this is what lets a blueprint create one at all.
 
@@ -68,7 +68,7 @@ If you genuinely need a blueprint-owned connection - a self-service org where ea
 
 ## A complete blueprint
 
-Provisions a VM and does not report the deployment as successful until Ansible has configured it.
+This provisions a VM and doesn't report the deployment as successful until Ansible has configured it.
 
 ```yaml
 formatVersion: 2
@@ -223,7 +223,7 @@ Substitute the namespace name, storage class, image, and template name. The `ima
 
 ### Scope the selector to the deployment
 
-`${env.shortDeploymentId}` is stamped onto the VM as a label and matched by `vmSelector`, so deployment A's binding only ever touches deployment A's VM. Without that second label, every deployment from this blueprint shares one selector: each binding matches every other deployment's VMs, runs the playbook against all of them, and they fight over the same AWX inventory hosts. This is the one thing that has no analogue in `Cloud.Ansible.Tower`, and the one thing that will bite you.
+`${env.shortDeploymentId}` is stamped onto the VM as a label and matched by `vmSelector`, so deployment A's binding only ever touches deployment A's VM. Without that second label, every deployment from this blueprint shares one selector, so each binding matches every other deployment's VMs, runs the playbook against all of them, and they fight over the same AWX inventory hosts. This is the one thing that has no analogue in `Cloud.Ansible.Tower`, and the one thing that will bite you.
 
 ### Name resources per deployment too
 
@@ -231,11 +231,11 @@ Substitute the namespace name, storage class, image, and template name. The `ima
 
 ### `dependsOn` orders creation, `wait` is what makes it mean something
 
-Without `wait` on the VM, the binding is created the moment the VM object exists, before it has an IP. That's not an error (the binding sits in `Pending` and starts the run when the IP appears), but the deployment reports complete before anything is configured. Waiting for `{.status.network.primaryIP4}` and then for the binding's `{.status.state}` is what makes deployment success actually mean "configured".
+Without `wait` on the VM, the binding is created the moment the VM object exists, before it has an IP. That's not an error, since the binding sits in `Pending` and starts the run when the IP appears, but the deployment reports complete before anything is configured. Waiting for `{.status.network.primaryIP4}` and then for the binding's `{.status.state}` is what makes deployment success actually mean "configured".
 
 ### Wait on `jsonPath`, not `conditions`
 
-These CRDs report `.status.state` and `.status.ready`, not a `.status.conditions` array, so a `conditions:` wait block will never match. Use the `jsonPath` form shown above.
+These CRDs report `.status.state` and `.status.ready` rather than a `.status.conditions` array, so a `conditions:` wait block will never match. Use the `jsonPath` form shown above.
 
 ### A failed playbook surfaces as a wait timeout
 
@@ -243,14 +243,14 @@ A `jsonPath` wait has no way to express "and fail immediately if the state becom
 
 ### Use the VM API version your Supervisor actually serves
 
-The example above uses `vmoperator.vmware.com/v1alpha5`, current on VCF 9.x Supervisors, but this moves between releases and blog examples go stale fast. Check yours before copying anything:
+The example above uses `vmoperator.vmware.com/v1alpha5`, which is current on VCF 9.x Supervisors, but this moves between releases and blog examples go stale fast. Check yours before copying anything:
 
 ```bash
 kubectl get crd virtualmachines.vmoperator.vmware.com \
   -o jsonpath='{range .spec.versions[?(@.served)]}{.name}{"\t"}{.storage}{"\n"}{end}'
 ```
 
-The version marked `true` in the second column is the storage version; any served version can be written. The safest source for a VM manifest is still the VCFA VM wizard in your own environment - whatever it emits is correct for that Supervisor by construction.
+The version marked `true` in the second column is the storage version, and any served version can be written. The safest source for a VM manifest is still the VCFA VM wizard in your own environment, since whatever it emits is correct for that Supervisor by construction.
 
 Whichever you pick, the controller reads the VM fine. It resolves the VirtualMachine API version by discovery at startup, preferring the newest the Supervisor serves, and the API server converts between served versions. So a VM your blueprint creates at `v1alpha5` is read correctly even though the controller asked for it at whatever version it settled on. There's nothing to keep in sync between the blueprint and the service, and no version for the blueprint to avoid. The controller logs its choice on startup:
 
@@ -262,7 +262,7 @@ Field names can move with the version too. If the `vmIpAddress` output comes bac
 
 ## Passing blueprint inputs to the playbook
 
-`extraVars` is what replaces the parameter passing you did on the `Cloud.Ansible.Tower` resource, and it's the reason to build a blueprint around this at all: the request form's inputs become variables the playbook branches on.
+`extraVars` is what replaces the parameter passing you did on the `Cloud.Ansible.Tower` resource, and it's the reason to build a blueprint around this at all, since the request form's inputs become variables the playbook branches on.
 
 ```yaml
           extraVars:
@@ -271,7 +271,7 @@ Field names can move with the version too. If the `vmIpAddress` output comes bac
             deployment_id: ${env.shortDeploymentId}
 ```
 
-Two constraints:
+There are two constraints:
 
 - **The AWX template needs Prompt on Launch for Variables**, or AWX silently discards everything sent here.
 - **Every value must be a string.** `extraVars` is a `map[string]string`. Declare inputs that feed it as `type: string` (use an `enum` for a picklist rather than an `integer` or `boolean` input), or concatenate into a string in the expression. An `integer` input dropped straight in fails schema validation on the manifest, which shows up as the resource failing to create rather than as an obvious type error.
@@ -280,19 +280,19 @@ Host-level variables work the same way through `hostVariables`, which is where a
 
 ## Re-running the playbook as a day-2 update
 
-The `configRunId` input is the whole mechanism. It lands in the binding's `ansible.field.vmware.com/reconcile-requested-at` annotation, and the controller re-launches the template against every matched VM whenever that annotation's value changes. To re-run: update the deployment, change `configRunId` to anything it hasn't been before, and submit.
+The `configRunId` input is the whole mechanism. It lands in the binding's `ansible.field.vmware.com/reconcile-requested-at` annotation, and the controller re-launches the template against every matched VM whenever that annotation's value changes. To re-run, update the deployment, change `configRunId` to anything it hasn't been before, and submit.
 
-Any spec change does the same thing on its own. Changing `appEnvironment` re-runs the playbook with the new value without touching `configRunId`, because it bumps the binding's `metadata.generation`. `configRunId` exists for the case where nothing about the desired state changed and you just want the playbook run again: config drifted, the playbook itself was updated in AWX, or a run failed on something you've since fixed.
+Any spec change does the same thing on its own. Changing `appEnvironment` re-runs the playbook with the new value without touching `configRunId`, because it bumps the binding's `metadata.generation`. `configRunId` exists for the case where nothing about the desired state changed and you just want the playbook run again, so config drifted, the playbook itself was updated in AWX, or a run failed on something you've since fixed.
 
 Give it a `title` that says so on the request form. Consumers read "Configuration run ID" as an opaque field otherwise.
 
 ## Multiple VMs
 
-One binding fans out to every VM its selector matches, so a blueprint that provisions several VMs of the same role needs exactly one `AnsibleBinding` for all of them. Label each VM with the same `app` and `deployment` pair and leave the binding as-is: each VM gets its own AWX inventory host, its own run, and its own `AnsibleBindingVM`, and the binding is `Ready` only once all of them have succeeded.
+One binding fans out to every VM its selector matches, so a blueprint that provisions several VMs of the same role needs exactly one `AnsibleBinding` for all of them. Label each VM with the same `app` and `deployment` pair and leave the binding as-is. Each VM gets its own AWX inventory host, its own run, and its own `AnsibleBindingVM`, and the binding is `Ready` only once all of them have succeeded.
 
-Different roles get different bindings pointed at different templates - `app: webserver` at one, `app: database` at another - each with the same per-deployment label, and each with its own `wait` if the deployment should block on it.
+Different roles get different bindings pointed at different templates, so `app: webserver` at one and `app: database` at another, each with the same per-deployment label, and each with its own `wait` if the deployment should block on it.
 
-Ordering between roles is `dependsOn` between the binding resources: a `Webserver_Ansible` that `dependsOn: [Database_Ansible]` does not start until the database binding's wait has been satisfied. That is how you get "configure the database, then the app tier" out of a single deployment.
+Ordering between roles is `dependsOn` between the binding resources. A `Webserver_Ansible` that `dependsOn: [Database_Ansible]` does not start until the database binding's wait has been satisfied. That's how you get "configure the database, then the app tier" out of a single deployment.
 
 ## One-off actions with AnsibleRun
 
@@ -336,17 +336,17 @@ An `AnsibleBinding` is standing state, which is right for "this tier should be c
             regex: '^Ready$'
 ```
 
-This one is safe in `resources:` because registering DNS *is* something that should happen at provisioning time. Runs that should happen at some other time are a different problem - see [Decommissioning in the right order](#decommissioning-in-the-right-order).
+This one is safe in `resources:` because registering DNS *is* something that should happen at provisioning time. Runs that should happen at some other time are a different problem, see [Decommissioning in the right order](#decommissioning-in-the-right-order).
 
-Four things about it are worth understanding rather than copying:
+There are four things about it worth understanding rather than copying.
 
-**The playbook doesn't target the VM.** It runs `hosts: localhost` on the AWX execution node and calls the DNS API, so this run has no `vmRef` and no `hosts`: nothing goes into the AWX inventory and no `--limit` is sent. The VM is *data*, arriving as variables through `varsFrom`. The Infoblox (or nsupdate, or Route53) credential is an AWX Credential on the template, exactly like the Machine credential that logs into VMs, so nothing sensitive passes through the blueprint.
+**The playbook doesn't target the VM.** It runs `hosts: localhost` on the AWX execution node and calls the DNS API, so this run has no `vmRef` and no `hosts`. Nothing goes into the AWX inventory and no `--limit` is sent. The VM is *data*, arriving as variables through `varsFrom`. The Infoblox (or nsupdate, or Route53) credential is an AWX Credential on the template, exactly like the Machine credential that logs into VMs, so nothing sensitive passes through the blueprint.
 
 **`varsFrom` is what removes the ordering headache.** The alternative is passing `${resource.Webserver_VM.object.status.network.primaryIP4}` as an `extraVars` string, which forces the VM's `wait` block to have already resolved the IP. Reading it off the live object instead means the run simply sits `Pending` and retries until the IP appears, and `activeDeadlineSeconds` is what stops that waiting forever. Keeping the `wait` on the VM is still worth it, since it makes the first attempt succeed.
 
 **No `ttlSecondsAfterFinished` on a run the blueprint owns.** A TTL makes the CR delete itself, and VCFA still believes that resource is part of the deployment, so the next update or delete is reconciling against something that has silently vanished. Let the deployment's own lifecycle remove it. Save the TTL for runs created outside VCFA, where nothing else is tracking them.
 
-**A blueprint-owned run must not derive its spec from inputs that change.** An `AnsibleRun`'s spec is immutable: the API server rejects any edit to it. So if `zone` here came from an input and someone updated the deployment with a different zone, VCFA would try to patch the existing run, be refused, and fail the update. Two ways out: keep the spec independent of mutable inputs, or put the varying value in `metadata.name` so a change creates a *new* resource instead of patching the old one:
+**A blueprint-owned run must not derive its spec from inputs that change.** An `AnsibleRun`'s spec is immutable and the API server rejects any edit to it. So if `zone` here came from an input and someone updated the deployment with a different zone, VCFA would try to patch the existing run, be refused, and fail the update. There are two ways out: keep the spec independent of mutable inputs, or put the varying value in `metadata.name` so a change creates a *new* resource instead of patching the old one:
 
 ```yaml
         metadata:
@@ -355,7 +355,7 @@ Four things about it are worth understanding rather than copying:
 
 That second form is also how you deliberately get "re-run on input change" out of a resource that otherwise never runs twice.
 
-Use the same shape for anything else that happens once at provisioning: opening a change ticket, registering in a CMDB, notifying a channel, adding the VM to a monitoring group.
+Use the same shape for anything else that happens once at provisioning, such as opening a change ticket, registering in a CMDB, notifying a channel, or adding the VM to a monitoring group.
 
 ## Decommissioning in the right order
 
@@ -363,13 +363,13 @@ There's no pre-delete hook this service can use. The mechanism exists in VM Serv
 
 **This is a genuine regression from VM Apps, and worth being straight about.** There, `Cloud.Ansible.Tower` takes both `templates.provision[]` and `templates.de-provision[]`, and the deprovision playbooks run as part of that resource's own teardown: declared in one place, ordered correctly by construction, with nothing for the blueprint author to sequence. All Apps has no typed Ansible resource, and the generic `CCI.Supervisor.Resource` has no lifecycle phase to attach one to, so the ordering becomes the caller's problem.
 
-**The trap is putting the decommission run in the blueprint's `resources:` block.** Everything in there is created when the *deployment* is created, not when it's deleted. A decommission `AnsibleRun` declared alongside the VM runs the teardown playbook at provisioning time (against a VM that probably has no IP yet), and then, having run once, never runs again. There's no delete-time counterpart to `resources:`, so this has to come from somewhere else.
+**The trap is putting the decommission run in the blueprint's `resources:` block.** Everything in there is created when the *deployment* is created rather than when it's deleted. A decommission `AnsibleRun` declared alongside the VM runs the teardown playbook at provisioning time (against a VM that probably has no IP yet), and then, having run once, never runs again. There's no delete-time counterpart to `resources:`, so this has to come from somewhere else.
 
-Two ways to get it, plus one that looks obvious and does not work.
+There are two ways to get it, plus one that looks obvious and doesn't work.
 
 ### A separate decommission blueprint
 
-Cleanest, and it puts the action in the catalog where people can find it. A second, tiny blueprint that takes the namespace and VM name as inputs, targets the existing namespace, and contains only the run:
+This is the cleanest, and it puts the action in the catalog where people can find it. It's a second, tiny blueprint that takes the namespace and VM name as inputs, targets the existing namespace, and contains only the run:
 
 ```yaml
 formatVersion: 2
@@ -415,11 +415,11 @@ resources:
             regex: '^Ready$'
 ```
 
-Request it, let it reach `Ready`, then delete the original deployment. The decommission deployment itself can be deleted afterwards; its run created no inventory host worth keeping.
+Request it, let it reach `Ready`, then delete the original deployment. The decommission deployment itself can be deleted afterwards, since its run created no inventory host worth keeping.
 
 ### Not: a conditional resource in the same blueprint
 
-Worth ruling out explicitly, because it's the first thing most people try. The idea is an input that decides whether the decommission run exists, flipped on a day-2 update just before deleting. It doesn't work, and the resource type says so.
+This is worth ruling out explicitly, because it's the first thing most people try. The idea is an input that decides whether the decommission run exists, flipped on a day-2 update just before deleting. It doesn't work, and the resource type says so.
 
 `CCI.Supervisor.Resource` has exactly six properties. Read them off your own instance:
 
@@ -438,17 +438,17 @@ curl -sk -H "Authorization: Bearer $TOKEN" \
 | `object` | computed - the live object, which is what `${resource.X.object...}` reads |
 | `wait` | the wait block |
 
-`count` is `ignoreOnUpdate`, so changing it on a deployment update is ignored: a run gated behind `count` can't be made to appear later. And there's no `condition` property at all. Note also that the blueprint validation endpoint accepts unknown resource properties without complaint, so a made-up `condition:` or a `count` expression will happily validate and then do nothing. The resource-type schema is the only reliable answer.
+`count` is `ignoreOnUpdate`, so changing it on a deployment update is ignored, and a run gated behind `count` can't be made to appear later. There's also no `condition` property at all. Note that the blueprint validation endpoint accepts unknown resource properties without complaint, so a made-up `condition:` or a `count` expression will happily validate and then do nothing. The resource-type schema is the only reliable answer.
 
-The same list is the reason there's no in-blueprint deprovision hook to reach for. `Cloud.Ansible.Tower` in a VM Apps organization carries `templates.provision[]` **and `templates.de-provision[]`**, because it's a typed resource whose provider implements a deprovision phase. `CCI.Supervisor.Resource` is a generic manifest wrapper with no lifecycle phases. It applies an object on create and deletes it on destroy, and there's nowhere to hang "run this on the way out".
+That same list is the reason there's no in-blueprint deprovision hook to reach for. `Cloud.Ansible.Tower` in a VM Apps organization carries `templates.provision[]` **and `templates.de-provision[]`**, because it's a typed resource whose provider implements a deprovision phase. `CCI.Supervisor.Resource` is a generic manifest wrapper with no lifecycle phases. It applies an object on create and deletes it on destroy, and there's nowhere to hang "run this on the way out".
 
 ### Out of band
 
-If whatever drives decommission is not VCFA at all - a pipeline, an Orchestrator workflow, a person - it applies the `AnsibleRun` to the namespace directly, waits on `.status.state`, and then removes the deployment. This is the case where `ttlSecondsAfterFinished` earns its keep, because nothing else owns the object.
+If whatever drives decommission isn't VCFA at all, so a pipeline, an Orchestrator workflow, or a person, it applies the `AnsibleRun` to the namespace directly, waits on `.status.state`, and then removes the deployment. This is the case where `ttlSecondsAfterFinished` earns its keep, because nothing else owns the object.
 
 ### Cleanup that doesn't need the guest
 
-Removing a DNS record, closing a CMDB entry, silencing an alert: none of these need the VM alive, so they aren't bound by any of the above and can run after the deployment is gone. They can't use `varsFrom` against the VM at that point, though, because there's no VM left to read. Whatever creates the run has to pass the name and address as literal `extraVars`.
+Removing a DNS record, closing a CMDB entry, or silencing an alert doesn't need the VM alive, so none of these are bound by any of the above and they can run after the deployment is gone. They can't use `varsFrom` against the VM at that point, though, because there's no VM left to read. Whatever creates the run has to pass the name and address as literal `extraVars`.
 
 ## Teardown
 
@@ -456,11 +456,11 @@ Deleting the deployment deletes the `AnsibleBinding`, whose finalizer blocks unt
 
 `AnsibleRun` carries the same finalizer and the same caveat, and a blueprint-owned one is deleted with the deployment like any other resource. Don't give it a `ttlSecondsAfterFinished` to try to tidy it up sooner. See [above](#one-off-actions-with-ansiblerun) for why a resource that deletes itself out from under VCFA is worse than one that sticks around.
 
-Set `cleanupPolicy: Retain` on a binding or run if you want the AWX host entries kept after the deployment is gone - for run history or audit. They are then yours to clean up.
+Set `cleanupPolicy: Retain` on a binding or run if you want the AWX host entries kept after the deployment is gone, for run history or audit. They're then yours to clean up.
 
 **Running a playbook on the way out.** `spec.onDeleted` on the binding launches a template when a VM in the deployment is deleted, before its inventory host goes. That's the deregistration half of what `Cloud.Ansible.Tower`'s `templates.de-provision[]` did in a VM Apps organization. Deleting the deployment deletes both the VMs and the binding, and each VM's hook runs before the binding finishes, so a deployment teardown takes as long as the slowest deregistration playbook rather than a second or two. Budget for that, or bound it with `timeoutSeconds`. Past that, the finalizer is released regardless, so a hung playbook can't leave a deployment stuck deleting.
 
-The hook cannot reach inside the guest: vm-operator has destroyed the machine by the time it runs. Anything that needs a live guest has to happen while the deployment still exists, as a day-2 action against the binding rather than as part of the teardown.
+The hook cannot reach inside the guest, since vm-operator has destroyed the machine by the time it runs. Anything that needs a live guest has to happen while the deployment still exists, as a day-2 action against the binding rather than as part of the teardown.
 
 ## Troubleshooting
 
@@ -485,4 +485,4 @@ kubectl get ansiblebindingvm -n <project-supervisor-namespace> -l field.vmware.c
   -o jsonpath='{range .items[*]}{.spec.vmName}{"\t"}{.status.phase}{"\t"}{.status.lastJobURL}{"\n"}{end}'
 ```
 
-Full CRD reference in the [README](README.md), edge cases in the [FAQ](FAQ.md).
+There's a full CRD reference in the [README](README.md), and the edge cases are in the [FAQ](FAQ.md).

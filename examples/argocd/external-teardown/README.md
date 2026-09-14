@@ -1,25 +1,26 @@
 # external-teardown/
 
-Decommissioning a guest before its VM is destroyed - the one thing that has
-no reliable Argo shape, sequenced from outside instead.
+Decommissioning a guest before its VM is destroyed. This is the one thing
+that has no reliable Argo shape, so it's sequenced from outside instead.
 
 ## The problem
 
-A decommission playbook that logs into the guest - flushing a queue,
-deregistering from a cluster, taking a final backup - has to run while the
+A decommission playbook that logs into the guest, so flushing a queue,
+deregistering from a cluster, or taking a final backup, has to run while the
 VM is still up.
 
 - `PostDelete` runs after the application's resources are gone. The VM is
   already destroyed and the playbook SSHes into nothing.
-- A finalizer on the `VirtualMachine` does not help either: vm-operator's
-  own finalizer destroys the vSphere VM during its finalization.
-- VM Service has a real pre-delete mechanism, and this service is not
+- A finalizer on the `VirtualMachine` doesn't help either, because
+  vm-operator's own finalizer destroys the vSphere VM during its
+  finalization.
+- VM Service has a real pre-delete mechanism, and this service isn't
   allowed to use it -
   [why](../../../FAQ.md#why-is-there-no-pre-delete-hook).
 - Newer Argo CD documents a `PreDelete` hook, which fires before the
   application's resources are removed and would be the right shape. **This
   repo does not pin a minimum version for it and does not test it.** Verify
-  it against your own Argo CD before depending on it; the cost of being
+  it against your own Argo CD before depending on it, the cost of being
   wrong is a guest destroyed with its decommission unexecuted.
 
 So the ordering becomes the caller's problem. That's a genuine regression
@@ -29,7 +30,7 @@ and it's worth being straight about.
 ## What is here
 
 - [`ansiblerun.yml`](ansiblerun.yml) - the decommission run. Applied by the
-  script, not by Argo.
+  script rather than by Argo.
 - [`teardown.sh`](teardown.sh) - run it, wait for it, and only then delete
   the application.
 
@@ -57,7 +58,7 @@ and it's worth being straight about.
 | Run reaches `Failed` | **Stops**, prints `status.message`, exits non-zero. The VM is left alive |
 | Run never finishes within `TIMEOUT` | **Stops**, exits non-zero. The VM is left alive |
 
-`activeDeadlineSeconds` in the manifest is the controller's own bound: on
+`activeDeadlineSeconds` in the manifest is the controller's own bound. On
 expiry it cancels the AWX job and marks the run `Failed`, so the script's
 timeout is a backstop rather than the only thing ending it.
 
@@ -71,9 +72,9 @@ decommissioned.
 
 ## Afterwards
 
-The `AnsibleRun` outlives the application deliberately: it is the record
-that the decommission ran, with a link to the AWX job output. Delete it
-when you no longer need that.
+The `AnsibleRun` outlives the application deliberately, since it's the
+record that the decommission ran, with a link to the AWX job output. Delete
+it when you no longer need that.
 
 Note that it needs the `AWXConnection` and its `Secret` to still exist while
 it finalizes, which is one more reason to keep those out of the application

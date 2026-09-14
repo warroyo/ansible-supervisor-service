@@ -1,7 +1,8 @@
 # platform/
 
-The one-time Argo CD configuration. Installed once by whoever administers
-Argo CD, alongside this service - not by every application.
+The one-time Argo CD configuration. It's installed once by whoever
+administers Argo CD, alongside this service, rather than by every
+application.
 
 ## What is here
 
@@ -11,14 +12,14 @@ Argo CD, alongside this service - not by every application.
 ## Why it is not optional
 
 Argo CD ships a health check for `batch/v1 Job` and none for custom
-resources. An unknown CR is reported `Healthy` the moment it is created,
+resources. An unknown CR is reported `Healthy` the moment it's created,
 so without this:
 
 - a sync wave does not wait for a playbook,
 - a `PostSync` hook does not gate on one,
 - the application goes green while the AWX job is still queued.
 
-That is a silent failure. Nothing errors; the sync is simply meaningless.
+That's a silent failure. Nothing errors, the sync is just meaningless.
 
 ## Applying it
 
@@ -37,7 +38,7 @@ argocd app resources <app> --output tree
 kubectl get ansiblerun -n <namespace>     # READY / STATE / JOB columns
 ```
 
-The key format is `resource.customizations.health.<group>_<Kind>`: group
+The key format is `resource.customizations.health.<group>_<Kind>`, so group
 and kind separated by an underscore. Getting it wrong is indistinguishable
 from not installing it at all, which is why the check above is worth doing
 once.

@@ -1,6 +1,6 @@
 # Argo CD
 
-An `AnsibleRun` is deliberately Job-shaped: immutable spec, one AWX job, run once and never again, optionally self-collecting. So most of what you already know about running a `Job` from Argo CD transfers directly, including the two mechanisms people mix up, resources and hooks, and which one an execution belongs in.
+An `AnsibleRun` is deliberately Job-shaped, with an immutable spec, one AWX job, run once and never again, and optionally self-collecting. So most of what you already know about running a `Job` from Argo CD transfers directly, including the two mechanisms people mix up, resources and hooks, and which one an execution belongs in.
 
 One thing doesn't transfer, and it's the thing that fails silently: **Argo has a built-in health check for `batch/v1 Job` and none for these CRDs.** An unknown custom resource is reported `Healthy` the moment it's created. Without the [health checks below](#1-install-the-health-checks), a sync wave won't wait for a playbook, a `PostSync` hook won't gate on it, and the application goes green while the job is still queued in AWX.
 
@@ -19,11 +19,11 @@ Runnable manifests for the shapes below are in [`examples/argocd/`](examples/arg
 
 ## One-time setup
 
-Done once by whoever administers Argo CD, not by every application. This is the *platform* team, not a tenant: `argocd-cm` lives in Argo's own namespace, so a tenant deploying into their Supervisor namespace can't add these themselves. Install them alongside the service.
+This is done once by whoever administers Argo CD rather than by every application. It's the *platform* team rather than a tenant, since `argocd-cm` lives in Argo's own namespace, so a tenant deploying into their Supervisor namespace can't add these themselves. Install them alongside the service.
 
 ### 1. Install the health checks
 
-Add to the `argocd-cm` ConfigMap. [`examples/argocd/platform/argocd-cm.yml`](examples/argocd/platform/argocd-cm.yml) is this same text as an applyable file. The state machine these read is the one documented under [CRD status](README.md#crd-status), and it lines up with Argo's health model exactly: `Failed` is reserved for a *terminal* outcome, and a run still retrying a transient problem stays `Pending` or `Running` with the error in `message`. That's the difference between `Degraded` and `Progressing`, already made for you.
+Add to the `argocd-cm` ConfigMap. [`examples/argocd/platform/argocd-cm.yml`](examples/argocd/platform/argocd-cm.yml) is this same text as an applyable file. The state machine these read is the one documented under [CRD status](README.md#crd-status), and it lines up with Argo's health model exactly. `Failed` is reserved for a *terminal* outcome, and a run still retrying a transient problem stays `Pending` or `Running` with the error in `message`. That's the difference between `Degraded` and `Progressing`, already made for you.
 
 ```yaml
 apiVersion: v1
@@ -88,7 +88,7 @@ data:
     return hs
 ```
 
-A `VirtualMachine` is worth adding too, since it's what a wave usually needs to wait for and it's equally unknown to Argo. The controller needs the VM's reported IP, so that (not merely `PoweredOn`) is what health should mean here:
+A `VirtualMachine` is worth adding too, since it's what a wave usually needs to wait for and it's equally unknown to Argo. The controller needs the VM's reported IP, so that, rather than merely `PoweredOn`, is what health should mean here:
 
 ```yaml
   resource.customizations.health.vmoperator.vmware.com_VirtualMachine: |
@@ -122,7 +122,7 @@ Don't put the `Secret` holding the AWX API token in the same Git repo as the app
 
 ## Resource or hook?
 
-Argo has two ways to run something, and an `AnsibleRun` fits both - differently.
+Argo has two ways to run something, and an `AnsibleRun` fits both, differently.
 
 | | Tracked resource | Hook |
 |---|---|---|
@@ -132,7 +132,7 @@ Argo has two ways to run something, and an `AnsibleRun` fits both - differently.
 | Runs again | only if the name changes | every sync |
 | Cleaned up | by prune, on app delete | `hook-delete-policy` |
 
-The rule that decides it is the same one that decides [`AnsibleBinding` or `AnsibleRun`](README.md#ansiblebinding-or-ansiblerun), one level up: **is this execution part of the application's desired state, or an event in its deployment?**
+The rule that decides it is the same one that decides [`AnsibleBinding` or `AnsibleRun`](README.md#ansiblebinding-or-ansiblerun), one level up, which is whether this execution is part of the application's desired state or an event in its deployment.
 
 | What you want | Shape |
 |---|---|
@@ -141,9 +141,9 @@ The rule that decides it is the same one that decides [`AnsibleBinding` or `Ansi
 | Run again only when an input changes | tracked resource with the varying value in `metadata.name` |
 | Keep VMs configured, forever, re-runnable on demand | not a run at all - an `AnsibleBinding`, plain tracked resource |
 
-The last row is worth stating outright: a binding is standing desired state, which is precisely what Argo is for. Most of what an application wants is a binding, and a binding needs none of the machinery below. It's an ordinary manifest that Argo applies, diffs, and prunes like any other. Everything from here down is about runs.
+The last row is worth stating outright. A binding is standing desired state, which is precisely what Argo is for. Most of what an application wants is a binding, and a binding needs none of the machinery below. It's an ordinary manifest that Argo applies, diffs, and prunes like any other. Everything from here down is about runs.
 
-A `PostSync` hook, with the health check installed:
+Here's a `PostSync` hook, with the health check installed:
 
 ```yaml
 apiVersion: field.vmware.com/v1
@@ -164,7 +164,7 @@ spec:
   activeDeadlineSeconds: 900       # what eventually turns the sync red
 ```
 
-Two things make that work. `generateName` sidesteps immutability entirely (Argo never patches this object, it creates a new one), and `activeDeadlineSeconds` is what stops a run that can never launch from leaving the sync `Progressing` forever. Set it on every hook.
+Two things make that work. `generateName` sidesteps immutability entirely, since Argo never patches this object and creates a new one instead, and `activeDeadlineSeconds` is what stops a run that can never launch from leaving the sync `Progressing` forever. Set it on every hook.
 
 ## Immutability, and what `Replace=true` does not fix
 
@@ -176,9 +176,9 @@ x-kubernetes-validations:
     message: spec is immutable - an AnsibleRun executes once; create a new one to run again
 ```
 
-That's stricter than a `Job`, and it changes the usual advice. Argo's standard escape hatch for immutable fields is `argocd.argoproj.io/sync-options: Replace=true`, but a replace is still an update, so the API server rejects it the same way. Only `Replace=true` **plus** `Force=true` gets through, because that degrades to delete-then-create, which re-launches a playbook that already ran. For a smoke test that's harmless. For a decommission or a ticket-open, it's an incident.
+That's stricter than a `Job`, and it changes the usual advice. Argo's standard escape hatch for immutable fields is `argocd.argoproj.io/sync-options: Replace=true`, but a replace is still an update, so the API server rejects it the same way. Only `Replace=true` **plus** `Force=true` gets through, because that degrades to delete-then-create, which re-launches a playbook that already ran. For a smoke test that's harmless, but for a decommission or a ticket-open it's an incident.
 
-So do not reach for `Replace`. Use one of the two shapes that never produce a diff in the first place:
+So don't reach for `Replace`. Use one of the two shapes that never produce a diff in the first place:
 
 - **A hook with `generateName`.** Nothing is ever patched.
 - **A tracked resource whose spec does not derive from a mutable input.** If a value can change, put it in the name instead, so a change creates a *new* resource rather than patching the old one:
@@ -192,14 +192,14 @@ So do not reach for `Replace`. Use one of the two shapes that never produce a di
 
 ## Never set a TTL on a run Argo tracks
 
-`ttlSecondsAfterFinished` makes the CR delete itself once it reaches a terminal state. Against a tracked resource that is a loop:
+`ttlSecondsAfterFinished` makes the CR delete itself once it reaches a terminal state. Against a tracked resource that's a loop:
 
 1. The run finishes and collects itself.
 2. Argo sees the resource missing and reports `OutOfSync`.
 3. With `selfHeal: true`, Argo recreates it.
 4. A brand-new `AnsibleRun` launches the playbook a second time. Go to 1.
 
-This is the same trap as [a blueprint-owned run](VCFA-BLUEPRINTS.md#decommissioning-in-the-right-order), except that automated sync makes it recur rather than merely confuse the next update. The rule is simple:
+This is the same trap as [a blueprint-owned run](VCFA-BLUEPRINTS.md#decommissioning-in-the-right-order), except that automated sync makes it recur rather than merely confuse the next update. The rule is pretty simple:
 
 | Who owns the run | TTL |
 |---|---|
@@ -219,9 +219,9 @@ metadata:
     argocd.argoproj.io/sync-wave: "1"     # VM is wave 0
 ```
 
-Argo will not start wave 1 until every wave 0 resource is `Healthy`, and the `VirtualMachine` check above only reports healthy once an IP is reported - which is exactly the condition the controller is waiting on anyway.
+Argo will not start wave 1 until every wave 0 resource is `Healthy`, and the `VirtualMachine` check above only reports healthy once an IP is reported, which is exactly the condition the controller is waiting on anyway.
 
-That said, waves are a convenience here, not a requirement, and it's worth knowing why. A run that references an object that isn't ready sits `Pending` and retries; it doesn't fail. So the run can be created in the same wave as the VM and simply wait. This matters most with `varsFrom`, which reads live objects at launch time:
+That said, waves are a convenience here rather than a requirement, and it's worth knowing why. A run that references an object that isn't ready sits `Pending` and retries rather than failing. So the run can be created in the same wave as the VM and simply wait. This matters most with `varsFrom`, which reads live objects at launch time:
 
 ```yaml
   varsFrom:
@@ -233,13 +233,13 @@ That said, waves are a convenience here, not a requirement, and it's worth knowi
         record_ip: "{.status.network.primaryIP4}"
 ```
 
-The alternative, templating the IP into `extraVars` from Git, isn't available at all, because Git doesn't know it. `varsFrom` is what makes an Argo-managed run possible for anything that depends on runtime state, and the wave is only there to make the first attempt succeed rather than retry a few times. `activeDeadlineSeconds` is what bounds the waiting; without it, a reference that never resolves waits forever and the app sits `Progressing` with no explanation.
+The alternative, templating the IP into `extraVars` from Git, isn't available at all, because Git doesn't know it. `varsFrom` is what makes an Argo-managed run possible for anything that depends on runtime state, and the wave is only there to make the first attempt succeed rather than retry a few times. `activeDeadlineSeconds` is what bounds the waiting, and without it a reference that never resolves waits forever and the app sits `Progressing` with no explanation.
 
 ## Explicit hosts, and what a run may write
 
-A run is a visitor in the inventory. It **executes against** an existing AWX host without owning it: the host's variables, address, groups, and ownership marker come out of the run exactly as they went in, and deleting the run leaves it alone. That holds whether the host was made by hand, by an `AnsibleBindingVM`, or by an earlier run.
+A run borrows the inventory rather than owning it. It **executes against** an existing AWX host without owning it, so the host's variables, address, groups, and ownership marker come out of the run exactly as they went in, and deleting the run leaves it alone. That holds whether the host was made by hand, by an `AnsibleBindingVM`, or by an earlier run.
 
-A run only writes to a host it created itself - one that was not there when it looked.
+A run only writes to a host it created itself, meaning one that was not there when it looked.
 
 That single rule decides every repeating-hook shape:
 
@@ -260,12 +260,12 @@ There's no pre-delete hook *this service* can use. The mechanism exists in VM Se
 
 Argo's own hooks are `PreSync`, `Sync`, `PostSync`, `SyncFail`, and (2.10+) `PostDelete`, which runs **after** the application's resources have been deleted. By then the VM is gone and the guest is unreachable. Newer Argo CD documents a `PreDelete` hook as well, which would fire before the application's resources (the `VirtualMachine` among them) are removed, and that's the right shape for a guest decommission.
 
-**This repo doesn't pin a minimum version for `PreDelete`, and doesn't test it.** Check your own Argo CD's documentation and behaviour before relying on it, because the failure mode of getting it wrong is a hook that never runs and a guest destroyed with its decommission playbook unexecuted. The [external sequencing](#9-decommission-a-guest-before-the-vm-is-destroyed) below works on every version and is what the suite covers.
+**This repo doesn't pin a minimum version for `PreDelete`, and doesn't test it.** Check your own Argo CD's documentation and behavior before relying on it, because the failure mode of getting it wrong is a hook that never runs and a guest destroyed with its decommission playbook unexecuted. The [external sequencing](#9-decommission-a-guest-before-the-vm-is-destroyed) below works on every version and is what the suite covers.
 
 So the limitation carries over intact:
 
 - **A decommission playbook that logs into the guest cannot be an Argo hook.** It has to run while the VM is still up, which means sequencing from outside Argo: create the `AnsibleRun`, wait on `.status.state`, then delete the application. Same shapes as [VCFA](VCFA-BLUEPRINTS.md#decommissioning-in-the-right-order).
-- **Cleanup that doesn't need the guest can be a `PostDelete` hook**, and this is a genuinely good fit. Deregistering DNS, closing a CMDB record, removing a monitoring target: all `hosts: localhost` playbooks against an external API, with no `vmRef` and no `hosts`:
+- **Cleanup that doesn't need the guest can be a `PostDelete` hook**, and this is a genuinely good fit. Deregistering DNS, closing a CMDB record, or removing a monitoring target are all `hosts: localhost` playbooks against an external API, with no `vmRef` and no `hosts`:
 
   ```yaml
   metadata:
@@ -283,11 +283,11 @@ So the limitation carries over intact:
       record_state: absent
   ```
 
-  Note that `varsFrom` is no use here (the VM it would read is already deleted), so a `PostDelete` run must carry everything it needs as literals. If the value it needs is only known at runtime, capture it into the manifest at provisioning time, or accept that this has to be sequenced externally too.
+  Note that `varsFrom` is no use here, since the VM it would read is already deleted, so a `PostDelete` run must carry everything it needs as literals. If the value it needs is only known at runtime, capture it into the manifest at provisioning time, or accept that this has to be sequenced externally too.
 
 ## Scenarios
 
-Nine shapes that cover essentially everything people ask for. All of them assume the [health checks](#1-install-the-health-checks) are installed and that the `AWXConnection` named `awx` already exists in the namespace, [created out of band](#2-create-the-awxconnection-out-of-band).
+These nine shapes cover essentially everything people ask for. All of them assume the [health checks](#1-install-the-health-checks) are installed and that the `AWXConnection` named `awx` already exists in the namespace, [created out of band](#2-create-the-awxconnection-out-of-band).
 
 | # | Scenario | Shape |
 |---|---|---|
@@ -303,7 +303,7 @@ Nine shapes that cover essentially everything people ask for. All of them assume
 
 ### 1. Keep a tier configured
 
-The most common thing, and the one that needs none of the machinery in this document. A binding is standing desired state, which is what Argo is for: an ordinary manifest that Argo applies, diffs and prunes.
+This is the most common thing, and the one that needs none of the machinery in this document. A binding is standing desired state, which is what Argo is for, so it's an ordinary manifest that Argo applies, diffs and prunes.
 
 ```yaml
 apiVersion: field.vmware.com/v1
@@ -337,7 +337,7 @@ To force a re-run without changing the spec, bump the annotation in Git:
 
 ### 2. Register DNS when the app is first deployed
 
-One execution, part of the application's desired state. Tracked resource, so Argo prunes it when the app goes away.
+This is one execution, part of the application's desired state. It's a tracked resource, so Argo prunes it when the app goes away.
 
 ```yaml
 apiVersion: field.vmware.com/v1
@@ -369,13 +369,13 @@ spec:
   # No ttlSecondsAfterFinished - Argo owns this object's lifecycle.
 ```
 
-**`varsFrom` is doing the essential work.** The IP isn't knowable at commit time, so it can't be an `extraVars` literal from Git. Reading it off the live object means the run sits `Pending` and retries until the VM reports an IP. The sync wave is only there to make the first attempt succeed instead of retrying a few times, and `activeDeadlineSeconds` is what stops it waiting forever if the VM never comes up.
+**`varsFrom` is doing the essential work here.** The IP isn't knowable at commit time, so it can't be an `extraVars` literal from Git. Reading it off the live object means the run sits `Pending` and retries until the VM reports an IP. The sync wave is only there to make the first attempt succeed instead of retrying a few times, and `activeDeadlineSeconds` is what stops it waiting forever if the VM never comes up.
 
-**The Infoblox credential is an AWX Credential on the template**, not anything in this manifest. `varsFrom` [refuses to read a Secret](FAQ.md#why-does-varsfrom-refuse-to-read-a-secret) precisely so nobody tries to route a token through Git and into `extra_vars`, where AWX would echo it in job output.
+**The Infoblox credential is an AWX Credential on the template**, rather than anything in this manifest. `varsFrom` [refuses to read a Secret](FAQ.md#why-does-varsfrom-refuse-to-read-a-secret) precisely so nobody tries to route a token through Git and into `extra_vars`, where AWX would echo it in job output.
 
 ### 3. Smoke test after every sync
 
-Runs on every sync, gates the sync on the result, cleans itself up.
+This runs on every sync, gates the sync on the result, and cleans itself up.
 
 ```yaml
 apiVersion: field.vmware.com/v1
@@ -398,13 +398,13 @@ spec:
   activeDeadlineSeconds: 900
 ```
 
-`generateName` is what makes this legal: Argo never patches this object, it creates a new one each time, so the [immutable spec](#immutability-and-what-replacetrue-does-not-fix) is never an issue. `HookSucceeded` deletes it on success and **keeps it on failure**, which is what you want: the failed run stays in the namespace with `status.jobURL` pointing at the AWX output.
+`generateName` is what makes this legal. Argo never patches this object and creates a new one each time, so the [immutable spec](#immutability-and-what-replacetrue-does-not-fix) is never an issue. `HookSucceeded` deletes it on success and **keeps it on failure**, which is what you want, since the failed run stays in the namespace with `status.jobURL` pointing at the AWX output.
 
 With the health check installed, a `Failed` run reports `Degraded` and the sync fails. Without it, the sync goes green regardless. This is the scenario where the missing health check hurts most.
 
 ### 4. Open a change ticket before the sync starts
 
-`PreSync` runs before Argo applies anything, so the run can't reference application resources; on a first deploy they don't exist yet. That's fine, because this shape targets nothing at all.
+`PreSync` runs before Argo applies anything, so the run can't reference application resources, since on a first deploy they don't exist yet. That's fine, because this shape targets nothing at all.
 
 ```yaml
 apiVersion: field.vmware.com/v1
@@ -427,11 +427,11 @@ spec:
   activeDeadlineSeconds: 300
 ```
 
-If the ticket system refuses, the run goes `Failed`, the `PreSync` hook fails, and **Argo never applies the sync**. That's a real change gate, built out of a job template and an annotation.
+If the ticket system refuses, the run goes `Failed`, the `PreSync` hook fails, and **Argo never applies the sync**. That gives you a real change gate out of a job template and an annotation.
 
 ### 5. Re-run only when an input changes
 
-A tracked run whose spec must not change, but which should execute again when a value does. Put the varying value in the name, so a change creates a new object instead of patching the old one - the API server would reject the patch.
+This is a tracked run whose spec must not change, but which should execute again when a value does. Put the varying value in the name, so a change creates a new object instead of patching the old one, which the API server would reject.
 
 ```yaml
 apiVersion: field.vmware.com/v1
@@ -459,9 +459,9 @@ metadata:
   name: deploy-shop-frontend-{{ .Values.appVersion | replace "." "-" }}
 ```
 
-**`prune: true` is required**, not optional. Without it, the superseded runs pile up, and each one holds onto any inventory host it created. The next run will happily execute against that host, but it can't write an `address` or `variables` onto it. See [what a run may write](#explicit-hosts-and-what-a-run-may-write).
+**`prune: true` is required here rather than optional.** Without it, the superseded runs pile up, and each one holds onto any inventory host it created. The next run will happily execute against that host, but it can't write an `address` or `variables` onto it. See [what a run may write](#explicit-hosts-and-what-a-run-may-write).
 
-The name still has to be a legal Kubernetes object name: 253 characters, lowercase alphanumeric plus `-` and `.`. A version string with `+build` metadata in it will be rejected, so sanitise it as above.
+The name still has to be a legal Kubernetes object name, so 253 characters, lowercase alphanumeric plus `-` and `.`. A version string with `+build` metadata in it will be rejected, so sanitize it as above.
 
 ### 6. Patch bare-metal hosts on every sync
 
@@ -499,7 +499,7 @@ spec:
   activeDeadlineSeconds: 1800
 ```
 
-**Safe form B: pre-create the hosts in AWX, by hand or by whatever manages your inventory.** An existing host is resolved and used by every run, and written to by none of them. This is the more robust option when the machines are permanent inventory that happens to get patched, rather than something this service should own:
+**Safe form B: pre-create the hosts in AWX, by hand or by whatever manages your inventory.** An existing host is resolved and used by every run, and written to by none of them. This is the better option when the machines are permanent inventory that happens to get patched, rather than something this service should own:
 
 ```yaml
 spec:
@@ -514,7 +514,7 @@ Note that `hostNamePrefix` on the `AWXConnection` is **not** applied to `spec.ho
 
 ### 7. Deregister DNS when the app is deleted
 
-`PostDelete` (Argo CD 2.10+) runs after the application's resources are gone. Good fit for cleanup that never needed the guest.
+`PostDelete` (Argo CD 2.10+) runs after the application's resources are gone. It's a good fit for cleanup that never needed the guest.
 
 ```yaml
 apiVersion: field.vmware.com/v1
@@ -537,9 +537,9 @@ spec:
   activeDeadlineSeconds: 300
 ```
 
-**`varsFrom` is useless here**, and this is the trap: by the time a `PostDelete` hook runs, the `VirtualMachine` it would read has already been deleted, so the run sits `Pending` until `activeDeadlineSeconds` kills it. Everything a `PostDelete` run needs must be a literal in the manifest. If the value is only knowable at runtime (a DHCP address, say), this can't be a `PostDelete` hook and has to be sequenced externally like scenario 9.
+**`varsFrom` is useless here**, and this is the trap. By the time a `PostDelete` hook runs, the `VirtualMachine` it would read has already been deleted, so the run sits `Pending` until `activeDeadlineSeconds` kills it. Everything a `PostDelete` run needs must be a literal in the manifest. If the value is only knowable at runtime (a DHCP address, say), this can't be a `PostDelete` hook and has to be sequenced externally like scenario 9.
 
-The `AWXConnection` also has to outlive the deletion. Keeping it [out of the application entirely](#2-create-the-awxconnection-out-of-band) is what guarantees that; if it's in the app, the hook may find it already gone.
+The `AWXConnection` also has to outlive the deletion. Keeping it [out of the application entirely](#2-create-the-awxconnection-out-of-band) is what guarantees that, and if it's in the app the hook may find it already gone.
 
 ### 8. Page someone when a sync fails
 
@@ -563,21 +563,21 @@ spec:
   activeDeadlineSeconds: 120
 ```
 
-Worth it only if the paging path already lives in AWX. Argo's own notifications controller is the more direct tool. This is for when the escalation logic (who's on call, which severity, which downstream ticket) is already a playbook.
+This is only worth it if the paging path already lives in AWX. Argo's own notifications controller is the more direct tool. This is for when the escalation logic (who's on call, which severity, which downstream ticket) is already a playbook.
 
 ### 9. Decommission a guest before the VM is destroyed
 
-**Sequence this from outside Argo unless you have verified `PreDelete` on your own Argo CD.** It is listed because it is the thing people try first.
+**Sequence this from outside Argo unless you have verified `PreDelete` on your own Argo CD.** It's listed here because it's the thing people try first.
 
 A decommission playbook that logs into the guest (flushing a queue, deregistering from a cluster, taking a final backup) has to run while the VM is still up. There's no pre-delete hook this service can use ([why](FAQ.md#why-is-there-no-pre-delete-hook)), and Argo's `PostDelete` runs after the VM is already destroyed. Newer Argo CD documents a `PreDelete` hook that fires early enough, but it's [not pinned or tested here](#decommissioning-postdelete-is-too-late), so what follows is the version-independent form. That's also what [`examples/argocd/external-teardown/`](examples/argocd/external-teardown/) implements.
 
 What does **not** work:
 
-- Putting the decommission `AnsibleRun` in the app as a tracked resource. It is created when the app is *deployed*, so the teardown playbook runs at provisioning time against a VM that probably has no IP yet - and then, being terminal, never runs again.
-- A `PostDelete` hook with `vmRef`. The VM is gone; the run cannot build an inventory host and waits out its deadline.
+- Putting the decommission `AnsibleRun` in the app as a tracked resource. It's created when the app is *deployed*, so the teardown playbook runs at provisioning time against a VM that probably has no IP yet, and then, being terminal, never runs again.
+- A `PostDelete` hook with `vmRef`. The VM is gone, so the run cannot build an inventory host and waits out its deadline.
 - A finalizer on the `VirtualMachine`. vm-operator's own finalizer destroys the vSphere VM during its finalization, so the playbook would SSH into nothing.
 
-What works is sequencing it outside Argo - run, wait, then delete:
+What works is sequencing it outside Argo, so run, wait, then delete:
 
 ```bash
 kubectl apply -n my-namespace -f - <<'EOF'
@@ -602,14 +602,14 @@ kubectl wait --for=jsonpath='{.status.state}'=Ready \
 argocd app delete shop-frontend --cascade
 ```
 
-Use `--for=jsonpath=` rather than `--for=condition=`, because these CRDs report state in `.status.state` and don't currently publish standard conditions. Note that `wait` won't return early on a `Failed` run; it waits out the timeout. So check the state afterwards before deleting anything:
+Use `--for=jsonpath=` rather than `--for=condition=`, because these CRDs report state in `.status.state` and don't currently publish standard conditions. Note that `wait` won't return early on a `Failed` run, it waits out the timeout. So check the state afterwards before deleting anything:
 
 ```bash
 kubectl get ansiblerun decommission-webserver -n my-namespace \
   -o jsonpath='{.status.state}{"\t"}{.status.message}{"\n"}'
 ```
 
-This is a genuine regression from what `Cloud.Ansible.Tower` could do with `templates.de-provision[]` in a VM Apps organization, and it's worth being straight about rather than papering over: the ordering is the caller's problem now, in Argo exactly as [in VCFA](VCFA-BLUEPRINTS.md#decommissioning-in-the-right-order).
+This is a genuine regression from what `Cloud.Ansible.Tower` could do with `templates.de-provision[]` in a VM Apps organization, and it's worth being straight about rather than papering over. The ordering is the caller's problem now, in Argo exactly as [in VCFA](VCFA-BLUEPRINTS.md#decommissioning-in-the-right-order).
 
 ## Teardown
 
@@ -617,10 +617,10 @@ Deleting the application deletes the CRs, and each one's finalizer blocks until 
 
 If AWX is gone for good and you need the app to finish deleting, the lever depends on the kind:
 
-- An `AnsibleBinding` has a mutable spec, so `cleanupPolicy: Retain` can be set on it and is honoured even while it is terminating. Sync before deleting.
-- An `AnsibleRun` does **not**: its spec is immutable, and patching `cleanupPolicy` on one is rejected by the API server. What releases it is removing what it cleans up *through*: delete the `AWXConnection` it names, or the `Secret` holding the token. A run that can no longer reach AWX at all abandons its hosts, logs which ids it left behind, and releases its finalizer. A run whose AWX is merely erroring keeps retrying, which is the intended difference.
+- An `AnsibleBinding` has a mutable spec, so `cleanupPolicy: Retain` can be set on it and is honored even while it is terminating. Sync before deleting.
+- An `AnsibleRun` does **not**, since its spec is immutable and patching `cleanupPolicy` on one is rejected by the API server. What releases it is removing what it cleans up *through*, so delete the `AWXConnection` it names, or the `Secret` holding the token. A run that can no longer reach AWX at all abandons its hosts, logs which ids it left behind, and releases its finalizer. A run whose AWX is merely erroring keeps retrying, which is the intended difference.
 
-Either way, do not strip finalizers; that leaves hosts behind with no record of them. The FAQ has [how to find hosts a supervisor left behind](FAQ.md#how-do-i-find-awx-hosts-a-supervisor-left-behind).
+Either way, don't strip finalizers, since that leaves hosts behind with no record of them. The FAQ has [how to find hosts a supervisor left behind](FAQ.md#how-do-i-find-awx-hosts-a-supervisor-left-behind).
 
 Order matters on the way out. Argo deletes in reverse sync-wave order, so putting the `AWXConnection` and its `Secret` in an earlier wave than anything that uses them means they're deleted *last*, which is what the finalizers need. Better still, keep the connection out of the application entirely, per [one-time setup](#2-create-the-awxconnection-out-of-band).
 

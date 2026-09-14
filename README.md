@@ -2,7 +2,7 @@
 
 ![Release Status](https://github.com/warroyo/ansible-supervisor-service/actions/workflows/build-release.yml/badge.svg)
 
-Supervisor service that binds VM Service `VirtualMachine`s to AWX/Tower job and workflow templates. It reproduces, for Supervisor-native VMs, the day-2 "run a playbook against this VM" experience that Aria Automation's Ansible Automation Platform integration gives classic vRA deployments.
+This is a Supervisor service that binds VM Service `VirtualMachine`s to AWX/Tower job and workflow templates. It reproduces, for Supervisor-native VMs, the day-2 "run a playbook against this VM" experience that Aria Automation's Ansible Automation Platform integration gives classic vRA deployments.
 
 - [Quickstart](QUICKSTART.md) - shortest path to a first working run
 - [Scenarios](SCENARIOS.md) - what the controller does on a create, an update and a delete
@@ -26,22 +26,22 @@ Supervisor service that binds VM Service `VirtualMachine`s to AWX/Tower job and 
 
 The controller runs centrally in the supervisor cluster. It only ever talks to Kubernetes and to AWX/Tower's HTTPS API, never to the VMs themselves. AWX does the SSH, exactly as it already does for the existing vRA integration, so the controller never needs a network route into a workload network.
 
-You write three CRDs, all namespace-scoped. This is a multi-tenant environment: each tenant namespace owns its own AWX connection and credentials, and nothing is shared across namespaces. The controller creates and deletes a fourth one, `AnsibleBindingVM`, one per matched VM (covered under [CRD status](#crd-status)). [Architecture](ARCHITECTURE.md) shows the whole picture in one diagram:
+You write three CRDs, all namespace-scoped. This is a multi-tenant environment, so each tenant namespace owns its own AWX connection and credentials, and nothing is shared across namespaces. The controller creates and deletes a fourth one, `AnsibleBindingVM`, one per matched VM (covered under [CRD status](#crd-status)). [Architecture](ARCHITECTURE.md) shows the whole picture in one diagram:
 
 **AWXConnection**: points at an AWX/Tower instance and a `Secret` holding its API token. A namespace can define more than one (e.g. dev/prod AWX instances).
 
 **AnsibleBinding**: a persistent binding from a `vmSelector` (matchLabels against `VirtualMachine`s in the same namespace) to an AWX job or workflow template. It's re-runnable. Bump the `ansible.field.vmware.com/reconcile-requested-at` annotation or edit the spec, and the controller launches a fresh run against every currently-matched VM. One CR fans out to every VM the selector matches, and each gets its own `AnsibleBindingVM` carrying that VM's phase, job URL, and bounded run history.
 
-**AnsibleRun**: a single execution. One AWX job, launched once, that never runs again. A binding is standing desired state; a run is what an orchestrator creates when something has already happened: register this VM in DNS, patch these two servers tonight, open this ticket. Its spec is immutable, and neither a spec edit nor the re-run annotation starts a second job, so re-running means creating another CR. It can target a VM, an explicit list of hosts, or nothing at all. That last case is what a `hosts: localhost` playbook calling an external API needs. [When to use which](#ansiblebinding-or-ansiblerun).
+**AnsibleRun**: a single execution. One AWX job, launched once, that never runs again. A binding is standing desired state, and a run is what an orchestrator creates when something has already happened, so registering this VM in DNS, patching these two servers tonight, or opening this ticket. Its spec is immutable, and neither a spec edit nor the re-run annotation starts a second job, so re-running means creating another CR. It can target a VM, an explicit list of hosts, or nothing at all. That last case is what a `hosts: localhost` playbook calling an external API needs. [When to use which](#ansiblebinding-or-ansiblerun).
 
 For each matched, powered-on VM with a reported IP, the controller upserts an AWX inventory host (into whatever inventory the target template already uses) and launches the template scoped to that host via `--limit`. A deleted VM can run a teardown playbook first, through [`onDeleted`](#ansiblebinding). When a VM drops out of the selector, whether deleted or relabeled, its AWX host is cleaned up on the very next reconcile rather than left stale. A stale host keeps an `ansible_host` IP that can later be reassigned to an unrelated VM. If you manage AWX inventory by hand, set `cleanupPolicy: Retain` to opt out.
 
-A few guardrails worth knowing about:
+There are a few guardrails worth knowing about:
 
 - **`vmSelector` may not be empty.** An empty selector would match every VM in the namespace, so it's rejected by the CRD schema and by the controller.
-- **Pre-existing AWX hosts are adopted, never hijacked.** If a host with the target name already exists in the inventory, the controller merges its variables in rather than overwriting them. It records that it did not create the host (`awxHostCreated: false` on that VM's `AnsibleBindingVM`) and never deletes it during cleanup. If that host's existing variables aren't a JSON object it can safely merge into, it refuses rather than destroying them.
+- **Pre-existing AWX hosts are adopted rather than hijacked.** If a host with the target name already exists in the inventory, the controller merges its variables in rather than overwriting them. It records that it did not create the host (`awxHostCreated: false` on that VM's `AnsibleBindingVM`) and never deletes it during cleanup. If that host's existing variables aren't a JSON object it can safely merge into, it refuses rather than destroying them.
 - **Hosts owned by another supervisor are refused outright.** See [Can several supervisors share one AWX instance?](FAQ.md#can-several-supervisors-share-one-awx-instance)
-- **The inventory host is reconciled against AWX, not against status.** Every `host_check_period` (600s by default), the host is read back from AWX, so one deleted or hand-edited in the AWX UI gets recreated or repaired. If the controller trusted its own record instead, a deleted host would go undetected, and every later run would fail with `--limit does not match any hosts` with nothing to repair it. Variables the controller doesn't manage are left untouched. A steady state writes nothing, and between checks an idle VM costs AWX nothing at all. A spec change or a re-run request isn't on that timer; both take effect on the next pass.
+- **The inventory host is reconciled against AWX rather than against status.** Every `host_check_period` (600s by default), the host is read back from AWX, so one deleted or hand-edited in the AWX UI gets recreated or repaired. If the controller trusted its own record instead, a deleted host would go undetected, and every later run would fail with `--limit does not match any hosts` with nothing to repair it. Variables the controller doesn't manage are left untouched. A steady state writes nothing, and between checks an idle VM costs AWX nothing at all. A spec change or a re-run request isn't on that timer, both take effect on the next pass.
 - **Leaked hosts get reaped.** Less often (every four host-check periods), a binding lists the AWX hosts carrying its own ownership marker and deletes any that no longer match a VM or a child. Those are the ones a controller leaves behind when it's killed mid-cleanup. It only ever considers hosts this supervisor created for that binding, and `cleanupPolicy: Retain` disables it.
 - **In-flight runs are tracked independently of the VM.** A VM powering off mid-run doesn't lose the job, and re-run requests made during downtime aren't swallowed. See [the FAQ](FAQ.md#what-happens-to-in-flight-runs-when-a-vm-powers-off).
 
@@ -49,7 +49,7 @@ For a step-by-step walkthrough of each of these (a binding created, a VM relabel
 
 ## AnsibleBinding or AnsibleRun?
 
-The short version: **is the thing you want a standing state, or an event that already happened?**
+The short version is whether the thing you want is a standing state, or an event that already happened.
 
 | | `AnsibleBinding` | `AnsibleRun` |
 |---|---|---|
@@ -72,15 +72,15 @@ An `AnsibleRun` has two independent choices, and keeping them apart is what make
 | `hosts: [...]` | one host upserted per entry | those hosts | machines this Supervisor does not own |
 | `vmRef: {name}` | one host from the VM's reported IP | that host | configuring a Supervisor VM's guest |
 
-**Where its variables come from** - `extraVars` for literals, `varsFrom` for fields read off live Kubernetes objects. This is entirely separate from the above: a run with no target at all can still read a VM's IP, which is exactly what a DNS-registration playbook running on localhost needs.
+**Where its variables come from** - `extraVars` for literals, `varsFrom` for fields read off live Kubernetes objects. This is entirely separate from the above, so a run with no target at all can still read a VM's IP, which is exactly what a DNS-registration playbook running on localhost needs.
 
-So there is no "VM mode". `vmRef` means only "build an inventory host from this VM"; reading a VM's fields into playbook variables is `varsFrom`'s job, with `kind: VirtualMachine` like any other object.
+That's why there's no "VM mode". `vmRef` means only "build an inventory host from this VM", and reading a VM's fields into playbook variables is `varsFrom`'s job, with `kind: VirtualMachine` like any other object.
 
 ## Prerequisites
 
 - VCF supervisor cluster with VM Service enabled. Any served `vmoperator.vmware.com` version works - the controller resolves one by API discovery at startup, preferring the newest, and logs its choice as `virtualmachine api: vmoperator.vmware.com/<version>`
 - An AWX or Ansible Automation Platform (Tower) instance that can reach your VMs over SSH at the IP they report in `status.network.primaryIP4`. That address is what the controller writes into the inventory host's `ansible_host`. If AWX has to reach them at some other address, override it per binding with `hostVariables`. AWX, Ansible Tower, AAP 2.4, and AAP 2.5+ are all supported. See [the FAQ](FAQ.md#which-awxtoweraap-versions-are-supported).
-- A Job Template or Workflow Template in AWX, with **Prompt on Launch enabled for Limit** (and for Variables, if you use `extraVars`). [Why](FAQ.md#why-does-my-template-need-prompt-on-launch-for-limit). Its inventory is where the controller creates host entries, and the Machine credential attached to it is what logs into the VMs. A Workflow Template with no inventory of its own is the exception: nothing gets a host created for it, and there's no inventory for `--limit` to scope against, so the run isn't confined to the selected VMs. See [What's different about Workflow Templates?](FAQ.md#whats-different-about-workflow-templates).
+- A Job Template or Workflow Template in AWX, with **Prompt on Launch enabled for Limit** (and for Variables, if you use `extraVars`). [Why](FAQ.md#why-does-my-template-need-prompt-on-launch-for-limit). Its inventory is where the controller creates host entries, and the Machine credential attached to it is what logs into the VMs. A Workflow Template with no inventory of its own is the exception, since nothing gets a host created for it and there's no inventory for `--limit` to scope against, so the run isn't confined to the selected VMs. See [What's different about Workflow Templates?](FAQ.md#whats-different-about-workflow-templates).
 
 ## Install
 
@@ -99,7 +99,7 @@ So there is no "VM mode". `vmRef` means only "build an inventory host from this 
 imgpkg copy -b <bundle-ref-from-ansible-supervisor.yml> --to-repo your-repo.example.com/ansible-supervisor
 ```
 
-2. In `ansible-supervisor.yml`, replace `ghcr.io/warroyo/ansible-supervisor-service` with your registry path. SHA stays the same; only the registry prefix changes.
+2. In `ansible-supervisor.yml`, replace `ghcr.io/warroyo/ansible-supervisor-service` with your registry path. SHA stays the same, only the registry prefix changes.
 
 3. Follow the UI steps above.
 
@@ -118,7 +118,7 @@ imgpkg copy -b <bundle-ref-from-ansible-supervisor.yml> --to-repo your-repo.exam
 
 ## Usage
 
-Three manifests, applied in this order, are a complete working setup - `examples/` holds all of them:
+Three manifests, applied in this order, are a complete working setup, and `examples/` holds all of them:
 
 | File | What it creates |
 |---|---|
@@ -135,11 +135,11 @@ The service never touches a VM directly, so there's nothing to install on one. A
 kubectl apply -f examples/virtualMachine.yml
 ```
 
-The label is the only part of that file this service reads: `app: webserver` in the example is what `vmSelector` matches. Everything else is an ordinary VM Service VM.
+The label is the only part of that file this service reads, so `app: webserver` in the example is what `vmSelector` matches. Everything else is an ordinary VM Service VM.
 
 AWX authenticates with the Machine credential attached to the job template, so the VM has to boot with the matching user and public key already in place. The example does that with cloud-init. A VM that comes up without it produces a job that fails with `unreachable`, and the `AnsibleBinding` reports that VM's `phase: Failed` along with the AWX job to look at.
 
-A matched VM is picked up on the next resync - creating a VM after the `AnsibleBinding` already exists needs no annotation bump, and one binding fans out to every VM its selector matches, each with its own inventory host and its own run.
+A matched VM is picked up on the next resync, so creating a VM after the `AnsibleBinding` already exists needs no annotation bump, and one binding fans out to every VM its selector matches, each with its own inventory host and its own run.
 
 ### AWXConnection
 
@@ -237,7 +237,7 @@ kubectl get ansiblebinding my-binding -n my-namespace -o jsonpath='{.status.summ
 # ["web-1 (my-namespace/platform-base)"]
 ```
 
-Ownership is released when the owner stops selecting the VM or is deleted, and only once its child has finished cleaning up. A waiting binding then picks it up within about half a minute. Under `cleanupPolicy: Retain`, the AWX host keeps the old binding's ownership marker, so the new owner refuses to touch that host until you retire it or give the new binding its own `hostNamePrefix`. The Kubernetes claim moves; the AWX host is not stolen.
+Ownership is released when the owner stops selecting the VM or is deleted, and only once its child has finished cleaning up. A waiting binding then picks it up within about half a minute. Under `cleanupPolicy: Retain`, the AWX host keeps the old binding's ownership marker, so the new owner refuses to touch that host until you retire it or give the new binding its own `hostNamePrefix`. The Kubernetes claim moves, and the AWX host stays where it is.
 
 To run **several playbooks for one VM**, compose them into one AWX workflow under a single binding rather than pointing two bindings at it. A workflow's nodes may use different inventories and act on more than this VM. That's AWX's business, and the controller doesn't inspect or restrict it.
 
@@ -252,9 +252,9 @@ Editing `spec` (which bumps `.metadata.generation`) triggers a re-run the same w
 
 **cleanupPolicy**: `Delete` (default) removes AWX inventory hosts **this controller created**, either when a VM stops matching the selector or when the whole `AnsibleBinding` is deleted. Hosts that already existed and were adopted are never deleted, regardless. `Retain` leaves everything in place. That's useful if you manage AWX inventory by hand, want hosts kept for audit or history, or have other job templates referencing that host outside this CR's control.
 
-Cleanup is retried rather than leaked. A host that can't be deleted keeps its `AnsibleBindingVM` in `Terminating` until the deletion succeeds, and deleting an `AnsibleBinding` blocks on its finalizer until every child has finished and AWX has confirmed the hosts are gone. A temporary failure (AWX unreachable, the API server erroring) is retried indefinitely rather than abandoned, since an abandoned host keeps an IP that AWX may later hand to an unrelated VM. Only a permanently unrecoverable case gives up: the `AWXConnection` or its Secret has been deleted, or is malformed beyond retrying, so there's no way left to reach AWX. That's logged, and the CR finishes deleting. To release a binding whose AWX instance is gone for good, set `cleanupPolicy: Retain` on it; that's honored even while it's terminating.
+Cleanup is retried rather than leaked. A host that can't be deleted keeps its `AnsibleBindingVM` in `Terminating` until the deletion succeeds, and deleting an `AnsibleBinding` blocks on its finalizer until every child has finished and AWX has confirmed the hosts are gone. A temporary failure (AWX unreachable, the API server erroring) is retried indefinitely rather than abandoned, since an abandoned host keeps an IP that AWX may later hand to an unrelated VM. Only a permanently unrecoverable case gives up, meaning the `AWXConnection` or its Secret has been deleted, or is malformed beyond retrying, so there's no way left to reach AWX. That's logged, and the CR finishes deleting. To release a binding whose AWX instance is gone for good, set `cleanupPolicy: Retain` on it, which is honored even while it's terminating.
 
-**onDeleted**: a template to launch when a matched `VirtualMachine` is deleted, before its inventory host is removed. Use it to deregister the VM from DNS, IPAM, a CMDB, monitoring, or a licence server. It's the counterpart of the provisioning run: `spec.template` runs when a VM arrives, `spec.onDeleted.template` runs when one goes.
+**onDeleted**: a template to launch when a matched `VirtualMachine` is deleted, before its inventory host is removed. Use it to deregister the VM from DNS, IPAM, a CMDB, monitoring, or a license server. It's the counterpart of the provisioning run, so `spec.template` runs when a VM arrives and `spec.onDeleted.template` runs when one goes.
 
 ```yaml
 spec:
@@ -265,13 +265,13 @@ spec:
     timeoutSeconds: 900        # the whole hook, across retries. Default 900
 ```
 
-Four things are worth knowing before you write the playbook.
+There are four things worth knowing before you write the playbook.
 
-**The guest is gone.** By the time the hook runs, vm-operator has already destroyed the virtual machine during its own finalization. There is no machine to log into, so the playbook has to act on the external record, not on the host. To make that unmissable, the controller sets `ansible_connection: local` on the inventory host before launching. A play that forgets `delegate_to` then runs on the AWX control node instead of connecting to an address IPAM may already have re-leased to someone else.
+**The guest is already gone.** By the time the hook runs, vm-operator has already destroyed the virtual machine during its own finalization. There's no machine to log into, so the playbook has to act on the external record rather than on the host. To make that unmissable, the controller sets `ansible_connection: local` on the inventory host before launching. A play that forgets `delegate_to` then runs on the AWX control node instead of connecting to an address IPAM may already have re-leased to someone else.
 
-**It fires only for a VM that's really gone.** A VM that merely stopped matching the selector (relabelled, or the selector narrowed) is still running, and a decommission playbook against a live production machine would be damage rather than cleanup. Its inventory host is still cleaned up, but no playbook runs. Deleted, being deleted, or replaced by a different VM of the same name all count as gone.
+**It fires only for a VM that's really gone.** A VM that merely stopped matching the selector (relabelled, or the selector narrowed) is still running, and running a decommission playbook against a live production machine does damage rather than cleaning anything up. Its inventory host is still cleaned up, but no playbook runs. Deleted, being deleted, or replaced by a different VM of the same name all count as gone.
 
-**It never blocks a delete.** A hook that fails, can't be launched, or overruns `timeoutSeconds` is recorded and released: the host is removed and the object finishes deleting. A teardown playbook that will never succeed must not be able to hold a VM, and the namespace above it, in `Terminating` forever. What happened is written in three places: the controller log (with the AWX job URL), `status.deprovision` on the child while it exists, and a Kubernetes Event on the `AnsibleBinding`, which outlives the child:
+**It never blocks a delete.** A hook that fails, can't be launched, or overruns `timeoutSeconds` is recorded and released, so the host is removed and the object finishes deleting. A teardown playbook that will never succeed must not be able to hold a VM, and the namespace above it, in `Terminating` forever. What happened is written in three places: the controller log (with the AWX job URL), `status.deprovision` on the child while it exists, and a Kubernetes Event on the `AnsibleBinding`, which outlives the child:
 
 ```bash
 kubectl get events -n my-namespace --field-selector involvedObject.name=sample-webserver-binding
@@ -279,9 +279,9 @@ kubectl get events -n my-namespace --field-selector involvedObject.name=sample-w
 
 **What it runs against is a choice: `onDeleted.targeting`.**
 
-`ManagedHost` is the default, and it's what a manifest that says nothing gets. The controller aims the hook at this VM's inventory host by supplying the host name as the launch limit, so Prompt on Launch for Limit has to be enabled on the hook's template. There's no `useDefaultLimit` escape here: a deprovision playbook that ran against a whole inventory would decommission every host in it. The template must also use the **same inventory** as `spec.template`. A limit only selects hosts within the job's own inventory, so a hook pointed elsewhere would run against an unrelated host of the same name, or against nothing while reporting success. Either mismatch is refused rather than launched, and so is a template with no inventory of its own. If AWX accepts the launch but reports that it dropped the limit, the hook is marked failed no matter how well the job itself ran.
+`ManagedHost` is the default, and it's what a manifest that says nothing gets. The controller aims the hook at this VM's inventory host by supplying the host name as the launch limit, so Prompt on Launch for Limit has to be enabled on the hook's template. There's no `useDefaultLimit` escape here, because a deprovision playbook that ran against a whole inventory would decommission every host in it. The template must also use the **same inventory** as `spec.template`. A limit only selects hosts within the job's own inventory, so a hook pointed elsewhere would run against an unrelated host of the same name, or against nothing while reporting success. Either mismatch is refused rather than launched, and so is a template with no inventory of its own. If AWX accepts the launch but reports that it dropped the limit, the hook is marked failed no matter how well the job itself ran.
 
-`Template` hands the aiming back to AWX. The controller supplies **no inventory and no limit at all**, so the job or workflow runs against whatever it's configured for. Nothing is required of the template: no shared inventory, no limit prompt. The hook doesn't even need this VM's inventory host to exist. It runs when the host is missing, when it belongs to another binding, or when provisioning never created one. This is the mode for a decommission whose records don't live on the machine: a workflow whose nodes each carry their own inventory, one that retires a DNS record, an IPAM lease, and a monitoring entry in three different places, or a `hosts: localhost` playbook that calls an API.
+`Template` hands the aiming back to AWX. The controller supplies **no inventory and no limit at all**, so the job or workflow runs against whatever it's configured for. Nothing is required of the template, so no shared inventory and no limit prompt. The hook doesn't even need this VM's inventory host to exist. It runs when the host is missing, when it belongs to another binding, or when provisioning never created one. This is the mode for a decommission whose records don't live on the machine: a workflow whose nodes each carry their own inventory, one that retires a DNS record, an IPAM lease, and a monitoring entry in three different places, or a `hosts: localhost` playbook that calls an API.
 
 ```yaml
 spec:
@@ -293,13 +293,13 @@ spec:
     timeoutSeconds: 900
 ```
 
-It's opt-in and never inferred. A `ManagedHost` hook whose template stops accepting a limit fails and says so; it isn't quietly widened to whatever that template targets. The trade is real: in `Template` mode you own the scope of what runs, including anything it touches beyond this VM, and AWX's own launch requirements (credentials, survey answers) still apply. Either way, nothing changes about the managed host. It's cleaned up from what provisioning recorded, not from the workflow's inventory, and in `Template` mode the controller neither pins nor edits it, because it never aimed anything at it.
+It's opt-in and never inferred. A `ManagedHost` hook whose template stops accepting a limit fails and says so rather than being quietly widened to whatever that template targets. The trade-off is real: in `Template` mode you own the scope of what runs, including anything it touches beyond this VM, and AWX's own launch requirements (credentials, survey answers) still apply. Either way, nothing changes about the managed host. It's cleaned up from what provisioning recorded rather than from the workflow's inventory, and in `Template` mode the controller neither pins nor edits it, because it never aimed anything at it.
 
-Prompt on Launch for Variables is optional in both modes. With it, the run gets `asb_hook`, `asb_vm_name`, `asb_vm_uid`, `asb_binding`, and `asb_last_known_ip`. Without it, those are dropped and the run still goes ahead. That context is reconstructed from the child, not from AWX, so it's there even in `Template` mode where there may be no host to read it from. Note that `asb_last_known_ip` can be empty, and it's a last known address rather than proof of identity.
+Prompt on Launch for Variables is optional in both modes. With it, the run gets `asb_hook`, `asb_vm_name`, `asb_vm_uid`, `asb_binding`, and `asb_last_known_ip`. Without it, those are dropped and the run still goes ahead. That context is reconstructed from the child rather than from AWX, so it's there even in `Template` mode where there may be no host to read it from. Note that `asb_last_known_ip` can be empty, and it's a last known address rather than proof of identity.
 
-A host that carries another binding's ownership marker is left alone entirely: no variables changed, no playbook run, nothing deleted. An unmarked host this binding adopted is a legitimate target, and so is one under `cleanupPolicy: Retain`. Because both outlive the hook, the `ansible_connection` override is taken back off them afterwards, restoring whatever the variable said before. That holds even when `cleanupPolicy` is switched to `Retain` while the hook is running: the decision is made from the policy in force when the hook finishes.
+A host that carries another binding's ownership marker is left alone entirely: no variables changed, no playbook run, nothing deleted. An unmarked host this binding adopted is a legitimate target, and so is one under `cleanupPolicy: Retain`. Because both outlive the hook, the `ansible_connection` override is taken back off them afterwards, restoring whatever the variable said before. That holds even when `cleanupPolicy` is switched to `Retain` while the hook is running, since the decision is made from the policy in force when the hook finishes.
 
-Under `Retain` there's no host to delete, so an expired hook finishes even if AWX can't be reached at all; the log and the Event then note that the override couldn't be undone. Under `Delete`, an unreachable AWX is still retried indefinitely rather than leaking a host, exactly as it was before hooks existed.
+Under `Retain` there's no host to delete, so an expired hook finishes even if AWX can't be reached at all, and the log and the Event then note that the override couldn't be undone. Under `Delete`, an unreachable AWX is still retried indefinitely rather than leaking a host, exactly as it was before hooks existed.
 
 The hook waits for a provisioning job still in flight against the same host before it launches, so a decommission playbook can't run against a machine a provisioning playbook is still configuring. That wait counts against the same `timeoutSeconds`.
 
@@ -361,27 +361,27 @@ spec:
 | `activeDeadlineSeconds` | Bound the whole run, measured from creation. On expiry the AWX job is canceled and the run goes terminally `Failed` |
 | `ttlSecondsAfterFinished` | Delete the CR that long after it finishes, taking the AWX hosts it created with it. Granularity is `resync_period`. Leave it unset when something else owns the object's lifecycle - [a VCFA deployment, for instance](VCFA-BLUEPRINTS.md#one-off-actions-with-ansiblerun) |
 
-**No target means no limit**, and that's deliberate. The template's own inventory and scope apply, exactly as `useDefaultLimit: true` does on a binding. For a `hosts: localhost` playbook that's the whole point: AWX requires *an* inventory on a job template regardless, and the usual answer is a throwaway one holding only `localhost`. For a `hosts: all` template with a populated inventory, it means the run reaches all of it. A binding refuses to launch in the analogous situation; a targetless run doesn't, because there's nothing to scope to.
+**No target means no limit**, and that's deliberate. The template's own inventory and scope apply, exactly as `useDefaultLimit: true` does on a binding. For a `hosts: localhost` playbook that's the whole point, since AWX requires *an* inventory on a job template regardless, and the usual answer is a throwaway one holding only `localhost`. For a `hosts: all` template with a populated inventory, it means the run reaches all of it. A binding refuses to launch in the analogous situation, and a targetless run doesn't, because there's nothing to scope to.
 
-**A run is a visitor in the inventory.** A host that already exists (made by hand, by an `AnsibleBindingVM`, or by an earlier run) is resolved and executed against, never written to and never claimed. Its variables, address, groups, and ownership marker come out of the run exactly as they went in, it reports `awxHostCreated: false`, and cleanup leaves it alone. Only a host the run itself created is written to, and only that host is deleted with the run.
+**A run borrows the inventory rather than owning it.** A host that already exists (made by hand, by an `AnsibleBindingVM`, or by an earlier run) is resolved and executed against, never written to and never claimed. Its variables, address, groups, and ownership marker come out of the run exactly as they went in, it reports `awxHostCreated: false`, and cleanup leaves it alone. Only a host the run itself created is written to, and only that host is deleted with the run.
 
-So host-level fields on a host that already exists are **refused before anything launches**, rather than quietly ignored. Running the playbook against a configuration the spec asked for but AWX never saw would be the worse outcome. Per-execution values belong in `extraVars`/`varsFrom`, which AWX passes as the job's `extra_vars`. Ansible ranks those above inventory variables: the run gets its value for that job, the inventory never changes, and the next job on that host sees the inventory's own value again.
+So host-level fields on a host that already exists are **refused before anything launches**, rather than quietly ignored. Running the playbook against a configuration the spec asked for but AWX never saw would be the worse outcome. Per-execution values belong in `extraVars`/`varsFrom`, which AWX passes as the job's `extra_vars`. Ansible ranks those above inventory variables, so the run gets its value for that job, the inventory never changes, and the next job on that host sees the inventory's own value again.
 
 This is what lets a one-off run and the `AnsibleBinding` that manages a VM share one AWX host without contesting it.
 
-**The spec is immutable, and the API server enforces it.** That makes a run idempotent across anything that re-applies it: re-applying an unchanged manifest does nothing, and there's no second job to worry about. It also means an *edit* is rejected outright. So any templating system that generates a run's spec from values that can change has to generate a new `metadata.name` when they do, rather than patching in place.
+**The spec is immutable, and the API server enforces it.** That makes a run idempotent across anything that re-applies it, so re-applying an unchanged manifest does nothing and there's no second job to worry about. It also means an *edit* is rejected outright. So any templating system that generates a run's spec from values that can change has to generate a new `metadata.name` when they do, rather than patching in place.
 
 #### `varsFrom`, and what it can read
 
-A playbook that *acts on* a host and one that *acts on its behalf* need opposite things. The second is the common case for DNS, IPAM, CMDB, and monitoring registration: the playbook runs `hosts: localhost`, talks to an API, and needs the machine's details as **variables**, not as an inventory host. `varsFrom` is that, and it works over any kind: a `VirtualMachine`, a `Service`, one of your own CRs.
+A playbook that *acts on* a host needs something different from one that *acts on its behalf*. The second is the common case for DNS, IPAM, CMDB, and monitoring registration: the playbook runs `hosts: localhost`, talks to an API, and needs the machine's details as **variables** rather than as an inventory host. `varsFrom` is that, and it works over any kind, whether that's a `VirtualMachine`, a `Service`, or one of your own CRs.
 
 Each entry is one read. `vars` maps an `extra_vars` name to a JSONPath, grouped so several fields off one object cost a single GET. Names are explicit rather than magic, so nothing collides with variables the template already uses, and any field of any VM API version is reachable without this service having to track where each version puts things.
 
-Guardrails, all of which fail the run terminally rather than quietly doing something surprising:
+There are guardrails, all of which fail the run terminally rather than quietly doing something surprising:
 
-- **Same namespace only.** There is no `namespace` field on `resource` - a cross-namespace read would let a tenant pull data out of a neighbour.
-- **Never a `Secret`.** `extra_vars` are visible in AWX job output and in the job's stored launch parameters, so sourcing a Secret through them is a credential leak with extra steps. Attach an AWX Credential to the template instead.
-- **Only the exact kinds `vars_from_resources` names.** The `ClusterRole` lists every one of them (by default `core/configmaps` and `vmoperator.vmware.com/virtualmachines`), and never a wildcard, in any group. A kind outside the list is refused by name, telling you what to widen, rather than coming back `Forbidden`. This matters because the controller reads with its own identity, not the requesting user's. Anything of a listed kind in the run's namespace becomes readable by anyone who can create an `AnsibleRun` there, so the list is the blast radius. (A Supervisor's own admission policy also refuses a service `ClusterRole` that wildcards the core group outright, so an install would fail rather than degrade.) Namespace-scoped RBAC on Supervisor usually already grants a tenant that much, and Secrets are refused regardless. Even so, widen it deliberately, not reflexively.
+- **Same namespace only.** There's no `namespace` field on `resource`, since a cross-namespace read would let a tenant pull data out of a neighbor.
+- **Never a `Secret`.** `extra_vars` are visible in AWX job output and in the job's stored launch parameters, so sourcing a Secret through them leaks the credential. Attach an AWX Credential to the template instead.
+- **Only the exact kinds `vars_from_resources` names.** The `ClusterRole` lists every one of them (by default `core/configmaps` and `vmoperator.vmware.com/virtualmachines`), and never a wildcard, in any group. A kind outside the list is refused by name, telling you what to widen, rather than coming back `Forbidden`. This matters because the controller reads with its own identity rather than the requesting user's. Anything of a listed kind in the run's namespace becomes readable by anyone who can create an `AnsibleRun` there, so the list is the blast radius. (A Supervisor's own admission policy also refuses a service `ClusterRole` that wildcards the core group outright, so an install would fail rather than degrade.) Namespace-scoped RBAC on Supervisor usually already grants a tenant that much, and Secrets are refused regardless. Even so, widen it deliberately rather than reflexively.
 - **Scalars only.** A path resolving to a list or an object is refused rather than silently JSON-encoded, since `extraVars` is `map[string]string` and the playbook would receive a string where it expected structure.
 - **No collisions.** A `varsFrom` name that also appears in `extraVars`, or in another entry, is an error rather than a precedence rule.
 
@@ -389,12 +389,12 @@ Only variable *names* are echoed into `status.resolvedVars`. Values never are.
 
 #### Finished, failed, and collected
 
-`finishedAt` is the pivot. It's set only on a **terminal** outcome, and it's what `ttlSecondsAfterFinished` counts from. The distinction matters because most failures are worth retrying and a few aren't:
+`finishedAt` is what everything else hangs off. It's set only on a **terminal** outcome, and it's what `ttlSecondsAfterFinished` counts from. The distinction matters because most failures are worth retrying and a few aren't:
 
 - **Terminal.** The AWX job failed; the template doesn't exist or is ambiguous; a `varsFrom` guardrail was hit; the template would silently drop the limit; the deadline expired; or the `AWXConnection` was repointed at a different AWX instance while the run was in flight. `state: Failed`, and the controller stops.
-- **Retryable.** AWX unreachable or answering 5xx (a template lookup included), the API server erroring, a `varsFrom` object or a `vmRef` VM that hasn't appeared yet, a `varsFrom` path whose field the object's own controller has yet to fill in, or a VM not yet powered on with an IP. The run stays `Pending`/`Running` with the error in `status.message` and keeps trying. `activeDeadlineSeconds` bounds this; without one, a run waiting on an object that never arrives waits forever.
+- **Retryable.** AWX unreachable or answering 5xx (a template lookup included), the API server erroring, a `varsFrom` object or a `vmRef` VM that hasn't appeared yet, a `varsFrom` path whose field the object's own controller has yet to fill in, or a VM not yet powered on with an IP. The run stays `Pending`/`Running` with the error in `status.message` and keeps trying. `activeDeadlineSeconds` bounds this, and without one, a run waiting on an object that never arrives waits forever.
 
-`state: Failed` therefore always means "over", never "struggling".
+So `state: Failed` always means the run is over, and never that it's still struggling.
 
 **A deadline that expires cancels the AWX job**, the way a Kubernetes Job terminates its pods, so the run doesn't report an end state while its playbook is still changing machines. If the job can't be canceled (AWX is exactly what has become unreachable), the run still finishes, and `status.failureReason` notes that the job may still be running. **Deleting an `AnsibleRun` cancels a job still in flight** too, before the inventory hosts go. `cleanupPolicy: Retain` keeps the hosts but doesn't leave the job running.
 
@@ -413,9 +413,9 @@ All four CRDs track reconciliation state in `.status`. Bindings use these states
 | `Conflict` | At least one selected VM is owned by a different binding. `status.summary.conflictedVMs` names them and the binding holding each claim. Reported ahead of `Failed`, since nothing will run for those VMs until the overlap is resolved |
 | `Terminating` | Every matched VM is gone, but a child is still being cleaned up - typically an AWX host that will not delete. `status.summary.terminating` counts them |
 
-An `AnsibleBinding`'s state is aggregated from its children's outcomes, not just from whether the last reconcile threw an error. A job that AWX ran and failed isn't a controller error, but it isn't `Ready` either.
+An `AnsibleBinding`'s state is aggregated from its children's outcomes rather than just from whether the last reconcile threw an error. A job that AWX ran and failed isn't a controller error, but it isn't `Ready` either.
 
-`AnsibleRun` reads `Failed` more narrowly: it means the run is **over**. A run still retrying a transient problem stays `Pending` or `Running` with the error in `message`, because there the distinction is between "this is finished" and "this hasn't got there yet". See [Finished, failed, and collected](#finished-failed-and-collected).
+`AnsibleRun` reads `Failed` more narrowly, where it means the run is **over**. A run still retrying a transient problem stays `Pending` or `Running` with the error in `message`, because there the distinction is between "this is finished" and "this hasn't got there yet". See [Finished, failed, and collected](#finished-failed-and-collected).
 
 ```bash
 kubectl get awxconnection <name> -n <namespace> -o jsonpath='{.status}'
@@ -433,7 +433,7 @@ kubectl get ansiblerun <name> -n <namespace> -o jsonpath='{.status}'
 | `terminating` | Children still being deleted. Counted apart from the phases and not included in `total`, so a child stuck on an AWX host that will not delete is visible rather than silently absent |
 | `conflicted`, `conflictedVMs` | Selected VMs another binding owns, and a bounded sample naming the owner of each. Part of `total`, and deliberately not counted as `pending`: this binding is not waiting for them to start, it will not run them at all |
 
-The per-VM detail lives on one `AnsibleBindingVM` per matched VM, named `vm-<vm>-<hash>`. The name is built from the VM alone, so that the name *is* the claim on it: every binding computes the same name for a given VM, Kubernetes lets one object hold it, and the create that succeeds decides the owner. The hash is of the full VM name, so two VMs that differ only past the truncation still get separate children. The controller creates and deletes these. They aren't something to write by hand, and one under any other name is refused rather than reconciled. Look them up by label rather than by name:
+The per-VM detail lives on one `AnsibleBindingVM` per matched VM, named `vm-<vm>-<hash>`. The name is built from the VM alone, so that the name *is* the claim on it. Every binding computes the same name for a given VM, Kubernetes lets one object hold it, and the create that succeeds decides the owner. The hash is of the full VM name, so two VMs that differ only past the truncation still get separate children. The controller creates and deletes these. They aren't something to write by hand, and one under any other name is refused rather than reconciled. Look them up by label rather than by name:
 
 ```bash
 kubectl get ansiblebindingvm -n <namespace> -l field.vmware.com/binding=<binding>
@@ -456,7 +456,7 @@ kubectl get ansiblebindingvm -n <namespace> -l field.vmware.com/binding=<binding
 
 `spec.bindingName` and `spec.bindingUID` say which binding, and which incarnation of it, holds the claim. Both are immutable, as is `spec.vmName`. A binding deleted and recreated under the same name claims its VMs afresh rather than inheriting whatever the previous one left mid-cleanup.
 
-Each child's `ownerReference` points at its `VirtualMachine`, so deleting a VM removes its child through ordinary garbage collection. That reference is also required: a child whose owner is missing, or names a different VM, is refused rather than reconciled, so a hand-written `AnsibleBindingVM` can't launch playbooks nothing would ever clean up. A VM deleted and recreated under the same name holds its claim across the replacement: the new VM waits for the old child's cleanup to finish before its own can be created. A child whose VM merely stops matching the selector is deleted by the binding instead. Either way, the child's own finalizer cleans up the AWX host first.
+Each child's `ownerReference` points at its `VirtualMachine`, so deleting a VM removes its child through ordinary garbage collection. That reference is also required, and a child whose owner is missing, or names a different VM, is refused rather than reconciled, so a hand-written `AnsibleBindingVM` can't launch playbooks nothing would ever clean up. A VM deleted and recreated under the same name holds its claim across the replacement, so the new VM waits for the old child's cleanup to finish before its own can be created. A child whose VM merely stops matching the selector is deleted by the binding instead. Either way, the child's own finalizer cleans up the AWX host first.
 
 `AnsibleRun` tracks its single job directly, with no per-VM array:
 
@@ -482,7 +482,7 @@ The controller checks for them at startup, before any worker runs and before it 
 3. Delete the `AnsibleBinding`s so their children and finalizers complete. `cleanupPolicy: Delete` removes their AWX hosts; `Retain` keeps the hosts and their ownership markers.
 4. Deploy this version, then recreate the bindings.
 
-Recreated bindings provision again, exactly as the 1.0.x upgrade did. Don't remove finalizers or delete children by hand to get past the check: that abandons AWX hosts and job state the controller can no longer account for. Rolling back after canonical children exist needs the same drain in reverse, not just an image downgrade.
+Recreated bindings provision again, exactly as the 1.0.x upgrade did. Don't remove finalizers or delete children by hand to get past the check, that abandons AWX hosts and job state the controller can no longer account for. Rolling back after canonical children exist needs the same drain in reverse rather than just an image downgrade.
 
 The child schema now also declares `x-kubernetes-validations` on the identity fields, which needs a Kubernetes 1.25 or newer API server.
 
