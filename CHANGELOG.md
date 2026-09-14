@@ -41,7 +41,7 @@ under the top heading and is renamed to the version when the tag is cut.
   host, and externally sequenced teardown. Each directory stands alone,
   with its prerequisites and expected outcomes.
 - **`AnsibleRun`**: a single execution - one AWX job, launched once,
-  terminal forever. Where an `AnsibleBinding` is standing desired state
+  that never runs again. Where an `AnsibleBinding` is standing desired state
   that re-runs, a run is what an orchestrator creates when something has
   already happened: register this VM in DNS, patch these two servers
   tonight, open this ticket. Its spec is immutable, and neither a spec

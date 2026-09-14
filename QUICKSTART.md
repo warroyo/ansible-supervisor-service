@@ -21,13 +21,13 @@ Everything here is explained in more depth in the [README](README.md); this page
 - An AWX / Ansible Tower / AAP instance that can reach your VMs over SSH
 - An SSH keypair whose private half is in an AWX **Machine credential**, and whose public half you'll bake into the VM
 
-The controller never touches a VM. It talks to Kubernetes and to AWX's HTTPS API only - AWX does the SSH. So the supervisor needs no route into the workload network, but AWX does.
+The controller never touches a VM. It talks only to Kubernetes and to AWX's HTTPS API, and AWX does the SSH. So the supervisor needs no route into the workload network, but AWX does.
 
 ## 1. Install the service
 
 vCenter → **Workload Management → Services → Add Service**, upload `ansible-supervisor.yml` from the [latest release](https://github.com/warroyo/ansible-supervisor-service/releases), and install. Defaults are fine.
 
-Set `supervisor_id` to something readable (e.g. `sup-lab-01`) if more than one supervisor will share this AWX instance. Left empty it's derived from a namespace UID, which works but makes the AWX inventory hard to read.
+Set `supervisor_id` to something readable (e.g. `sup-lab-01`) if more than one supervisor will share this AWX instance. Left empty, it's derived from a namespace UID, which works but makes the AWX inventory hard to read.
 
 Confirm the CRDs landed:
 
@@ -38,17 +38,17 @@ kubectl get crd | grep field.vmware.com
 # awxconnections.field.vmware.com
 ```
 
-Three, not two: `AnsibleBindingVM` is the per-VM child the controller creates and deletes itself. You never write one - see [CRD status](README.md#crd-status).
+Three, not two: `AnsibleBindingVM` is the per-VM child the controller creates and deletes itself. You never write one (see [CRD status](README.md#crd-status)).
 
 ## 2. Prepare the AWX template
 
 In AWX, on the Job Template you want to run:
 
-- **Enable Prompt on Launch for Limit.** Without it AWX discards the limit the controller sends and runs your playbook against every host in the inventory. The controller refuses to launch rather than let that happen - [why](FAQ.md#why-does-my-template-need-prompt-on-launch-for-limit).
+- **Enable Prompt on Launch for Limit.** Without it, AWX discards the limit the controller sends and runs your playbook against every host in the inventory. The controller refuses to launch rather than let that happen. [Why](FAQ.md#why-does-my-template-need-prompt-on-launch-for-limit).
 - Enable Prompt on Launch for Variables too, if you plan to pass `extraVars`.
 - Attach the **Machine credential** holding the private key. This is what logs into the VM.
 - Note which **inventory** the template uses. That's where the controller creates host entries.
-- **Workflow templates usually have no inventory of their own**, since each node carries one. With no inventory there is no host for the controller to create and nothing for `--limit` to scope, so the workflow runs against whatever its nodes target - the same as `useDefaultLimit: true`. Use a Job Template if you need the run confined to the selected VM. [More](FAQ.md#whats-different-about-workflow-templates)
+- **Workflow templates usually have no inventory of their own**, since each node carries one. With no inventory, there's no host for the controller to create and nothing for `--limit` to scope, so the workflow runs against whatever its nodes target (the same as `useDefaultLimit: true`). Use a Job Template if you need the run confined to the selected VM. [More](FAQ.md#whats-different-about-workflow-templates)
 
 Then create an API token (AWX → your user → **Tokens** → Add, scope `write`) and keep it handy.
 
@@ -103,7 +103,7 @@ kubectl get awxconnection -n my-namespace
 # sample-awx   true    Ready   /api/v2   5s
 ```
 
-Anything other than `Ready` here is a bad URL, a bad token, or TLS - `kubectl get awxconnection sample-awx -n my-namespace -o jsonpath='{.status.message}'` says which. Fix it before moving on; nothing downstream will work until this is `Ready`.
+Anything other than `Ready` here is a bad URL, a bad token, or TLS. Run `kubectl get awxconnection sample-awx -n my-namespace -o jsonpath='{.status.message}'` to see which. Fix it before moving on; nothing downstream will work until this is `Ready`.
 
 ## 4. Create a target VM
 
@@ -117,14 +117,14 @@ kubectl apply -n my-namespace -f examples/virtualMachine.yml
 
 The only line in that file this service cares about is `labels: {app: webserver}`. The rest is an ordinary VM Service VM, and the cloud-init block is just how the public key gets in - use whatever bootstrap you already have.
 
-The example is written against `vmoperator.vmware.com/v1alpha2`, which VCF 9.x Supervisors still serve alongside newer versions. Any served version works - the controller discovers which one to read at startup - so if the apply is rejected, set `apiVersion` to whatever your Supervisor offers:
+The example is written against `vmoperator.vmware.com/v1alpha2`, which VCF 9.x Supervisors still serve alongside newer versions. Any served version works (the controller discovers which one to read at startup), so if the apply is rejected, set `apiVersion` to whatever your Supervisor offers:
 
 ```bash
 kubectl get crd virtualmachines.vmoperator.vmware.com \
   -o jsonpath='{range .spec.versions[?(@.served)]}{.name}{"\n"}{end}'
 ```
 
-No need to wait for the VM to boot before moving on. A VM that is powered off or has no IP yet sits in `Pending`, and the controller starts the run when the IP appears - the reconcile loop re-checks every matched VM on each resync (`-resync-period`, 60s by default). Ordering only matters if you want the binding to go `Ready` promptly.
+No need to wait for the VM to boot before moving on. A VM that's powered off or has no IP yet sits in `Pending`, and the controller starts the run when the IP appears; the reconcile loop re-checks every matched VM on each resync (`-resync-period`, 60s by default). Ordering only matters if you want the binding to go `Ready` promptly.
 
 To watch the VM come up anyway:
 
@@ -170,7 +170,7 @@ kubectl get ansiblebindingvm -n my-namespace -l field.vmware.com/binding=webserv
 # sample-webserver  Succeeded  https://awx.example.com/#/jobs/playbook/412
 ```
 
-One binding fans out: every VM the selector matches gets its own inventory host, its own run, and its own `AnsibleBindingVM`. Label a second VM `app: webserver` and it's picked up on the next resync - no edit to the binding needed.
+One binding fans out: every VM the selector matches gets its own inventory host, its own run, and its own `AnsibleBindingVM`. Label a second VM `app: webserver` and it's picked up on the next resync, with no edit to the binding needed.
 
 ## Re-running
 
@@ -198,7 +198,7 @@ Full reference in the [README](README.md), edge cases in the [FAQ](FAQ.md).
 
 ## Cleaning up
 
-Delete the `AnsibleBinding` **while the controller is still running** - it carries a finalizer that blocks until its AWX inventory hosts are gone:
+Delete the `AnsibleBinding` **while the controller is still running**. It carries a finalizer that blocks until its AWX inventory hosts are gone:
 
 ```bash
 kubectl delete ansiblebinding webserver-config -n my-namespace
@@ -210,4 +210,4 @@ Remove the service last, after the bindings are gone.
 
 This walkthrough builds an `AnsibleBinding`: standing state that says "these VMs should be configured like this", re-runnable forever.
 
-The other shape is `AnsibleRun` - one AWX job, launched once, terminal. That is what you want for something that has already happened rather than something that should stay true: registering a VM in DNS, patching two servers tonight, running a decommission playbook before a VM is destroyed, or calling an external API with no host involved at all. See [AnsibleBinding or AnsibleRun?](README.md#ansiblebinding-or-ansiblerun) and `examples/ansibleRun.yml`.
+The other shape is `AnsibleRun`: one AWX job, launched once, that never runs again. That's what you want for something that has already happened rather than something that should stay true: registering a VM in DNS, patching two servers tonight, running a decommission playbook before a VM is destroyed, or calling an external API with no host involved at all. See [AnsibleBinding or AnsibleRun?](README.md#ansiblebinding-or-ansiblerun) and `examples/ansibleRun.yml`.
