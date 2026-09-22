@@ -60,6 +60,15 @@ test-fixture-up:
 test-fixture-down:
 	test/fixture.sh down
 
+# A guided walkthrough for showing the service to people, against the same
+# .env as the harness. See DEMO.md. It leaves everything running;
+# demo-clean takes it down.
+.PHONY: demo demo-clean
+demo:
+	demo/demo.sh run
+demo-clean:
+	demo/demo.sh clean
+
 # EXPECT_IMAGE is resolved here rather than in the script so the check is
 # against the digest actually in the registry for this version - which is
 # what catches a run validating a stale install.

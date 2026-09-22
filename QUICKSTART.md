@@ -211,3 +211,5 @@ Remove the service last, after the bindings are gone.
 This walkthrough builds an `AnsibleBinding`, which is standing state that says "these VMs should be configured like this", re-runnable forever.
 
 The other shape is `AnsibleRun`, one AWX job, launched once, that never runs again. That's the one you want for something that has already happened rather than something that should stay true, so registering a VM in DNS, patching two servers tonight, running a decommission playbook before a VM is destroyed, or calling an external API with no host involved at all. See [AnsibleBinding or AnsibleRun?](README.md#ansiblebinding-or-ansiblerun) and `examples/ansibleRun.yml`.
+
+To show all of this to someone, including scale-out and the `onDeleted` hook, run `make demo`. See [DEMO.md](DEMO.md).

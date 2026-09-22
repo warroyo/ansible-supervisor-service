@@ -6,6 +6,7 @@ This is a Supervisor service that binds VM Service `VirtualMachine`s to AWX/Towe
 
 - [Quickstart](QUICKSTART.md) - shortest path to a first working run
 - [Scenarios](SCENARIOS.md) - what the controller does on a create, an update and a delete
+- [Demo](DEMO.md) - a guided walkthrough for showing the service to people, and a test AWX to run it against
 - [Architecture](ARCHITECTURE.md) - how the objects and the process fit together, with diagrams
 - [How it works](#how-it-works)
 - [AnsibleBinding or AnsibleRun?](#ansiblebinding-or-ansiblerun)
