@@ -68,6 +68,17 @@ fail() { echo "[install] FAILED: $*" >&2; exit 1; }
 
 b64() { base64 -w0 < "$1" 2>/dev/null || base64 < "$1" | tr -d '\n'; }
 
+# config/values.yml rendered through its own schema, minus `namespace` -
+# the Supervisor fills that in itself. It has to go through ytt rather
+# than grep: a schema array's default lives in a #@schema/default
+# annotation, and stripping the annotation leaves the element-type
+# placeholder (`- ""`) behind as the value, which the package's own
+# assert then rejects.
+repo_defaults() {
+  command -v ytt >/dev/null 2>&1 || fail "ytt is needed to render the defaults in config/values.yml"
+  ytt -f config/values.yml --data-values-inspect | grep -v '^namespace:'
+}
+
 # --- auth -------------------------------------------------------------
 # The password goes to curl through a config file on stdin rather than -u
 # on the command line, which would put it in the process list for anyone
@@ -153,12 +164,10 @@ elif [[ "$INSTALLED" == "200" ]]; then
     log "preserving the config this service is already installed with"
   else
     log "WARNING: the installed service reports no config; falling back to repo defaults"
-    grep -v '^#@\|^#!\|^---\|^namespace:' config/values.yml | grep -v '^[[:space:]]*$' > "$WORK_DIR/values.yml"
+    repo_defaults > "$WORK_DIR/values.yml"
   fi
 else
-  # First install: config/values.yml minus the ytt schema header, ytt
-  # comments, and `namespace` - the Supervisor fills that in itself.
-  grep -v '^#@\|^#!\|^---\|^namespace:' config/values.yml | grep -v '^[[:space:]]*$' > "$WORK_DIR/values.yml"
+  repo_defaults > "$WORK_DIR/values.yml"
   log "first install, using repo defaults"
 fi
 log "values:"
